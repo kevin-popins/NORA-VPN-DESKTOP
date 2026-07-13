@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>NORA VPN logo</title>
+
+  <!-- Всё за пределами круга прозрачно -->
+  <circle cx="512" cy="512" r="480"
+          fill="#0A1220"
+          stroke="#FFA31A"
+          stroke-width="24"/>
+
+  <!-- Ровная геометрическая N -->
+  <path d="
+    M 320 292
+    H 424
+    L 600 570
+    V 292
+    H 704
+    V 732
+    H 600
+    L 424 454
+    V 732
+    H 320
+    Z"
+    fill="#FFA31A"/>
+</svg>

@@ -1,0 +1,37 @@
+NORA VPN
+Copyright 2026 NORA VPN contributors
+
+NORA VPN source code is licensed under the Apache License, Version 2.0.
+See LICENSE for the full text. NORA VPN names and visual identity are governed
+separately by TRADEMARKS.md.
+
+This project includes or supports the following third-party work:
+
+* NAudio 2.2.1 — Copyright Mark Heath and contributors — MIT License
+  https://github.com/naudio/NAudio
+
+* YamlDotNet 18.1.0 — Copyright Antoine Aubry and contributors — MIT License
+  https://github.com/aaubry/YamlDotNet
+
+* System.Security.Cryptography.ProtectedData 10.0.9 — .NET Foundation and
+  contributors — MIT License
+  https://github.com/dotnet/runtime
+
+* Twemoji artwork — Copyright 2020 Twitter, Inc. and other contributors —
+  CC-BY 4.0
+  https://github.com/jdecked/twemoji
+  The complete local artwork attribution is in assets/emoji/ATTRIBUTION.md.
+
+* Country flag artwork — sourced from stefangabos/world_countries and
+  lipis/flag-icons. Provenance is in assets/flags/ATTRIBUTION.md.
+
+Portable builds may obtain or package these independently licensed runtime
+components from their official upstream releases:
+
+* Xray-core — MPL-2.0 — https://github.com/XTLS/Xray-core
+* sing-box — GPL-3.0 — https://github.com/SagerNet/sing-box
+* AmneziaWG — see the upstream project licence —
+  https://github.com/amnezia-vpn/amneziawg-windows-client
+
+Their names and trademarks belong to their respective owners. NORA VPN is not
+affiliated with or endorsed by them.

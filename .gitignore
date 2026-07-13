@@ -1,0 +1,36 @@
+# Build and release outputs
+bin/
+obj/
+dist/
+artifacts/
+runs/
+tmp/
+
+# Downloaded runtime components — fetched locally or supplied with a release
+cores/
+
+# Local user data and credentials
+profiles/
+private/
+.env
+.env.*
+!.env.example
+*.connection.key
+*.pfx
+*.p12
+*.pem
+*.ppk
+*.db
+*.db-shm
+*.db-wal
+
+# IDE and OS files
+.vs/
+.idea/
+*.user
+*.suo
+*.cache
+*.pdb
+*.log
+Thumbs.db
+Desktop.ini

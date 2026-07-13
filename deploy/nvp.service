@@ -1,0 +1,17 @@
+[Unit]
+Description=NVP-1 relay core
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/nvp
+ExecStart=/opt/nvp/nvp server /opt/nvp/server-profile.json
+Restart=always
+RestartSec=3
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

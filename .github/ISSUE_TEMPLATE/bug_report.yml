@@ -1,0 +1,30 @@
+name: Bug report
+description: Report a reproducible NORA VPN defect without private connection data.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include subscription URLs, connection keys, passwords, private IPs,
+        server logs or screenshots with personal data.
+  - type: input
+    id: version
+    attributes:
+      label: NORA VPN version
+      placeholder: 0.1.0-pre.1
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Safe reproduction steps
+      placeholder: Describe a minimal reproduction using demo or redacted data.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual result
+    validations:
+      required: true
