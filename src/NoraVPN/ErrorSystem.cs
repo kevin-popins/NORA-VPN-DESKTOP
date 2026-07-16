@@ -27,6 +27,7 @@ internal enum NoraOperation
     CopyKey,
     PingServers,
     Diagnostics,
+    DiscordMode,
     LoadProfile,
     BackendRuntime,
     CommandLine
@@ -164,6 +165,9 @@ internal static class NoraErrors
         D("NORA-CFG-8004", NoraErrorSeverity.Error, "Credential is missing", "The profile exists, but its secret credential is unavailable.", "The local key material needed for authentication was removed or not saved.", "Reimport the original key or create a new user credential."),
 
         D("NORA-DIA-9001", NoraErrorSeverity.Error, "Diagnostics failed", "NORA VPN could not complete the requested diagnostic check.", "A diagnostic dependency or network stage failed.", "Open Logs for details and retry after resolving the reported component."),
+        D("NORA-DIS-9101", NoraErrorSeverity.Error, "Discord Mode components are missing", "NORA VPN cannot prepare Discord Mode because a required routing component is absent.", "The portable folder is incomplete or Windows Security removed one of its files.", "Restore the complete NORA portable folder and try again."),
+        D("NORA-DIS-9102", NoraErrorSeverity.Error, "Discord Mode preparation failed", "NORA VPN could not validate the Discord-only routing configuration.", "The local routing engine rejected its configuration or could not be started.", "Open Logs, restore the complete portable folder, and try again."),
+        D("NORA-DIS-9103", NoraErrorSeverity.Error, "Discord Mode route failed", "Discord traffic could not be attached to the selected VPN connection.", "The selective VLESS or KRot path did not become ready or stopped unexpectedly.", "Disconnect, select another VLESS or KRot server, and try again."),
         D("NORA-INT-9999", NoraErrorSeverity.Critical, "Unexpected NORA VPN error", "The requested operation stopped because of an unexpected internal error.", "No more specific safe classification matched this failure.", "Retry once. If it repeats, send this code and the Logs page to support.")
     ];
 
@@ -298,6 +302,12 @@ internal static class NoraErrors
 
         if (operation == NoraOperation.Diagnostics)
             return "NORA-DIA-9001";
+        if (operation == NoraOperation.DiscordMode)
+        {
+            if (Has(m, "missing", "not found", "portable folder")) return "NORA-DIS-9101";
+            if (Has(m, "route", "routing", "selective", "discord")) return "NORA-DIS-9103";
+            return "NORA-DIS-9102";
+        }
 
         if (operation is NoraOperation.Connect or NoraOperation.Disconnect)
         {

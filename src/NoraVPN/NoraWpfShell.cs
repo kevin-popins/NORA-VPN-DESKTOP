@@ -9,6 +9,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Xml.Linq;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
@@ -63,6 +64,13 @@ namespace Nvp;
 
 internal static class NoraWpfShell
 {
+    public static int RunPreview()
+    {
+        var app = new WpfApplication { ShutdownMode = ShutdownMode.OnMainWindowClose };
+        app.Run(new NoraWpfWindow(enableTray: false));
+        return 0;
+    }
+
     public static void Run()
     {
         var app = new WpfApplication { ShutdownMode = ShutdownMode.OnExplicitShutdown };
@@ -90,12 +98,13 @@ internal static class NoraWpfShell
         var previousVisualReady = Environment.GetEnvironmentVariable("NORA_GUI_VISUAL_READY");
         var previousState = Environment.GetEnvironmentVariable("NORA_GUI_SNAPSHOT_STATE");
         var previousPage = Environment.GetEnvironmentVariable("NORA_GUI_SNAPSHOT_PAGE");
+        var previousReducedMotion = Environment.GetEnvironmentVariable("NORA_REDUCED_MOTION");
         // state supports "connected", "servers", or combined "connected+servers".
         var page = "";
         var parts = state.Split('+', ':');
         foreach (var part in parts.Select(x => x.Trim().ToLowerInvariant()))
         {
-            if (part is "home" or "servers" or "add" or "users" or "logs" or "settings")
+            if (part is "home" or "servers" or "add" or "users" or "logs" or "settings" or "voice")
                 page = part;
             else if (part.Length > 0)
                 state = part;
@@ -106,6 +115,7 @@ internal static class NoraWpfShell
                 state = "ready";
         }
         Environment.SetEnvironmentVariable("NORA_GUI_VISUAL_READY", "1");
+        Environment.SetEnvironmentVariable("NORA_REDUCED_MOTION", "1");
         Environment.SetEnvironmentVariable("NORA_GUI_SNAPSHOT_STATE", state);
         Environment.SetEnvironmentVariable("NORA_GUI_SNAPSHOT_PAGE", page);
         var app = new WpfApplication { ShutdownMode = ShutdownMode.OnExplicitShutdown };
@@ -115,6 +125,7 @@ internal static class NoraWpfShell
             "dialog-key" => new NoraKeyWindow("Connection key created",
                 "krot://eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkRlbW8gS2V5IiwiaWF0IjoxNTE2MjM5MDIyfQ.demo-key-material-abcdef1234567890-abcdef1234567890"),
             "dialog-progress" => new NoraProgressWindow("Creating user", "Creating `marina` and restarting KRot on demo-vps.example..."),
+            "dialog-discord-error" => CreateDiscordErrorPreview(),
             _ => new NoraWpfWindow(enableTray: false)
         };
         window.WindowStartupLocation = WindowStartupLocation.Manual;
@@ -162,9 +173,19 @@ internal static class NoraWpfShell
             window.Close();
             app.Shutdown();
             Environment.SetEnvironmentVariable("NORA_GUI_VISUAL_READY", previousVisualReady);
+            Environment.SetEnvironmentVariable("NORA_REDUCED_MOTION", previousReducedMotion);
             Environment.SetEnvironmentVariable("NORA_GUI_SNAPSHOT_STATE", previousState);
             Environment.SetEnvironmentVariable("NORA_GUI_SNAPSHOT_PAGE", previousPage);
         }
+    }
+
+    private static Window CreateDiscordErrorPreview()
+    {
+        var window = new NoraProgressWindow("Preparing Discord Mode", "Checking the selective routing engine...");
+        window.SetError(
+            "Discord Mode could not be prepared",
+            "A required routing component is missing. Restore the complete NORA portable folder and try again.");
+        return window;
     }
 
     public static int RunTraySmoke(string outputPath)
@@ -435,8 +456,9 @@ internal static class NoraWindowScalePolicy
 
 internal sealed class NoraWpfWindow : Window
 {
-    private enum PageKind { Home, Servers, Add, Users, Logs, Settings }
+    private enum PageKind { Home, Servers, Add, Users, Logs, Settings, VoiceMode }
     private enum TunnelState { Ready, Connecting, Connected, Disconnecting, Failed }
+    private static readonly Color DiscordModeAccent = Color.FromRgb(0x58, 0x65, 0xF2);
     private enum ToastKind { Info, Success, Error }
 
     private readonly Grid _contentHost = new();
@@ -471,12 +493,14 @@ internal sealed class NoraWpfWindow : Window
     private static readonly object ImageCacheSync = new();
     private static readonly Dictionary<string, IReadOnlyList<ImageSource>> LocationImageCache = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Dictionary<string, ImageSource> NamedImageCache = new(StringComparer.OrdinalIgnoreCase);
+    private static Geometry? VoiceModeIconGeometry;
     private static readonly object EmojiImageCacheSync = new();
     private static readonly Dictionary<string, ImageSource?> EmojiImageCache = new(StringComparer.OrdinalIgnoreCase);
 
     private NoraConnectButton? _connectButton;
     private NoraCyberGrid? _heroGrid;
     private NoraAudioBarBackdrop? _audioBackdrop;
+    private TextBlock? _discordModeStatusText;
     private Grid? _welcomeOverlayHost;
     private IVpnCoreProcess? _core;
     // A connection launch owns this token for its entire lifetime.  Cancelling it
@@ -567,7 +591,7 @@ internal sealed class NoraWpfWindow : Window
             _isArrangingServers = true;
         if (snapshotState == "endpoint-revealed")
             _showActiveEndpoint = true;
-        if (snapshotState is "connected" or "connecting" or "stopping" or "failed")
+        if (snapshotState is "connected" or "discord-active" or "connecting" or "stopping" or "failed")
         {
             _state = snapshotState switch
             {
@@ -622,9 +646,10 @@ internal sealed class NoraWpfWindow : Window
             "users" => PageKind.Users,
             "logs" => PageKind.Logs,
             "settings" => PageKind.Settings,
+            "voice" => PageKind.VoiceMode,
             _ => PageKind.Home
         });
-        if (snapshotState == "connected")
+        if (snapshotState is "connected" or "discord-active")
         {
             var previewDuration = new TimeSpan(0, 18, 42);
             _connectButton?.SnapConnectedPreview(previewDuration);
@@ -1308,6 +1333,7 @@ internal sealed class NoraWpfWindow : Window
         _userTrafficText.Clear();
         _connectButton = null;
         _heroGrid = null;
+        _discordModeStatusText = null;
         _welcomeOverlayHost = null;
         _contentHost.ClipToBounds = true;
         _contentHost.Children.Clear();
@@ -1320,7 +1346,8 @@ internal sealed class NoraWpfWindow : Window
             PageKind.Add => AddPage(),
             PageKind.Users => UsersPage(),
             PageKind.Logs => LogsPage(),
-            _ => SettingsPage()
+            PageKind.Settings => SettingsPage(),
+            _ => VoiceModePage()
         };
         _contentHost.Children.Add(content);
         RenderNav();
@@ -1542,6 +1569,18 @@ internal sealed class NoraWpfWindow : Window
         brand.Children.Add(wordmark);
         header.Children.Add(brand);
 
+        var voiceButton = new NoraFxButton(Colors.Transparent, Color.FromArgb(42, 255, 156, 38), 14, false, NoraWpfTheme.Brush(Color.FromArgb(72, 146, 157, 176)))
+        {
+            Width = 44,
+            Height = 44,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Top,
+            Content = CreateVoiceModeIcon(24, NoraWpfTheme.Brush(Color.FromRgb(181, 190, 204))),
+            ToolTip = "Routing rules"
+        };
+        voiceButton.Click += (_, _) => RenderPage(PageKind.VoiceMode);
+        header.Children.Add(voiceButton);
+
         var settingsButton = new NoraFxButton(Colors.Transparent, Color.FromArgb(42, 255, 156, 38), 14, false, NoraWpfTheme.Brush(Color.FromArgb(72, 146, 157, 176)))
         {
             Width = 44,
@@ -1584,6 +1623,7 @@ internal sealed class NoraWpfWindow : Window
         {
             Width = 216,
             Height = 216,
+            ConnectedAccent = DiscordModeEnabledForView() ? DiscordModeAccent : NoraWpfTheme.Green,
             HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Center
         };
@@ -1609,11 +1649,125 @@ internal sealed class NoraWpfWindow : Window
         panel.Children.Add(hero);
 
         panel.Children.Add(ActiveServerCard());
-        var graph = new NoraTrafficGraph { Height = 208, Margin = new Thickness(0, 14, 0, 0), Active = _state == TunnelState.Connected };
-        graph.Seed(_trafficHistory, _trafficUpRate, _trafficDownRate, (long)_trafficUpBytes, (long)_trafficDownBytes, _connectedFor.Elapsed);
-        _graphs.Add(graph);
-        panel.Children.Add(graph);
+        if (DiscordModeEnabledForView())
+        {
+            panel.Children.Add(DiscordModeStatusCard());
+        }
+        else
+        {
+            var graph = new NoraTrafficGraph { Height = 208, Margin = new Thickness(0, 14, 0, 0), Active = _state == TunnelState.Connected };
+            graph.Seed(_trafficHistory, _trafficUpRate, _trafficDownRate, (long)_trafficUpBytes, (long)_trafficDownBytes, _connectedFor.Elapsed);
+            _graphs.Add(graph);
+            panel.Children.Add(graph);
+        }
         return panel;
+    }
+
+    private static bool DiscordModeEnabledForView()
+    {
+        var snapshot = Environment.GetEnvironmentVariable("NORA_GUI_SNAPSHOT_STATE")?.Trim().ToLowerInvariant();
+        return snapshot switch
+        {
+            "discord-enabled" or "discord-active" => true,
+            "discord-disabled" => false,
+            _ => NoraDiscordModeSettings.Enabled
+        };
+    }
+
+    private UIElement DiscordModeStatusCard()
+    {
+        var slideshowEnabled = NoraPremiumService.ServerSlideshowEffective;
+        var images = LoadLocationImages("Discord", slideshowEnabled);
+        var imageZoom = new ScaleTransform(1, 1, 0.5, 0.5);
+        var card = new Border
+        {
+            Height = 208,
+            Margin = new Thickness(0, 14, 0, 0),
+            CornerRadius = new CornerRadius(22),
+            BorderBrush = NoraWpfTheme.Brush(Color.FromArgb(118, 255, 156, 38)),
+            BorderThickness = new Thickness(1),
+            Background = NoraWpfTheme.CardBrush,
+            UseLayoutRounding = true,
+            SnapsToDevicePixels = true
+        };
+
+        var surface = new Grid { ClipToBounds = true };
+        AddPhotoSlideshow(surface, images, imageZoom, new CornerRadius(21));
+        surface.Children.Add(new Border
+        {
+            CornerRadius = new CornerRadius(21),
+            Background = new LinearGradientBrush(
+                Color.FromArgb(238, 6, 9, 14),
+                Color.FromArgb(66, 6, 9, 14),
+                new Point(0, 0.5),
+                new Point(1, 0.5)),
+            IsHitTestVisible = false
+        });
+        surface.Children.Add(new Border
+        {
+            CornerRadius = new CornerRadius(21),
+            Background = new LinearGradientBrush(
+                Color.FromArgb(18, 6, 9, 14),
+                Color.FromArgb(214, 6, 9, 14),
+                new Point(0.5, 0),
+                new Point(0.5, 1)),
+            IsHitTestVisible = false
+        });
+
+        var root = new Grid { Margin = new Thickness(21, 18, 21, 18) };
+        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+        var eyebrow = new StackPanel { Orientation = Orientation.Horizontal };
+        eyebrow.Children.Add(new Ellipse
+        {
+            Width = 8,
+            Height = 8,
+            Fill = NoraWpfTheme.GreenBrush,
+            Margin = new Thickness(0, 3, 9, 0)
+        });
+        eyebrow.Children.Add(new TextBlock
+        {
+            Text = "DISCORD MODE IS ACTIVE",
+            FontSize = 12,
+            FontWeight = FontWeights.Bold,
+            Foreground = NoraWpfTheme.OrangeBrush
+        });
+        root.Children.Add(eyebrow);
+
+        var copy = new StackPanel { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 4, 0, 2) };
+        copy.Children.Add(new TextBlock
+        {
+            Text = "Only Discord uses the VPN",
+            FontSize = 22,
+            FontWeight = FontWeights.Bold,
+            Foreground = NoraWpfTheme.TextBrush
+        });
+        copy.Children.Add(new TextBlock
+        {
+            Text = "Games, browsers and everything else keep using your normal internet connection.",
+            FontSize = 13,
+            LineHeight = 19,
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = NoraWpfTheme.Brush(Color.FromRgb(204, 213, 226)),
+            Margin = new Thickness(0, 8, 0, 0)
+        });
+        Grid.SetRow(copy, 1);
+        root.Children.Add(copy);
+
+        _discordModeStatusText = new TextBlock
+        {
+            Text = _state == TunnelState.Connected ? "DISCORD IS PROTECTED" : "SELECT A VLESS OR KROT SERVER AND CONNECT",
+            FontSize = 10.5,
+            FontWeight = FontWeights.Bold,
+            Foreground = _state == TunnelState.Connected ? NoraWpfTheme.GreenBrush : NoraWpfTheme.DimBrush
+        };
+        Grid.SetRow(_discordModeStatusText, 2);
+        root.Children.Add(_discordModeStatusText);
+        surface.Children.Add(root);
+        card.Child = surface;
+        return card;
     }
 
     private bool HasAnyConfiguredAccess()
@@ -2288,71 +2442,7 @@ internal sealed class NoraWpfWindow : Window
         var grid = new Grid { ClipToBounds = true };
         card.Child = grid;
 
-        if (images.Count > 0)
-        {
-            ImageBrush PhotoBrush(ImageSource source) => new(source)
-            {
-                Stretch = Stretch.UniformToFill,
-                AlignmentX = AlignmentX.Center,
-                AlignmentY = AlignmentY.Center,
-                RelativeTransform = imageZoom
-            };
-
-            var visiblePhoto = new Border
-            {
-                CornerRadius = new CornerRadius(21),
-                Background = PhotoBrush(images[0]),
-                Opacity = 1
-            };
-            var hiddenPhoto = new Border
-            {
-                CornerRadius = new CornerRadius(21),
-                Background = PhotoBrush(images[0]),
-                Opacity = 0
-            };
-            grid.Children.Add(visiblePhoto);
-            grid.Children.Add(hiddenPhoto);
-
-            if (images.Count > 1)
-            {
-                var index = 0;
-                var interval = LocationSlideInterval();
-                var fadeDuration = TimeSpan.FromMilliseconds(Math.Min(1800, interval.TotalMilliseconds * 0.65));
-                var timer = new DispatcherTimer { Interval = interval };
-                timer.Tick += (_, _) =>
-                {
-                    index = (index + 1) % images.Count;
-                    hiddenPhoto.Background = PhotoBrush(images[index]);
-                    hiddenPhoto.Opacity = 0;
-                    hiddenPhoto.BeginAnimation(OpacityProperty, null);
-                    visiblePhoto.BeginAnimation(OpacityProperty, null);
-
-                    if (!NoraWpfTheme.MotionEnabled)
-                    {
-                        hiddenPhoto.Opacity = 1;
-                        visiblePhoto.Opacity = 0;
-                        (visiblePhoto, hiddenPhoto) = (hiddenPhoto, visiblePhoto);
-                        return;
-                    }
-
-                    var ease = new CubicEase { EasingMode = EasingMode.EaseInOut };
-                    var fadeIn = new DoubleAnimation(0, 1, fadeDuration) { EasingFunction = ease };
-                    var fadeOut = new DoubleAnimation(1, 0, fadeDuration) { EasingFunction = ease };
-                    fadeIn.Completed += (_, _) =>
-                    {
-                        hiddenPhoto.BeginAnimation(OpacityProperty, null);
-                        visiblePhoto.BeginAnimation(OpacityProperty, null);
-                        hiddenPhoto.Opacity = 1;
-                        visiblePhoto.Opacity = 0;
-                        (visiblePhoto, hiddenPhoto) = (hiddenPhoto, visiblePhoto);
-                    };
-                    hiddenPhoto.BeginAnimation(OpacityProperty, fadeIn);
-                    visiblePhoto.BeginAnimation(OpacityProperty, fadeOut);
-                };
-                card.Loaded += (_, _) => timer.Start();
-                card.Unloaded += (_, _) => timer.Stop();
-            }
-        }
+        AddPhotoSlideshow(grid, images, imageZoom, new CornerRadius(21));
 
         // Two-directional scrim keeps every label readable on any photo.
         grid.Children.Add(new Border
@@ -2520,6 +2610,81 @@ internal sealed class NoraWpfWindow : Window
         Grid.SetRow(footer, 2);
         content.Children.Add(footer);
         return card;
+    }
+
+    private static void AddPhotoSlideshow(
+        Grid host,
+        IReadOnlyList<ImageSource> images,
+        ScaleTransform imageZoom,
+        CornerRadius cornerRadius)
+    {
+        if (images.Count == 0)
+            return;
+
+        ImageBrush PhotoBrush(ImageSource source) => new(source)
+        {
+            Stretch = Stretch.UniformToFill,
+            AlignmentX = AlignmentX.Center,
+            AlignmentY = AlignmentY.Center,
+            RelativeTransform = imageZoom
+        };
+
+        var visiblePhoto = new Border
+        {
+            CornerRadius = cornerRadius,
+            Background = PhotoBrush(images[0]),
+            Opacity = 1,
+            IsHitTestVisible = false
+        };
+        var hiddenPhoto = new Border
+        {
+            CornerRadius = cornerRadius,
+            Background = PhotoBrush(images[0]),
+            Opacity = 0,
+            IsHitTestVisible = false
+        };
+        host.Children.Add(visiblePhoto);
+        host.Children.Add(hiddenPhoto);
+
+        if (images.Count <= 1)
+            return;
+
+        var index = 0;
+        var interval = LocationSlideInterval();
+        var fadeDuration = TimeSpan.FromMilliseconds(Math.Min(1800, interval.TotalMilliseconds * 0.65));
+        var timer = new DispatcherTimer { Interval = interval };
+        timer.Tick += (_, _) =>
+        {
+            index = (index + 1) % images.Count;
+            hiddenPhoto.Background = PhotoBrush(images[index]);
+            hiddenPhoto.Opacity = 0;
+            hiddenPhoto.BeginAnimation(OpacityProperty, null);
+            visiblePhoto.BeginAnimation(OpacityProperty, null);
+
+            if (!NoraWpfTheme.MotionEnabled)
+            {
+                hiddenPhoto.Opacity = 1;
+                visiblePhoto.Opacity = 0;
+                (visiblePhoto, hiddenPhoto) = (hiddenPhoto, visiblePhoto);
+                return;
+            }
+
+            var ease = new CubicEase { EasingMode = EasingMode.EaseInOut };
+            var fadeIn = new DoubleAnimation(0, 1, fadeDuration) { EasingFunction = ease };
+            var fadeOut = new DoubleAnimation(1, 0, fadeDuration) { EasingFunction = ease };
+            fadeIn.Completed += (_, _) =>
+            {
+                hiddenPhoto.BeginAnimation(OpacityProperty, null);
+                visiblePhoto.BeginAnimation(OpacityProperty, null);
+                hiddenPhoto.Opacity = 1;
+                visiblePhoto.Opacity = 0;
+                (visiblePhoto, hiddenPhoto) = (hiddenPhoto, visiblePhoto);
+            };
+            hiddenPhoto.BeginAnimation(OpacityProperty, fadeIn);
+            visiblePhoto.BeginAnimation(OpacityProperty, fadeOut);
+        };
+        host.Loaded += (_, _) => timer.Start();
+        host.Unloaded += (_, _) => timer.Stop();
     }
 
     private static Border Pill(UIElement child) => new()
@@ -2711,6 +2876,210 @@ internal sealed class NoraWpfWindow : Window
         {
             return null;
         }
+    }
+
+    private static UIElement CreateVoiceModeIcon(double size, Brush fill)
+    {
+        var geometry = LoadVoiceModeIconGeometry();
+        if (geometry is null)
+        {
+            return new NoraIcon
+            {
+                Kind = NoraIconKind.Users,
+                Width = size,
+                Height = size,
+                Stroke = fill
+            };
+        }
+
+        return new System.Windows.Shapes.Path
+        {
+            Data = geometry,
+            Fill = fill,
+            Width = size,
+            Height = size,
+            Stretch = Stretch.Uniform,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            SnapsToDevicePixels = true
+        };
+    }
+
+    private static Geometry? LoadVoiceModeIconGeometry()
+    {
+        lock (ImageCacheSync)
+        {
+            if (VoiceModeIconGeometry is not null)
+                return VoiceModeIconGeometry;
+        }
+
+        try
+        {
+            var document = XDocument.Load(NoraDiscordModeSettings.VoiceAssetPath, LoadOptions.None);
+            var group = new GeometryGroup { FillRule = FillRule.Nonzero };
+            foreach (var element in document.Descendants().Where(x => x.Name.LocalName == "path"))
+            {
+                var data = element.Attribute("d")?.Value;
+                if (!string.IsNullOrWhiteSpace(data))
+                    group.Children.Add(Geometry.Parse(data));
+            }
+
+            if (group.Children.Count == 0)
+                return null;
+
+            group.Freeze();
+            lock (ImageCacheSync)
+                VoiceModeIconGeometry = group;
+            return group;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private UIElement VoiceModePage()
+    {
+        var enabled = DiscordModeEnabledForView();
+        var snapshot = string.Equals(Environment.GetEnvironmentVariable("NORA_GUI_VISUAL_READY"), "1", StringComparison.Ordinal);
+        var root = new StackPanel { Margin = new Thickness(0, 0, 0, 8) };
+
+        var header = new Grid { Margin = new Thickness(0, 0, 0, 18) };
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var heading = new StackPanel();
+        heading.Children.Add(new TextBlock
+        {
+            Text = "Routing Rules",
+            FontSize = 40,
+            FontWeight = FontWeights.Bold,
+            Foreground = NoraWpfTheme.TextBrush
+        });
+        header.Children.Add(heading);
+        var home = new NoraFxButton(Colors.Transparent, Color.FromArgb(36, 255, 156, 38), 14, false,
+            NoraWpfTheme.Brush(Color.FromArgb(72, 146, 157, 176)))
+        {
+            Width = 46,
+            Height = 46,
+            VerticalAlignment = VerticalAlignment.Top,
+            Content = new NoraIcon { Kind = NoraIconKind.Home, Width = 20, Height = 20, Stroke = NoraWpfTheme.MutedBrush },
+            ToolTip = "Back to Home"
+        };
+        home.Click += (_, _) => RenderPage(PageKind.Home);
+        Grid.SetColumn(home, 1);
+        header.Children.Add(home);
+        root.Children.Add(header);
+
+        var scene = Card(24, enabled);
+        scene.Height = 320;
+        scene.Padding = new Thickness(24, 24, 24, 22);
+        var sceneRoot = new Grid();
+        sceneRoot.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        sceneRoot.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        sceneRoot.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        sceneRoot.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+        var title = new TextBlock
+        {
+            Text = "Discord Mode",
+            FontSize = 25,
+            FontWeight = FontWeights.Bold,
+            Foreground = NoraWpfTheme.TextBrush
+        };
+        sceneRoot.Children.Add(title);
+
+        var explanation = new TextBlock
+        {
+            Text = "When you connect, only Discord traffic goes through the selected VPN server. Games, Steam, browsers and every other app keep using your normal internet connection.",
+            FontSize = 14,
+            LineHeight = 21,
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = NoraWpfTheme.MutedBrush,
+            Margin = new Thickness(0, 10, 0, 0)
+        };
+        Grid.SetRow(explanation, 1);
+        sceneRoot.Children.Add(explanation);
+
+        var warning = new Border
+        {
+            CornerRadius = new CornerRadius(15),
+            Padding = new Thickness(14, 12, 14, 12),
+            VerticalAlignment = VerticalAlignment.Center,
+            Background = NoraWpfTheme.Brush(Color.FromArgb(22, 255, 156, 38)),
+            BorderBrush = NoraWpfTheme.Brush(Color.FromArgb(68, 255, 156, 38)),
+            BorderThickness = new Thickness(1),
+            Child = new TextBlock
+            {
+                Text = "AWG is not supported in Discord Mode. Choose a VLESS or KRot server before connecting.",
+                FontSize = 12.5,
+                LineHeight = 18,
+                TextWrapping = TextWrapping.Wrap,
+                Foreground = NoraWpfTheme.Brush(Color.FromRgb(232, 190, 126))
+            }
+        };
+        Grid.SetRow(warning, 2);
+        sceneRoot.Children.Add(warning);
+
+        var action = new Grid { Margin = new Thickness(0, 14, 0, 0) };
+        action.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        action.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var actionCopy = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+        actionCopy.Children.Add(new TextBlock
+        {
+            Text = enabled ? "MODE ON" : "MODE OFF",
+            FontSize = 11,
+            FontWeight = FontWeights.Bold,
+            Foreground = enabled ? NoraWpfTheme.GreenBrush : NoraWpfTheme.DimBrush
+        });
+        actionCopy.Children.Add(new TextBlock
+        {
+            Text = enabled ? "Turn it off to restore normal full-device VPN." : "Enable before connecting to a server.",
+            FontSize = 12,
+            Foreground = NoraWpfTheme.MutedBrush,
+            Margin = new Thickness(0, 3, 0, 0)
+        });
+        action.Children.Add(actionCopy);
+
+        var toggle = BuildModeToggle(enabled);
+        toggle.IsEnabled = !snapshot;
+        toggle.Click += async (_, _) => await SetDiscordModeAsync(!enabled);
+        Grid.SetColumn(toggle, 1);
+        action.Children.Add(toggle);
+        Grid.SetRow(action, 3);
+        sceneRoot.Children.Add(action);
+
+        scene.Child = sceneRoot;
+        root.Children.Add(scene);
+        return root;
+    }
+
+    private static NoraFxButton BuildModeToggle(bool enabled)
+    {
+        var button = new NoraFxButton(Colors.Transparent, Colors.Transparent, 17, false, Brushes.Transparent)
+        {
+            Width = 66,
+            Height = 40,
+            VerticalAlignment = VerticalAlignment.Center,
+            ToolTip = enabled ? "Turn Discord Mode off" : "Turn Discord Mode on"
+        };
+        var track = new Grid { Width = 60, Height = 34 };
+        track.Children.Add(new Border
+        {
+            CornerRadius = new CornerRadius(17),
+            Background = NoraWpfTheme.Brush(enabled ? NoraWpfTheme.Green : Color.FromRgb(45, 53, 66)),
+            BorderBrush = NoraWpfTheme.Brush(enabled ? Color.FromRgb(54, 224, 132) : Color.FromRgb(72, 83, 101)),
+            BorderThickness = new Thickness(1)
+        });
+        track.Children.Add(new Ellipse
+        {
+            Width = 26,
+            Height = 26,
+            Fill = NoraWpfTheme.Brush(enabled ? NoraWpfTheme.Bg : Color.FromRgb(166, 176, 192)),
+            HorizontalAlignment = enabled ? HorizontalAlignment.Right : HorizontalAlignment.Left,
+            Margin = new Thickness(4)
+        });
+        button.Content = track;
+        return button;
     }
 
     private UIElement SettingsPage()
@@ -3052,8 +3421,9 @@ internal sealed class NoraWpfWindow : Window
 
     // Same accent mapping the Connect button uses, so the audio spectrum and the
     // button always share one color per tunnel state.
-    private static Color ConnectAccentFor(TunnelState state) => state switch
+    private Color ConnectAccentFor(TunnelState state) => state switch
     {
+        TunnelState.Connected when DiscordModeEnabledForView() => DiscordModeAccent,
         TunnelState.Connected => NoraWpfTheme.Green,
         TunnelState.Failed => NoraWpfTheme.Red,
         TunnelState.Connecting or TunnelState.Disconnecting => NoraWpfTheme.Orange2,
@@ -5264,6 +5634,78 @@ internal sealed class NoraWpfWindow : Window
             RenderPage(PageKind.Logs);
     }
 
+    private async Task SetDiscordModeAsync(bool enabled)
+    {
+        if (enabled)
+        {
+            if (_state is TunnelState.Connecting or TunnelState.Connected or TunnelState.Disconnecting ||
+                _core is not null || _connectCancellation is not null)
+            {
+                ShowToast(
+                    "Disconnect first",
+                    "Disconnect from the current server before turning on Discord Mode.",
+                    ToastKind.Info);
+                return;
+            }
+
+            var progress = new NoraProgressWindow(
+                "Preparing Discord Mode",
+                "Checking the selective routing engine…")
+            {
+                Owner = this
+            };
+            var progressVisibleFor = Stopwatch.StartNew();
+            progress.Show();
+            try
+            {
+                await NoraDiscordModeSettings.PrepareAsync(
+                    status => Dispatcher.Invoke(() => progress.SetStatus(status)),
+                    AppendLog,
+                    CancellationToken.None);
+                NoraDiscordModeSettings.SetEnabledOrThrow(true);
+                AppendLog("[discord] Discord Mode enabled");
+                progress.SetStatus("Discord Mode is ready");
+                var remaining = TimeSpan.FromMilliseconds(1300) - progressVisibleFor.Elapsed;
+                if (remaining > TimeSpan.Zero)
+                    await Task.Delay(remaining);
+                progress.Close();
+                RenderPage(PageKind.Home);
+                ShowToast("Discord Mode is ready", "Choose a VLESS or KRot server and connect.", ToastKind.Success);
+            }
+            catch (Exception ex)
+            {
+                NoraDiscordModeSettings.Enabled = false;
+                var incident = ReportFailure(NoraOperation.DiscordMode, ex);
+                progress.SetError(incident.Title, incident.Message + Environment.NewLine + "What to do: " + incident.Action);
+            }
+            return;
+        }
+
+        if (_state == TunnelState.Disconnecting)
+        {
+            ShowToast("Disconnecting", "Wait until the current connection has stopped, then turn off Discord Mode.", ToastKind.Info);
+            return;
+        }
+
+        if (_state == TunnelState.Connecting)
+            await CancelConnectingAsync();
+        else if (_core is not null || _state == TunnelState.Connected)
+            await DisconnectAsync();
+
+        try
+        {
+            NoraDiscordModeSettings.SetEnabledOrThrow(false);
+            AppendLog("[discord] Discord Mode disabled");
+            RenderPage(PageKind.Home);
+            ShowToast("Discord Mode is off", "NORA has returned to normal full-device VPN mode.", ToastKind.Info);
+        }
+        catch (Exception ex)
+        {
+            ReportFailure(NoraOperation.DiscordMode, ex);
+            RenderPage(PageKind.VoiceMode);
+        }
+    }
+
     private async Task ConnectAsync()
     {
         if (_diagnosticRunning)
@@ -5279,6 +5721,17 @@ internal sealed class NoraWpfWindow : Window
 
         if (_state is TunnelState.Connecting or TunnelState.Disconnecting)
             return;
+
+        var discordMode = NoraDiscordModeSettings.Enabled;
+        if (discordMode && CurrentServerInfo().Protocol.Contains("AWG", StringComparison.OrdinalIgnoreCase))
+        {
+            AppendLog("[discord] connection blocked because AWG is selected");
+            ShowToast(
+                "AWG is not supported",
+                "Discord Mode works with VLESS and KRot servers. Select another server and try again.",
+                ToastKind.Info);
+            return;
+        }
 
         var cancellation = new CancellationTokenSource();
         var cancellationToken = cancellation.Token;
@@ -5352,7 +5805,7 @@ internal sealed class NoraWpfWindow : Window
                     throw new InvalidOperationException("No backend is available for subscription protocol " + _activeSubscriptionServer.Protocol);
                 backend = "Xray";
                 _trafficInterfaceHint = "NORA-Xray";
-                startedCore = new XrayCoreProcess(_activeSubscriptionServer, HandleCoreLine);
+                startedCore = new XrayCoreProcess(_activeSubscriptionServer, HandleCoreLine, discordMode);
             }
             else if (_activeExternalProtocol.Equals("AWG 2.0", StringComparison.OrdinalIgnoreCase))
             {
@@ -5362,21 +5815,31 @@ internal sealed class NoraWpfWindow : Window
             }
             else
             {
-                startedCore = new NvpCoreProcess(_activeProfilePath, HandleCoreLine);
+                startedCore = discordMode
+                    ? new NoraDiscordKrotCoreProcess(_activeProfilePath, HandleCoreLine)
+                    : new NvpCoreProcess(_activeProfilePath, HandleCoreLine);
             }
             cancellationToken.ThrowIfCancellationRequested();
             _core = startedCore;
             AppendLog("Starting " + backend + " backend");
             await StartCoreAsync(startedCore, TimeSpan.FromSeconds(50), cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
-            AppendLog(backend + " core is ready; verifying tunneled HTTPS and DNS");
-            await VerifyDataPlaneAsync(startedCore, TimeSpan.FromSeconds(35), cancellationToken);
+            if (discordMode && startedCore is INoraDiscordModeCore selectiveCore)
+            {
+                AppendLog(backend + " core is ready; verifying the Discord-only route");
+                await selectiveCore.VerifyDiscordPathAsync(TimeSpan.FromSeconds(35), cancellationToken);
+            }
+            else
+            {
+                AppendLog(backend + " core is ready; verifying tunneled HTTPS and DNS");
+                await VerifyDataPlaneAsync(startedCore, TimeSpan.FromSeconds(35), cancellationToken);
+            }
             cancellationToken.ThrowIfCancellationRequested();
             if (!ReferenceEquals(_core, startedCore))
                 throw new OperationCanceledException(cancellationToken);
             _connectedFor.Restart();
             ApplyState(TunnelState.Connected);
-            AppendLog("Data plane verified; connection is online");
+            AppendLog(discordMode ? "Discord-only data path verified; connection is online" : "Data plane verified; connection is online");
             ArmBackendExitWatch();
         }
         catch (Exception) when (cancellationToken.IsCancellationRequested)
@@ -5411,6 +5874,7 @@ internal sealed class NoraWpfWindow : Window
     {
         var candidates = NoraSubscriptionStore.GetAutomaticFailoverCandidates(primary);
         Exception? lastFailure = null;
+        var discordMode = NoraDiscordModeSettings.Enabled;
 
         for (var index = 0; index < candidates.Count; index++)
         {
@@ -5421,15 +5885,23 @@ internal sealed class NoraWpfWindow : Window
             if (index > 0)
                 AppendLog($"AUTO fallback {index + 1}/{candidates.Count}: trying {candidate.Name}.");
 
-            var core = new XrayCoreProcess(candidate, HandleCoreLine);
+            var core = new XrayCoreProcess(candidate, HandleCoreLine, discordMode);
             _core = core;
             try
             {
                 AppendLog("Starting Xray backend");
                 await StartCoreAsync(core, TimeSpan.FromSeconds(50), cancellationToken);
                 cancellationToken.ThrowIfCancellationRequested();
-                AppendLog("Xray core is ready; verifying tunneled HTTPS and DNS");
-                await VerifyDataPlaneAsync(core, TimeSpan.FromSeconds(35), cancellationToken);
+                if (discordMode)
+                {
+                    AppendLog("Xray core is ready; verifying the Discord-only route");
+                    await core.VerifyDiscordPathAsync(TimeSpan.FromSeconds(35), cancellationToken);
+                }
+                else
+                {
+                    AppendLog("Xray core is ready; verifying tunneled HTTPS and DNS");
+                    await VerifyDataPlaneAsync(core, TimeSpan.FromSeconds(35), cancellationToken);
+                }
                 cancellationToken.ThrowIfCancellationRequested();
                 if (!ReferenceEquals(_core, core))
                     throw new OperationCanceledException(cancellationToken);
@@ -5437,7 +5909,7 @@ internal sealed class NoraWpfWindow : Window
                 ApplyState(TunnelState.Connected);
                 if (index > 0)
                     AppendLog($"AUTO route switched to a working endpoint: {candidate.Name}.");
-                AppendLog("Data plane verified; connection is online");
+                AppendLog(discordMode ? "Discord-only data path verified; connection is online" : "Data plane verified; connection is online");
                 ArmBackendExitWatch();
                 return;
             }
@@ -6047,6 +6519,7 @@ internal sealed class NoraWpfWindow : Window
         }
         if (_connectButton is not null)
         {
+            _connectButton.ConnectedAccent = DiscordModeEnabledForView() ? DiscordModeAccent : NoraWpfTheme.Green;
             _connectButton.IsConnected = state == TunnelState.Connected;
             _connectButton.IsProgress = state is TunnelState.Connecting or TunnelState.Disconnecting;
             _connectButton.IsFailed = state == TunnelState.Failed;
@@ -6064,6 +6537,24 @@ internal sealed class NoraWpfWindow : Window
             _connectButton.InvalidateVisual();
         }
         _audioBackdrop?.SetAccent(ConnectAccentFor(state));
+        if (_discordModeStatusText is not null)
+        {
+            _discordModeStatusText.Text = state switch
+            {
+                TunnelState.Connected => "DISCORD IS PROTECTED",
+                TunnelState.Connecting => "CONNECTING DISCORD TO THE SELECTED SERVER",
+                TunnelState.Disconnecting => "STOPPING DISCORD CONNECTION",
+                TunnelState.Failed => "DISCORD CONNECTION FAILED · TRY ANOTHER SERVER",
+                _ => "SELECT A VLESS OR KROT SERVER AND CONNECT"
+            };
+            _discordModeStatusText.Foreground = state switch
+            {
+                TunnelState.Connected => NoraWpfTheme.GreenBrush,
+                TunnelState.Failed => NoraWpfTheme.RedBrush,
+                TunnelState.Connecting or TunnelState.Disconnecting => NoraWpfTheme.OrangeBrush,
+                _ => NoraWpfTheme.DimBrush
+            };
+        }
         foreach (var graph in _graphs)
         {
             graph.Active = state == TunnelState.Connected;
@@ -7702,6 +8193,7 @@ internal sealed class NoraConnectButton : WpfButton
     public bool IsConnected { get; set; }
     public bool IsProgress { get; set; }
     public bool IsFailed { get; set; }
+    public Color ConnectedAccent { get; set; } = NoraWpfTheme.Green;
 
     public NoraConnectButton()
     {
@@ -7739,7 +8231,7 @@ internal sealed class NoraConnectButton : WpfButton
         IsFailed = false;
         MainText = "Connected";
         DetailText = duration.ToString(@"hh\:mm\:ss", CultureInfo.InvariantCulture);
-        _accent = NoraWpfTheme.Green;
+        _accent = ConnectedAccent;
         _shownMain = "Connected";
         _previousMain = "";
         _textTransition = 1;
@@ -7774,7 +8266,7 @@ internal sealed class NoraConnectButton : WpfButton
             _pulseT += dt;
         _hover = Approach(_hover, IsMouseOver ? 1 : 0, dt, 12);
         _press = Approach(_press, IsPressed ? 1 : 0, dt, 22);
-        var target = IsFailed ? NoraWpfTheme.Red : IsConnected ? NoraWpfTheme.Green : IsProgress ? NoraWpfTheme.Orange2 : NoraWpfTheme.Orange;
+        var target = IsFailed ? NoraWpfTheme.Red : IsConnected ? ConnectedAccent : IsProgress ? NoraWpfTheme.Orange2 : NoraWpfTheme.Orange;
         _accent = LerpApproach(_accent, target, dt, IsConnected ? 3.4 : 6.5);
         if (_ripple < 1)
             _ripple = Math.Min(1, _ripple + dt * 2.2);
@@ -8951,6 +9443,10 @@ internal static class NoraFormUi
 internal sealed class NoraProgressWindow : Window
 {
     private readonly TextBlock _status = new();
+    private readonly TextBlock _heading = new();
+    private readonly NoraSpinner _spinner = new() { Width = 50, Height = 50, VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(0, 4, 20, 0) };
+    private readonly StackPanel _panel = new() { VerticalAlignment = VerticalAlignment.Center };
+    private bool _errorShown;
 
     public NoraProgressWindow(string title, string status)
     {
@@ -8959,6 +9455,7 @@ internal sealed class NoraProgressWindow : Window
         Height = 240;
         ResizeMode = ResizeMode.NoResize;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
+        ShowInTaskbar = false;
         Background = NoraWpfTheme.BgBrush;
         Foreground = NoraWpfTheme.TextBrush;
         FontFamily = NoraWpfTheme.UiFont;
@@ -8976,24 +9473,55 @@ internal sealed class NoraProgressWindow : Window
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         card.Child = grid;
 
-        grid.Children.Add(new NoraSpinner { Width = 50, Height = 50, VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(0, 4, 20, 0) });
+        grid.Children.Add(_spinner);
 
-        var panel = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
-        Grid.SetColumn(panel, 1);
-        grid.Children.Add(panel);
-        panel.Children.Add(new TextBlock { Text = title, FontSize = 23, FontWeight = FontWeights.Bold });
+        Grid.SetColumn(_panel, 1);
+        grid.Children.Add(_panel);
+        _heading.Text = title;
+        _heading.FontSize = 23;
+        _heading.FontWeight = FontWeights.Bold;
+        _panel.Children.Add(_heading);
         _status.Text = status;
         _status.TextWrapping = TextWrapping.Wrap;
         _status.Foreground = NoraWpfTheme.MutedBrush;
         _status.FontSize = 13.5;
         _status.Margin = new Thickness(0, 10, 0, 0);
-        panel.Children.Add(_status);
+        _panel.Children.Add(_status);
         Content = card;
     }
 
     public void SetStatus(string status)
     {
         _status.Text = status;
+    }
+
+    public void SetError(string title, string message)
+    {
+        _heading.Text = title;
+        _heading.Foreground = NoraWpfTheme.RedBrush;
+        _status.Text = message;
+        _status.Foreground = NoraWpfTheme.Brush(Color.FromRgb(217, 184, 190));
+        _spinner.Visibility = Visibility.Collapsed;
+        Height = 290;
+        if (_errorShown)
+            return;
+        _errorShown = true;
+        var close = new NoraFxButton(NoraWpfTheme.Card2, Color.FromRgb(31, 38, 49), 14, false, NoraWpfTheme.StrokeBrush)
+        {
+            Width = 128,
+            Height = 40,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            Margin = new Thickness(0, 16, 0, 0),
+            Content = new TextBlock
+            {
+                Text = "Close",
+                FontSize = 13,
+                FontWeight = FontWeights.Bold,
+                Foreground = NoraWpfTheme.TextBrush
+            }
+        };
+        close.Click += (_, _) => Close();
+        _panel.Children.Add(close);
     }
 }
 

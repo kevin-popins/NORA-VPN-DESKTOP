@@ -2423,7 +2423,7 @@ internal static class NoraDataPlaneProbe
     }
 }
 
-internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<string> log) : IVpnCoreProcess
+internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<string> log, bool discordMode = false) : IVpnCoreProcess, INoraDiscordModeCore
 {
     private Process? _xray;
     private Process? _tunFrontend;
@@ -2472,12 +2472,20 @@ internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<stri
         var xrayConfigPath = Path.Combine(dir, "xray-" + server.Id + ".json");
         _tunConfigPath = Path.Combine(dir, "xray-tun-" + server.Id + ".json");
         File.WriteAllText(xrayConfigPath, NoraSubscriptionStore.BuildXrayConfig(server, _socksPort, endpointAddresses: endpointAddresses));
-        File.WriteAllText(_tunConfigPath, NoraSubscriptionStore.BuildXrayTunFrontendConfig(_socksPort, server));
+        File.WriteAllText(
+            _tunConfigPath,
+            discordMode
+                ? NoraDiscordRouting.BuildForSocks(_socksPort)
+                : NoraSubscriptionStore.BuildXrayTunFrontendConfig(_socksPort, server));
         if (!IPAddress.TryParse(server.Host, out _))
             log($"[xray] endpoint DNS pool pinned: {endpointAddresses.Count} IPv4 address(es) for this session");
 
         var routePolicy = NoraSubscriptionStore.ParseXrayRoutingPolicy(server.RawConfigJson);
-        if (routePolicy is not null)
+        if (discordMode)
+        {
+            log("Discord-only routing: Discord processes use the selected VLESS server; all other processes stay direct.");
+        }
+        else if (routePolicy is not null)
         {
             log($"Split routing active: {routePolicy.DirectMatcherCount} direct rule(s) bypass the tunnel" +
                 (routePolicy.BlockBittorrent ? ", BitTorrent blocked" : "") +
@@ -2558,6 +2566,14 @@ internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<stri
         {
             return new NoraBackendProbeResult(false, Math.Max(1, stopwatch.ElapsedMilliseconds), ex.GetBaseException().GetType().Name, ex.GetBaseException().Message);
         }
+    }
+
+    public async Task VerifyDiscordPathAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        var result = await ProbeLocalSocksAsync(timeout, cancellationToken);
+        if (!result.Success)
+            throw new NoraAppException("NORA-DIS-9103", "The selected VLESS server did not carry Discord Mode traffic: " + result.Detail);
+        log($"[discord] VLESS selective route ready through local Xray SOCKS; probe_ms={result.Milliseconds}");
     }
 
     internal async Task StartTunFrontendForDiagnosticsAsync(TimeSpan timeout, CancellationToken cancellationToken)

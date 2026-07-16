@@ -1524,7 +1524,7 @@ internal sealed class MainWindow : Form
     }
 }
 
-internal sealed class NvpCoreProcess(string profilePath, Action<string> log) : IVpnCoreProcess
+internal sealed class NvpCoreProcess(string profilePath, Action<string> log, bool selectiveMode = false) : IVpnCoreProcess
 {
     private Process? _process;
     private readonly TaskCompletionSource _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1542,7 +1542,7 @@ internal sealed class NvpCoreProcess(string profilePath, Action<string> log) : I
             CreateNoWindow = true,
             WorkingDirectory = AppContext.BaseDirectory
         };
-        psi.ArgumentList.Add("client");
+        psi.ArgumentList.Add(selectiveMode ? "client-selective" : "client");
         psi.ArgumentList.Add(profilePath);
 
         _process = new Process { StartInfo = psi, EnableRaisingEvents = true };

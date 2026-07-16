@@ -18,7 +18,12 @@ $required = @(
     "cores\sing-box.exe",
     "cores\amneziawg.exe",
     "cores\awg.exe",
-    "cores\wintun.dll"
+    "cores\wintun.dll",
+    "assets\router-with-screen-svgrepo-com.svg",
+    "assets\locations\Discord1.png",
+    "assets\locations\Discord2.png",
+    "assets\locations\Discord3.png",
+    "assets\locations\Discord4.png"
 )
 
 $missing = $required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $root $_)) }
@@ -74,4 +79,9 @@ if ($LASTEXITCODE -ne 0) {
     throw "sing-box.exe version check failed with exit code $LASTEXITCODE"
 }
 
-Write-Host "PORTABLE CORE CHECK PASS: all required assets, $($brandIcon.Count) title/tray frames, $($taskbarIcon.Count) taskbar frames, $flagCount country flags, $emojiCount color emoji, and cores are present and executable."
+$discordSelfTest = Start-Process -FilePath (Join-Path $root "NoraVPN.exe") -ArgumentList @("discord-routing-selftest") -WindowStyle Hidden -Wait -PassThru
+if ($discordSelfTest.ExitCode -ne 0) {
+    throw "Discord routing self-test failed with exit code $($discordSelfTest.ExitCode)"
+}
+
+Write-Host "PORTABLE CORE CHECK PASS: all required assets, $($brandIcon.Count) title/tray frames, $($taskbarIcon.Count) taskbar frames, $flagCount country flags, $emojiCount color emoji, VPN cores, and Discord Mode routing are present and executable."

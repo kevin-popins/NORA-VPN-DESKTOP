@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.0-pre.3 — 2026-07-16
+
+- Added routing presets with the first beta preset, Discord Mode.
+- Discord Mode routes only Discord through a selected VLESS or KRot server;
+  other applications keep using the normal connection.
+- Added the Routing Rules page, opened from the computer icon on the left side
+  of the Home screen.
+
 ## 0.1.0-pre.2 — 2026-07-15
 
 - Added a connection test on the Logs page with a ready-to-share diagnostic report.

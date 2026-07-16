@@ -25,6 +25,17 @@ internal static class Program
     [STAThread]
     public static int Main(string[] args)
     {
+#if WINDOWS
+#if NORA_QA_PREVIEW
+        if (args.Length == 0)
+        {
+            return NoraWpfShell.RunPreview();
+        }
+#endif
+        if (args.Length == 1 && args[0].Equals("discord-routing-selftest", StringComparison.OrdinalIgnoreCase))
+            return NoraDiscordRouting.RunSelfTest(Console.Out);
+#endif
+
         if (args.Length == 0)
         {
 #if WINDOWS
@@ -270,11 +281,12 @@ internal static class Program
             return 2;
         }
 
-        if (args.Length < 2 || args[0] is not ("server" or "client" or "diag" or "resume-diag" or "security-diag" or "cover-diag" or "garbage-diag" or "lint" or "tuncheck" or "subdiag" or "singbox-config" or "xray-config" or "xray-tun-config" or "xray-diag" or "user-add" or "user-disable"))
+        if (args.Length < 2 || args[0] is not ("server" or "client" or "client-selective" or "diag" or "resume-diag" or "security-diag" or "cover-diag" or "garbage-diag" or "lint" or "tuncheck" or "subdiag" or "singbox-config" or "xray-config" or "xray-tun-config" or "xray-diag" or "user-add" or "user-disable"))
         {
             Console.WriteLine("Usage:");
             Console.WriteLine("  nvp server <server-profile.json>");
             Console.WriteLine("  nvp client <client-profile.json>");
+            Console.WriteLine("  nvp client-selective <client-profile.json>");
             Console.WriteLine("  nvp diag <client-profile.json>");
             Console.WriteLine("  nvp resume-diag <client-profile.json>");
             Console.WriteLine("  nvp security-diag <client-profile.json>");
@@ -422,8 +434,8 @@ internal static class Program
             var config = NvpConfig.Load(args[1]);
             if (args[0] == "server")
                 new NvpServer(config).RunAsync().GetAwaiter().GetResult();
-            else if (args[0] == "client")
-                new NvpClient(config).RunAsync().GetAwaiter().GetResult();
+            else if (args[0] is "client" or "client-selective")
+                new NvpClient(config, selectiveMode: args[0] == "client-selective").RunAsync().GetAwaiter().GetResult();
             else if (args[0] == "diag")
             {
                 var diag = NvpDiagnostics.ProbeAsync(config, CancellationToken.None).GetAwaiter().GetResult();
@@ -544,7 +556,7 @@ internal static class Program
     private static NoraOperation OperationForCommand(string command)
         => command.ToLowerInvariant() switch
         {
-            "client" => NoraOperation.Connect,
+            "client" or "client-selective" => NoraOperation.Connect,
             "subdiag" => NoraOperation.ImportProfile,
             "xray-diag" => NoraOperation.Diagnostics,
             "diag" or "resume-diag" or "security-diag" or "cover-diag" or "garbage-diag" or "tuncheck" => NoraOperation.Diagnostics,
@@ -1595,7 +1607,7 @@ internal sealed class NvpServer(NvpConfig config)
     }
 }
 
-internal sealed class NvpClient(NvpConfig config)
+internal sealed class NvpClient(NvpConfig config, bool selectiveMode = false)
 {
     public async Task RunAsync()
     {
@@ -1609,7 +1621,7 @@ internal sealed class NvpClient(NvpConfig config)
         if (!IsAdministrator())
             throw new InvalidOperationException("Run nvp.exe as Administrator/root so it can create TUN routes");
 
-        await using var session = new NvpClientSession(config, line => Console.WriteLine("[client] " + line));
+        await using var session = new NvpClientSession(config, line => Console.WriteLine("[client] " + line), selectiveMode);
         Console.CancelKeyPress += (_, e) =>
         {
             e.Cancel = true;
@@ -1617,7 +1629,9 @@ internal sealed class NvpClient(NvpConfig config)
         };
         var stdinStop = NvpConsole.CreateInteractiveStopTask(session.Stop);
         await session.StartAsync();
-        Console.WriteLine("[client] tunnel is up. Press Ctrl+C to stop.");
+        Console.WriteLine(selectiveMode
+            ? "[client] selective tunnel is up. Press Ctrl+C to stop."
+            : "[client] tunnel is up. Press Ctrl+C to stop.");
         await Task.WhenAny(session.WaitAsync(), stdinStop);
     }
 
@@ -1944,7 +1958,7 @@ internal sealed class NvpLinuxClientSession(NvpConfig config, Action<string>? lo
     private void Log(string message) => log?.Invoke(message);
 }
 
-internal sealed class NvpClientSession(NvpConfig config, Action<string>? log = null) : IAsyncDisposable
+internal sealed class NvpClientSession(NvpConfig config, Action<string>? log = null, bool selectiveMode = false) : IAsyncDisposable
 {
     private TcpClient? _tcp;
     private Stream? _stream;
@@ -2002,12 +2016,17 @@ internal sealed class NvpClientSession(NvpConfig config, Action<string>? log = n
         Log($"Wintun interface index: {_tun.InterfaceIndex}");
         foreach (var warning in WindowsNet.ActiveVpnWarnings(config))
             Log("Route warning: " + warning);
-        Log("Applying Windows routes and DNS");
-        WindowsNet.ConfigureClient(config, _server.Address, _tun.InterfaceIndex);
-        var routeStatus = WindowsNet.VerifyClient(config, _server.Address, _tun.InterfaceIndex);
+        Log(selectiveMode ? "Preparing selective KRot interface" : "Applying Windows routes and DNS");
+        if (selectiveMode)
+            WindowsNet.ConfigureSelective(config, _server.Address, _tun.InterfaceIndex);
+        else
+            WindowsNet.ConfigureClient(config, _server.Address, _tun.InterfaceIndex);
+        var routeStatus = selectiveMode
+            ? WindowsNet.VerifySelective(config, _server.Address, _tun.InterfaceIndex)
+            : WindowsNet.VerifyClient(config, _server.Address, _tun.InterfaceIndex);
         if (!routeStatus.Success)
             throw new NoraAppException("NORA-KRT-3005", routeStatus.Details);
-        Log("Wintun adapter, DNS and full-tunnel routes verified: " + routeStatus.Details);
+        Log((selectiveMode ? "Selective KRot interface verified: " : "Wintun adapter, DNS and full-tunnel routes verified: ") + routeStatus.Details);
         _uplink = Task.Run(async () =>
         {
             try
@@ -2119,6 +2138,12 @@ internal sealed class NvpClientSession(NvpConfig config, Action<string>? log = n
             }
         }, _cts.Token);
 
+        if (selectiveMode)
+        {
+            Log("Selective KRot data plane is ready; no system default route or DNS was replaced");
+            return;
+        }
+
         Log("Triggering IPv4 data-plane probe");
         WindowsNet.ProbeIpv4Traffic();
         await WaitForDataPlaneCounterAsync(() => Interlocked.Read(ref _tunToRelayPackets), TimeSpan.FromSeconds(3), _cts.Token);
@@ -2172,7 +2197,12 @@ internal sealed class NvpClientSession(NvpConfig config, Action<string>? log = n
         _ = _secure?.WriteFrameAsync(NvpFrameType.Close, ReadOnlyMemory<byte>.Empty, CancellationToken.None).ContinueWith(_ => { });
         cts.Cancel();
         if (_server is not null && OperatingSystem.IsWindows())
-            WindowsNet.RestoreClient(config, _server.Address, _tun?.InterfaceIndex);
+        {
+            if (selectiveMode)
+                WindowsNet.RestoreSelective(config, _server.Address, _tun?.InterfaceIndex);
+            else
+                WindowsNet.RestoreClient(config, _server.Address, _tun?.InterfaceIndex);
+        }
         Log($"Data-plane counters: tun->relay={_tunToRelayPackets}/{_tunToRelayBytes}b relay->tun={_relayToTunPackets}/{_relayToTunBytes}b");
     }
 
@@ -4417,6 +4447,53 @@ internal static class WindowsNet
         Run("netsh.exe", $"interface ipv4 add route prefix=128.0.0.0/1 interface={snapshot.TunIndex} metric=1 store=active", timeoutMs: 10000);
     }
 
+    public static void ConfigureSelective(NvpConfig config, string serverAddress, int tunIndex)
+    {
+        var snapshot = GetSnapshot(config, tunIndex);
+        var mask = CidrToMask(24);
+
+        Run("netsh.exe", $"interface ipv4 set address name={tunIndex} static {config.Tunnel.ClientIp} {mask} none", timeoutMs: 20000);
+        Run("netsh.exe", $"interface ipv4 set interface {tunIndex} metric=9000", timeoutMs: 15000);
+        Run("netsh.exe", $"interface ipv4 delete route prefix=0.0.0.0/0 interface={snapshot.TunIndex} store=active", throwOnError: false, timeoutMs: 10000);
+        Run("route.exe", $"DELETE {serverAddress} MASK 255.255.255.255", throwOnError: false, timeoutMs: 10000);
+        Run("route.exe", $"ADD {serverAddress} MASK 255.255.255.255 {snapshot.PhysicalGateway} IF {snapshot.PhysicalIndex} METRIC 1", timeoutMs: 10000);
+
+        // A high-metric /0 keeps the interface usable for sockets explicitly
+        // bound to KRot while the physical /0 remains the system default.
+        Run("netsh.exe", $"interface ipv4 add route prefix=0.0.0.0/0 interface={snapshot.TunIndex} metric=9000 store=active", timeoutMs: 10000);
+    }
+
+    public static NvpDiagnostics VerifySelective(NvpConfig config, string serverAddress, int tunIndex)
+    {
+        try
+        {
+            var snapshot = GetSnapshot(config, tunIndex);
+            var tunRoutes = RunCapture("netsh.exe", $"interface ipv4 show route interface={snapshot.TunIndex}", timeoutMs: 5000);
+            var serverRoutes = RunCapture("route.exe", $"PRINT -4 {serverAddress}", timeoutMs: 5000);
+            var defaultRoute = RunCapture("route.exe", "PRINT -4 1.1.1.1", timeoutMs: 5000);
+
+            if (!HasTunPrefix(tunRoutes, "0.0.0.0/0"))
+                return new NvpDiagnostics { Stage = "selective_route_verify", Success = false, Details = "The high-metric KRot selective route is missing." };
+            if (HasTunPrefix(tunRoutes, "0.0.0.0/1") || HasTunPrefix(tunRoutes, "128.0.0.0/1"))
+                return new NvpDiagnostics { Stage = "selective_route_verify", Success = false, Details = "A full-tunnel /1 route is present while Discord Mode is enabled." };
+            if (!HasRoute(serverRoutes, serverAddress, "255.255.255.255", snapshot.PhysicalGateway))
+                return new NvpDiagnostics { Stage = "selective_route_verify", Success = false, Details = "The KRot server physical bypass route is missing." };
+            if (!defaultRoute.Contains(snapshot.PhysicalGateway, StringComparison.OrdinalIgnoreCase))
+                return new NvpDiagnostics { Stage = "selective_route_verify", Success = false, Details = "The normal Windows default route is no longer using the physical gateway." };
+
+            return new NvpDiagnostics
+            {
+                Stage = "selective_route_verify",
+                Success = true,
+                Details = $"adapter={snapshot.TunName}; ifIndex={snapshot.TunIndex}; metric=9000; system_default=physical; dns=unchanged"
+            };
+        }
+        catch (Exception ex)
+        {
+            return new NvpDiagnostics { Stage = "selective_route_verify", Success = false, Details = ex.Message };
+        }
+    }
+
     public static NvpDiagnostics VerifyClient(NvpConfig config, string serverAddress, int tunIndex)
     {
         try
@@ -4470,6 +4547,15 @@ internal static class WindowsNet
             Run("netsh.exe", $"interface ipv4 set dnsservers name={tunIndex.Value} source=dhcp", throwOnError: false, timeoutMs: 10000);
             Run("netsh.exe", $"interface ipv4 set address name={tunIndex.Value} source=dhcp", throwOnError: false, timeoutMs: 10000);
         }
+    }
+
+    public static void RestoreSelective(NvpConfig config, string serverAddress, int? tunIndex)
+    {
+        Run("route.exe", $"DELETE {serverAddress} MASK 255.255.255.255", throwOnError: false, timeoutMs: 10000);
+        if (tunIndex is null)
+            return;
+        Run("netsh.exe", $"interface ipv4 delete route prefix=0.0.0.0/0 interface={tunIndex.Value} store=active", throwOnError: false, timeoutMs: 10000);
+        Run("netsh.exe", $"interface ipv4 set address name={tunIndex.Value} source=dhcp", throwOnError: false, timeoutMs: 10000);
     }
 
     public static void ProbeIpv4Traffic()

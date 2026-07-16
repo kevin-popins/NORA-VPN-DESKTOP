@@ -70,6 +70,17 @@ NORA есть живой главный экран, карта, аккуратн
 - **Диагностика подключения.** На странице Logs можно запустить проверку
   соединения и получить готовый отчёт, если VPN не подключается.
 
+### Пресеты маршрутизации
+
+Я добавил отдельные режимы для случаев, когда VPN нужен не всей системе.
+Первый пресет — **Discord Mode**: через выбранный VPN-сервер идёт только
+Discord, а остальные приложения продолжают использовать обычное подключение.
+
+Открыть режим можно кнопкой с иконкой компьютера слева на главном экране.
+Сейчас Discord Mode работает с VLESS и KRot; AmneziaWG пока не поддерживается.
+Режим находится в бета-версии, поэтому возможны ошибки. В будущем я планирую
+добавить больше пресетов маршрутизации.
+
 ### Что такое KRot
 
 **KRot** — мой экспериментальный VPN-протокол, вдохновлённый VLESS и
@@ -122,6 +133,17 @@ live home screen, a map, tidy traffic stats, and an easy-to-read server list.
   speed changes without abrupt jumps between samples.
 - **Connection diagnostics.** The Logs page can run a connection test and
   produce a ready-to-share report when the VPN cannot connect.
+
+### Routing presets
+
+I added separate modes for cases where the whole system does not need to use
+the VPN. The first preset is **Discord Mode**: only Discord goes through the
+selected VPN server, while other apps continue using the normal connection.
+
+Open it with the computer icon on the left side of the Home screen. Discord
+Mode currently works with VLESS and KRot; AmneziaWG is not supported yet. The
+mode is in beta, so bugs are possible. I plan to add more routing presets in
+future releases.
 
 ### What is KRot?
 

@@ -288,6 +288,10 @@ internal static class NoraDiagnosticEnvironment
             DescribeCore("amneziawg", NoraSubscriptionStore.AmneziaWgPath()),
             DescribeCore("awg", NoraSubscriptionStore.AmneziaWgCliPath())
         };
+        var discordMissing = NoraDiscordModeSettings.MissingComponents();
+        lines.Add($"discord_mode enabled={NoraDiscordModeSettings.Enabled}; components={(discordMissing.Count == 0 ? "ready" : "missing")}; protocols=VLESS,KRot; awg_supported=false");
+        if (discordMissing.Count > 0)
+            lines.Add("discord_mode missing=" + string.Join(",", discordMissing.Select(Path.GetFileName)));
         return lines;
     }
 
