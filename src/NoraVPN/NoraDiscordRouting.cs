@@ -88,7 +88,8 @@ internal static class NoraDiscordModeSettings
         var configPath = Path.Combine(runtime, "discord-mode-check.json");
         try
         {
-            File.WriteAllText(configPath, NoraDiscordRouting.BuildForSocks(9));
+            var config = await NoraDiscordRouting.BuildForSocksAsync(9, cancellationToken);
+            File.WriteAllText(configPath, config);
             await NoraDiscordRouting.CheckConfigAsync(configPath, TimeSpan.FromSeconds(10), cancellationToken);
         }
         finally
@@ -124,7 +125,7 @@ internal static class NoraDiscordRouting
         TypeInfoResolver = new DefaultJsonTypeInfoResolver()
     };
 
-    public static string BuildForSocks(int socksPort)
+    public static async Task<string> BuildForSocksAsync(int socksPort, CancellationToken cancellationToken = default)
     {
         var vpn = new JsonObject
         {
@@ -133,10 +134,13 @@ internal static class NoraDiscordRouting
             ["server"] = "127.0.0.1",
             ["server_port"] = socksPort
         };
-        return Build(vpn);
+        var physical = await FindPhysicalInterfaceNameAsync(cancellationToken).ConfigureAwait(false);
+        return Build(vpn, physical);
     }
 
-    public static string BuildForInterface(string interfaceName)
+    public static async Task<string> BuildForInterfaceAsync(
+        string interfaceName,
+        CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(interfaceName))
             throw new ArgumentException("The KRot interface name is required.", nameof(interfaceName));
@@ -146,12 +150,12 @@ internal static class NoraDiscordRouting
             ["tag"] = "vpn",
             ["bind_interface"] = interfaceName
         };
-        return Build(vpn);
+        var physical = await FindPhysicalInterfaceNameAsync(cancellationToken).ConfigureAwait(false);
+        return Build(vpn, physical);
     }
 
-    private static string Build(JsonObject vpnOutbound)
+    private static string Build(JsonObject vpnOutbound, string physical)
     {
-        var physical = FindPhysicalInterfaceName();
         var processNames = new JsonArray();
         foreach (var name in ProcessNames)
             processNames.Add(name);
@@ -248,8 +252,8 @@ internal static class NoraDiscordRouting
         var interfacePath = Path.Combine(runtime, "discord-interface.json");
         try
         {
-            var socks = BuildForSocks(20808);
-            var bound = BuildForInterface("NORA-KRot-Test");
+            var socks = BuildForSocksAsync(20808).GetAwaiter().GetResult();
+            var bound = BuildForInterfaceAsync("NORA-KRot-Test").GetAwaiter().GetResult();
             File.WriteAllText(socksPath, socks);
             File.WriteAllText(interfacePath, bound);
 
@@ -296,9 +300,11 @@ internal static class NoraDiscordRouting
         }
     }
 
-    private static string FindPhysicalInterfaceName()
+    private static async Task<string> FindPhysicalInterfaceNameAsync(CancellationToken cancellationToken)
     {
-        var candidates = NetworkInterface.GetAllNetworkInterfaces()
+        var snapshot = await NoraNetworkInterfaceCache.GetSnapshotAsync(
+            cancellationToken: cancellationToken).ConfigureAwait(false);
+        var candidates = snapshot.Interfaces
             .Where(x => x.OperationalStatus == OperationalStatus.Up)
             .Where(x => x.NetworkInterfaceType is NetworkInterfaceType.Ethernet or NetworkInterfaceType.Wireless80211)
             .Where(x => !IsTunnelLike(x.Name + " " + x.Description))
@@ -333,7 +339,7 @@ internal static class NoraDiscordRouting
            value.Contains("nora", StringComparison.OrdinalIgnoreCase);
 }
 
-internal sealed class NoraDiscordTunProcess(Func<string> buildConfig, Action<string> log) : IVpnCoreProcess
+internal sealed class NoraDiscordTunProcess(Func<CancellationToken, Task<string>> buildConfig, Action<string> log) : IVpnCoreProcess
 {
     private Process? _process;
     private string _configPath = "";
@@ -348,7 +354,7 @@ internal sealed class NoraDiscordTunProcess(Func<string> buildConfig, Action<str
         var runtime = Path.Combine(NoraAppState.DataRoot, "runtime");
         Directory.CreateDirectory(runtime);
         _configPath = Path.Combine(runtime, "discord-router-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture) + ".json");
-        File.WriteAllText(_configPath, buildConfig());
+        File.WriteAllText(_configPath, await buildConfig(CancellationToken.None));
         await NoraDiscordRouting.CheckConfigAsync(_configPath, TimeSpan.FromSeconds(10), CancellationToken.None);
 
         var psi = new ProcessStartInfo(executable)
@@ -423,7 +429,9 @@ internal sealed class NoraDiscordKrotCoreProcess : IVpnCoreProcess, INoraDiscord
         _config = NvpConfig.Load(profilePath);
         _log = log;
         _krot = new NvpCoreProcess(profilePath, log, selectiveMode: true);
-        _router = new NoraDiscordTunProcess(() => NoraDiscordRouting.BuildForInterface(_config.Tunnel.InterfaceName), log);
+        _router = new NoraDiscordTunProcess(
+            cancellationToken => NoraDiscordRouting.BuildForInterfaceAsync(_config.Tunnel.InterfaceName, cancellationToken),
+            log);
     }
 
     public async Task StartAsync(TimeSpan timeout)
@@ -487,7 +495,10 @@ internal static class NoraDiscordInterfaceProbe
         TimeSpan timeout,
         CancellationToken cancellationToken)
     {
-        var selected = NetworkInterface.GetAllNetworkInterfaces()
+        var snapshot = await NoraNetworkInterfaceCache.GetSnapshotAsync(
+            forceRefresh: true,
+            cancellationToken: cancellationToken).ConfigureAwait(false);
+        var selected = snapshot.Interfaces
             .Select(networkInterface => new
             {
                 Interface = networkInterface,

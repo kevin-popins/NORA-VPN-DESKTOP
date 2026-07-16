@@ -234,6 +234,26 @@ internal static class Program
 #endif
         }
 
+        if (args.Length == 1 && args[0].Equals("network-interface-cache-selftest", StringComparison.OrdinalIgnoreCase))
+        {
+#if WINDOWS
+            return NoraNetworkInterfaceCache.RunSelfTestAsync(Console.Out).GetAwaiter().GetResult();
+#else
+            Console.Error.WriteLine("Network-interface cache diagnostics are available only on Windows.");
+            return 2;
+#endif
+        }
+
+        if (args.Length == 1 && args[0].Equals("network-ui-responsiveness-selftest", StringComparison.OrdinalIgnoreCase))
+        {
+#if WINDOWS
+            return NoraWpfShell.RunNetworkUiResponsivenessSelfTest(Console.Out);
+#else
+            Console.Error.WriteLine("Network UI responsiveness diagnostics are available only on Windows.");
+            return 2;
+#endif
+        }
+
         if (args.Length == 1 && args[0].Equals("ui-scale-selftest", StringComparison.OrdinalIgnoreCase))
         {
 #if WINDOWS
@@ -313,6 +333,8 @@ internal static class Program
             Console.WriteLine("  nvp run-log-selftest");
             Console.WriteLine("  nvp connection-diagnostic-selftest");
             Console.WriteLine("  nvp traffic-motion-selftest");
+            Console.WriteLine("  nvp network-interface-cache-selftest");
+            Console.WriteLine("  nvp network-ui-responsiveness-selftest");
             Console.WriteLine("  nvp ui-scale-selftest");
             Console.WriteLine("  nvp direct-latency-probe <host> <port>");
             Console.WriteLine("  nvp ui-connect-cancel-smoke <result.json>");

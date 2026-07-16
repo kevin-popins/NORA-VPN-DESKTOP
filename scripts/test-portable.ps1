@@ -79,9 +79,24 @@ if ($LASTEXITCODE -ne 0) {
     throw "sing-box.exe version check failed with exit code $LASTEXITCODE"
 }
 
-$discordSelfTest = Start-Process -FilePath (Join-Path $root "NoraVPN.exe") -ArgumentList @("discord-routing-selftest") -WindowStyle Hidden -Wait -PassThru
-if ($discordSelfTest.ExitCode -ne 0) {
-    throw "Discord routing self-test failed with exit code $($discordSelfTest.ExitCode)"
+$isAdministrator = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+if ($isAdministrator) {
+    $discordSelfTest = Start-Process -FilePath (Join-Path $root "NoraVPN.exe") -ArgumentList @("discord-routing-selftest") -WorkingDirectory $root -WindowStyle Hidden -Wait -PassThru
+    if ($discordSelfTest.ExitCode -ne 0) {
+        throw "Discord routing self-test failed with exit code $($discordSelfTest.ExitCode)"
+    }
+}
+else {
+    $buildDll = Join-Path $PSScriptRoot "..\src\NoraVPN\bin\Release\net8.0-windows\win-x64\NoraVPN.dll"
+    if (-not (Test-Path -LiteralPath $buildDll)) {
+        throw "Non-elevated portable verification requires the Release build output: $buildDll"
+    }
+    dotnet $buildDll discord-routing-selftest
+    if ($LASTEXITCODE -ne 0) {
+        throw "Discord routing self-test failed from Release build output with exit code $LASTEXITCODE"
+    }
+    Write-Warning "Portable NoraVPN.exe requires elevation; routing logic was verified from the matching Release build without opening a UAC prompt."
 }
 
 Write-Host "PORTABLE CORE CHECK PASS: all required assets, $($brandIcon.Count) title/tray frames, $($taskbarIcon.Count) taskbar frames, $flagCount country flags, $emojiCount color emoji, VPN cores, and Discord Mode routing are present and executable."

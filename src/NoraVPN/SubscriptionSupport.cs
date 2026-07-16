@@ -838,35 +838,6 @@ internal static class NoraSubscriptionStore
         return root.ToJsonString(JsonOptions);
     }
 
-    private static string FindPhysicalInterfaceName()
-    {
-        var candidates = NetworkInterface.GetAllNetworkInterfaces()
-            .Where(x => x.OperationalStatus == OperationalStatus.Up)
-            .Where(x => x.NetworkInterfaceType is NetworkInterfaceType.Ethernet or NetworkInterfaceType.Wireless80211)
-            .Where(x => !IsTunnelLike(x.Name + " " + x.Description))
-            .Select(x => new
-            {
-                Interface = x,
-                HasIpv4Gateway = x.GetIPProperties().GatewayAddresses.Any(g =>
-                    g.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork &&
-                    !g.Address.Equals(System.Net.IPAddress.Any))
-            })
-            .OrderByDescending(x => x.HasIpv4Gateway)
-            .ToList();
-        var selected = candidates.FirstOrDefault(x => x.HasIpv4Gateway)?.Interface ?? candidates.FirstOrDefault()?.Interface;
-        if (selected is null)
-            throw new NoraAppException("NORA-NET-7005", "No active physical Ethernet or Wi-Fi adapter with a gateway was found.");
-        return selected.Name;
-    }
-
-    private static bool IsTunnelLike(string value)
-        => value.Contains("tunnel", StringComparison.OrdinalIgnoreCase) ||
-           value.Contains("wintun", StringComparison.OrdinalIgnoreCase) ||
-           value.Contains("tap", StringComparison.OrdinalIgnoreCase) ||
-           value.Contains("meta", StringComparison.OrdinalIgnoreCase) ||
-           value.Contains("virtual", StringComparison.OrdinalIgnoreCase) ||
-           value.Contains("openvpn", StringComparison.OrdinalIgnoreCase);
-
     private static JsonObject BuildXrayVlessOutbound(NoraSubscriptionServer server)
     {
         var stream = BuildXrayStreamSettings(server);
@@ -2154,7 +2125,8 @@ internal static class NoraDirectLatencyProbe
         TimeSpan timeout,
         CancellationToken cancellationToken = default)
     {
-        if (!TryGetPhysicalRoute(out var route))
+        var route = await GetPhysicalRouteAsync(cancellationToken).ConfigureAwait(false);
+        if (route is null)
         {
             return new NoraDirectLatencyResult(
                 false,
@@ -2207,8 +2179,8 @@ internal static class NoraDirectLatencyProbe
         {
             var encoded = InterfaceOptionValue(42);
             var expected = BitConverter.IsLittleEndian ? 0x2A00_0000 : 42;
-            var routeAvailable = TryGetPhysicalRoute(out var route);
-            var passed = encoded == expected && (!routeAvailable ||
+            var route = GetPhysicalRouteAsync(CancellationToken.None).GetAwaiter().GetResult();
+            var passed = encoded == expected && (route is null ||
                 (route.InterfaceIndex > 0 && route.LocalAddress.AddressFamily == AddressFamily.InterNetwork));
             output.WriteLine(passed
                 ? "DIRECT LATENCY SELF-TEST PASS: physical-interface option is network-order; no tunnel fallback"
@@ -2312,14 +2284,19 @@ internal static class NoraDirectLatencyProbe
         }
     }
 
-    private static bool TryGetPhysicalRoute(out PhysicalRoute route)
+    private static async Task<PhysicalRoute?> GetPhysicalRouteAsync(CancellationToken cancellationToken)
     {
-        var candidate = NetworkInterface.GetAllNetworkInterfaces()
-            .Where(network => network.OperationalStatus == OperationalStatus.Up)
-            .Where(network => network.NetworkInterfaceType is not NetworkInterfaceType.Loopback and not NetworkInterfaceType.Tunnel)
-            .Where(network => !LooksVirtualOrTunnelLike(network.Name + " " + network.Description))
-            .Select(network =>
+        var snapshot = await NoraNetworkInterfaceCache.GetSnapshotAsync(
+            cancellationToken: cancellationToken).ConfigureAwait(false);
+        var candidates = new List<(PhysicalRoute Route, int Priority)>();
+        foreach (var network in snapshot.Interfaces)
+        {
+            try
             {
+                if (network.OperationalStatus != OperationalStatus.Up ||
+                    network.NetworkInterfaceType is NetworkInterfaceType.Loopback or NetworkInterfaceType.Tunnel ||
+                    LooksVirtualOrTunnelLike(network.Name + " " + network.Description))
+                    continue;
                 var properties = network.GetIPProperties();
                 var address = properties.UnicastAddresses
                     .Select(item => item.Address)
@@ -2328,21 +2305,22 @@ internal static class NoraDirectLatencyProbe
                     gateway.Address.AddressFamily == AddressFamily.InterNetwork &&
                     !gateway.Address.Equals(IPAddress.Any));
                 var index = properties.GetIPv4Properties()?.Index ?? 0;
-                return new { network, address, hasGateway, index };
-            })
-            .Where(item => item.address is not null && item.hasGateway && item.index > 0)
-            .OrderBy(item => item.network.NetworkInterfaceType is NetworkInterfaceType.Ethernet or NetworkInterfaceType.Wireless80211 ? 0 : 1)
-            .ThenBy(item => item.index)
-            .FirstOrDefault();
-
-        if (candidate?.address is null)
-        {
-            route = null!;
-            return false;
+                if (address is not null && hasGateway && index > 0)
+                    candidates.Add((
+                        new PhysicalRoute(address, index, network.Name),
+                        network.NetworkInterfaceType is NetworkInterfaceType.Ethernet or NetworkInterfaceType.Wireless80211 ? 0 : 1));
+            }
+            catch
+            {
+                // Windows filter bindings can expose NetworkInterface records
+                // without a configured IPv4 protocol. Skip them independently.
+            }
         }
-
-        route = new PhysicalRoute(candidate.address, candidate.index, candidate.network.Name);
-        return true;
+        return candidates
+            .OrderBy(candidate => candidate.Priority)
+            .ThenBy(candidate => candidate.Route.InterfaceIndex)
+            .Select(candidate => candidate.Route)
+            .FirstOrDefault();
     }
 
     private static bool IsUsableIpv4(IPAddress address)
@@ -2472,11 +2450,10 @@ internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<stri
         var xrayConfigPath = Path.Combine(dir, "xray-" + server.Id + ".json");
         _tunConfigPath = Path.Combine(dir, "xray-tun-" + server.Id + ".json");
         File.WriteAllText(xrayConfigPath, NoraSubscriptionStore.BuildXrayConfig(server, _socksPort, endpointAddresses: endpointAddresses));
-        File.WriteAllText(
-            _tunConfigPath,
-            discordMode
-                ? NoraDiscordRouting.BuildForSocks(_socksPort)
-                : NoraSubscriptionStore.BuildXrayTunFrontendConfig(_socksPort, server));
+        var tunConfig = discordMode
+            ? await NoraDiscordRouting.BuildForSocksAsync(_socksPort, cancellationToken).ConfigureAwait(false)
+            : NoraSubscriptionStore.BuildXrayTunFrontendConfig(_socksPort, server);
+        File.WriteAllText(_tunConfigPath, tunConfig);
         if (!IPAddress.TryParse(server.Host, out _))
             log($"[xray] endpoint DNS pool pinned: {endpointAddresses.Count} IPv4 address(es) for this session");
 
@@ -2685,7 +2662,7 @@ internal static class XrayEndpointBypass
 
     public static async Task<IReadOnlyList<RouteEntry>> InstallAsync(IReadOnlyCollection<IPAddress> addresses, Action<string> log)
     {
-        var route = FindDefaultIpv4Route();
+        var route = await FindDefaultIpv4RouteAsync().ConfigureAwait(false);
         if (route is null)
             throw new NoraAppException("NORA-XRY-3105", "Cannot install the Xray endpoint bypass route because no physical IPv4 gateway was found.");
 
@@ -2735,24 +2712,29 @@ internal static class XrayEndpointBypass
         }
     }
 
-    private static RouteEntry? FindDefaultIpv4Route()
+    private static async Task<RouteEntry?> FindDefaultIpv4RouteAsync()
     {
-        foreach (var ni in NetworkInterface.GetAllNetworkInterfaces()
+        var snapshot = await NoraNetworkInterfaceCache.GetSnapshotAsync().ConfigureAwait(false);
+        foreach (var ni in snapshot.Interfaces
                      .Where(x => x.OperationalStatus == OperationalStatus.Up)
                      .Where(x => x.NetworkInterfaceType is NetworkInterfaceType.Ethernet or NetworkInterfaceType.Wireless80211)
                      .Where(x => !x.Name.Contains("NORA", StringComparison.OrdinalIgnoreCase) &&
                                  !x.Description.Contains("Wintun", StringComparison.OrdinalIgnoreCase) &&
                                  !x.Description.Contains("WireGuard", StringComparison.OrdinalIgnoreCase)))
         {
-            var ip = ni.GetIPProperties();
-            var gateway = ip.GatewayAddresses
-                .Select(x => x.Address)
-                .FirstOrDefault(x => x.AddressFamily == AddressFamily.InterNetwork && !x.Equals(IPAddress.Any));
-            if (gateway is null)
-                continue;
-            var index = ip.GetIPv4Properties()?.Index ?? 0;
-            if (index > 0)
-                return new RouteEntry(IPAddress.Any, gateway, index);
+            try
+            {
+                var ip = ni.GetIPProperties();
+                var gateway = ip.GatewayAddresses
+                    .Select(x => x.Address)
+                    .FirstOrDefault(x => x.AddressFamily == AddressFamily.InterNetwork && !x.Equals(IPAddress.Any));
+                if (gateway is null)
+                    continue;
+                var index = ip.GetIPv4Properties()?.Index ?? 0;
+                if (index > 0)
+                    return new RouteEntry(IPAddress.Any, gateway, index);
+            }
+            catch { }
         }
         return null;
     }

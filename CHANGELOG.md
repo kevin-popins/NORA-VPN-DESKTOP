@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.0-pre.4 — 2026-07-16
+
+- Kept the interface responsive while Windows scans physical and virtual
+  network adapters during latency checks, connection startup and diagnostics.
+- Prevented Live Traffic from counting a long Windows pause as a sudden traffic
+  spike.
+- Added regression checks for the shared network-adapter cache and WPF render
+  responsiveness.
+
 ## 0.1.0-pre.3 — 2026-07-16
 
 - Added routing presets with the first beta preset, Discord Mode.

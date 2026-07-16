@@ -70,7 +70,7 @@ internal sealed class NoraConnectionDiagnosticRunner
             cancellationToken.ThrowIfCancellationRequested();
 
             Stage(2, "Inspecting active network adapters");
-            foreach (var line in NoraDiagnosticEnvironment.DescribeAdapters())
+            foreach (var line in await NoraDiagnosticEnvironment.DescribeAdaptersAsync(cancellationToken))
                 Write(line);
             foreach (var line in await NoraDiagnosticEnvironment.DescribeFirewallAsync(cancellationToken))
                 Write(line);
@@ -295,10 +295,19 @@ internal static class NoraDiagnosticEnvironment
         return lines;
     }
 
-    public static IReadOnlyList<string> DescribeAdapters()
+    public static async Task<IReadOnlyList<string>> DescribeAdaptersAsync(CancellationToken cancellationToken)
+    {
+        var snapshot = await NoraNetworkInterfaceCache.GetSnapshotAsync(
+            cancellationToken: cancellationToken).ConfigureAwait(false);
+        return await Task.Run(
+            () => DescribeAdapters(snapshot.Interfaces),
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private static IReadOnlyList<string> DescribeAdapters(IReadOnlyList<NetworkInterface> interfaces)
     {
         var lines = new List<string>();
-        foreach (var adapter in NetworkInterface.GetAllNetworkInterfaces()
+        foreach (var adapter in interfaces
                      .Where(item => item.OperationalStatus == OperationalStatus.Up)
                      .OrderBy(item => item.NetworkInterfaceType is NetworkInterfaceType.Ethernet or NetworkInterfaceType.Wireless80211 ? 0 : 1)
                      .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase))

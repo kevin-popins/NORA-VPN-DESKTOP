@@ -2,6 +2,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
+using System.IO;
 using System.Net.Http;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -64,6 +65,79 @@ namespace Nvp;
 
 internal static class NoraWpfShell
 {
+    public static int RunNetworkUiResponsivenessSelfTest(TextWriter output)
+    {
+        var app = new WpfApplication { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+        var graph = new NoraTrafficGraph { Width = 220, Height = 120, Active = true };
+        graph.Seed([(120_000, 80_000), (180_000, 95_000)], 180_000, 95_000, 1_000_000, 700_000, TimeSpan.FromSeconds(8));
+        var window = new Window
+        {
+            Width = 220,
+            Height = 120,
+            Left = -10_000,
+            Top = -10_000,
+            ShowInTaskbar = false,
+            ShowActivated = false,
+            WindowStyle = WindowStyle.None,
+            Content = graph
+        };
+        var stopwatch = new Stopwatch();
+        var frames = 0;
+        var lastFrameMilliseconds = 0d;
+        var maximumFrameGap = 0d;
+        var timedOut = false;
+        Exception? failure = null;
+        EventHandler rendering = (_, _) =>
+        {
+            if (!stopwatch.IsRunning)
+                return;
+            var current = stopwatch.Elapsed.TotalMilliseconds;
+            if (frames > 0)
+                maximumFrameGap = Math.Max(maximumFrameGap, current - lastFrameMilliseconds);
+            lastFrameMilliseconds = current;
+            frames++;
+        };
+        CompositionTarget.Rendering += rendering;
+        app.Startup += async (_, _) =>
+        {
+            window.Show();
+            await window.Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
+            stopwatch.Start();
+            try
+            {
+                var refresh = NoraNetworkInterfaceCache.GetSnapshotAsync(forceRefresh: true);
+                var completed = await Task.WhenAny(refresh, Task.Delay(TimeSpan.FromSeconds(15)));
+                if (!ReferenceEquals(completed, refresh))
+                {
+                    timedOut = true;
+                    return;
+                }
+                await refresh;
+                await Task.Delay(250);
+            }
+            catch (Exception ex)
+            {
+                failure = ex;
+            }
+            finally
+            {
+                stopwatch.Stop();
+                CompositionTarget.Rendering -= rendering;
+                window.Close();
+                app.Shutdown();
+            }
+        };
+        app.Run();
+
+        var duration = stopwatch.Elapsed.TotalMilliseconds;
+        var passed = failure is null && !timedOut && frames >= 10 && maximumFrameGap < 500;
+        output.WriteLine(
+            $"NETWORK UI RESPONSIVENESS {(passed ? "PASS" : "FAIL")}: " +
+            $"duration_ms={duration:F0}; render_frames={frames}; max_frame_gap_ms={maximumFrameGap:F0}; " +
+            $"error={(failure?.GetBaseException().Message ?? (timedOut ? "timeout" : "none"))}");
+        return passed ? 0 : 1;
+    }
+
     public static int RunPreview()
     {
         var app = new WpfApplication { ShutdownMode = ShutdownMode.OnMainWindowClose };
@@ -527,6 +601,10 @@ internal sealed class NoraWpfWindow : Window
     private double _trafficDownBytes;
     private DateTimeOffset _lastTrafficSample;
     private string _trafficInterfaceHint = "";
+    private NetworkInterface? _trafficNetworkInterface;
+    private DateTimeOffset _nextTrafficInterfaceResolveAt;
+    private int _trafficSampleInFlight;
+    private int _trafficSamplerGeneration;
     private DateTimeOffset _lastInterfaceTrafficSample;
     private long _lastInterfaceBytesSent = -1;
     private long _lastInterfaceBytesReceived = -1;
@@ -706,10 +784,11 @@ internal sealed class NoraWpfWindow : Window
                 RenderPage(_page);
         };
         _clock.Start();
+        _ = NoraNetworkInterfaceCache.WarmAsync();
         _trafficSampleTimer.Tick += (_, _) =>
         {
             if (_state == TunnelState.Connected)
-                SampleBackendInterfaceTraffic();
+                _ = SampleBackendInterfaceTrafficAsync();
         };
         _trafficSampleTimer.Start();
         _managedRefreshTimer.Tick += (_, _) =>
@@ -728,6 +807,7 @@ internal sealed class NoraWpfWindow : Window
         {
             _diagnosticCancellation?.Cancel();
             _trafficSampleTimer.Stop();
+            ResetInterfaceTrafficSampler();
             DisposeTray();
             DisposeTaskbarIcon();
         };
@@ -5746,9 +5826,7 @@ internal sealed class NoraWpfWindow : Window
         _trafficDownBytes = 0;
         _lastTrafficSample = default;
         _trafficInterfaceHint = "";
-        _lastInterfaceTrafficSample = default;
-        _lastInterfaceBytesSent = -1;
-        _lastInterfaceBytesReceived = -1;
+        ResetInterfaceTrafficSampler();
         _trafficHistory.Clear();
         foreach (var graph in _graphs)
             graph.ResetSamples();
@@ -5772,6 +5850,7 @@ internal sealed class NoraWpfWindow : Window
                 ReportFailure(NoraOperation.Connect, ex);
                 _core = null;
                 _trafficInterfaceHint = "";
+                ResetInterfaceTrafficSampler();
                 ApplyState(TunnelState.Failed);
             }
             finally
@@ -5785,7 +5864,7 @@ internal sealed class NoraWpfWindow : Window
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var competing = NetworkInterface.GetAllNetworkInterfaces()
+            var competing = NoraNetworkInterfaceCache.CachedInterfaces
                 .Where(x => x.OperationalStatus == OperationalStatus.Up)
                 .Select(x => x.Name)
                 .Where(x => x.Contains("Tunnel", StringComparison.OrdinalIgnoreCase) ||
@@ -5862,6 +5941,7 @@ internal sealed class NoraWpfWindow : Window
             }
             FlushCoreLogSummary();
             _trafficInterfaceHint = "";
+            ResetInterfaceTrafficSampler();
             ApplyState(TunnelState.Failed);
         }
         finally
@@ -5882,6 +5962,7 @@ internal sealed class NoraWpfWindow : Window
             var candidate = candidates[index];
             _activeSubscriptionServer = candidate;
             _trafficInterfaceHint = "NORA-Xray";
+            ResetInterfaceTrafficSampler();
             if (index > 0)
                 AppendLog($"AUTO fallback {index + 1}/{candidates.Count}: trying {candidate.Name}.");
 
@@ -5988,6 +6069,7 @@ internal sealed class NoraWpfWindow : Window
             _connectedFor.Stop();
             _trafficLabel = "";
             _trafficInterfaceHint = "";
+            ResetInterfaceTrafficSampler();
             ApplyState(TunnelState.Ready);
             AppendLog("Connection attempt stopped");
         }
@@ -5996,6 +6078,7 @@ internal sealed class NoraWpfWindow : Window
             _connectedFor.Stop();
             _trafficLabel = "";
             _trafficInterfaceHint = "";
+            ResetInterfaceTrafficSampler();
             ApplyState(TunnelState.Failed);
             ReportFailure(NoraOperation.Disconnect, ex);
         }
@@ -6025,6 +6108,7 @@ internal sealed class NoraWpfWindow : Window
             _connectedFor.Stop();
             _trafficLabel = "";
             _trafficInterfaceHint = "";
+            ResetInterfaceTrafficSampler();
             ApplyState(TunnelState.Ready);
             return true;
         }
@@ -6033,6 +6117,7 @@ internal sealed class NoraWpfWindow : Window
             _connectedFor.Stop();
             _trafficLabel = "";
             _trafficInterfaceHint = "";
+            ResetInterfaceTrafficSampler();
             ApplyState(TunnelState.Failed);
             ReportFailure(operation, ex);
             return false;
@@ -6065,57 +6150,111 @@ internal sealed class NoraWpfWindow : Window
         _coreLogLimiter = new NoraCoreLogLimiter();
     }
 
-    private void SampleBackendInterfaceTraffic()
+    private async Task SampleBackendInterfaceTrafficAsync()
     {
-        if (string.IsNullOrWhiteSpace(_trafficInterfaceHint))
+        if (Interlocked.Exchange(ref _trafficSampleInFlight, 1) != 0)
             return;
-        if (!TryGetInterfaceBytes(_trafficInterfaceHint, out var sent, out var received))
-            return;
-
-        var now = DateTimeOffset.UtcNow;
-        if (_lastInterfaceTrafficSample == default || _lastInterfaceBytesSent < 0 || _lastInterfaceBytesReceived < 0)
+        var generation = _trafficSamplerGeneration;
+        var hint = _trafficInterfaceHint;
+        try
         {
+            if (string.IsNullOrWhiteSpace(hint))
+                return;
+
+            var networkInterface = _trafficNetworkInterface;
+            if (networkInterface is null)
+            {
+                if (DateTimeOffset.UtcNow < _nextTrafficInterfaceResolveAt)
+                    return;
+                _nextTrafficInterfaceResolveAt = DateTimeOffset.UtcNow.AddSeconds(2);
+                var snapshot = await NoraNetworkInterfaceCache.GetSnapshotAsync(forceRefresh: true);
+                networkInterface = NoraNetworkInterfaceCache.FindByHint(snapshot.Interfaces, hint);
+                if (networkInterface is null)
+                {
+                    NoraNetworkInterfaceCache.Invalidate();
+                    return;
+                }
+                if (generation != _trafficSamplerGeneration ||
+                    _state != TunnelState.Connected ||
+                    !string.Equals(hint, _trafficInterfaceHint, StringComparison.OrdinalIgnoreCase))
+                    return;
+                _trafficNetworkInterface = networkInterface;
+                _lastInterfaceTrafficSample = default;
+                _lastInterfaceBytesSent = -1;
+                _lastInterfaceBytesReceived = -1;
+            }
+
+            var bytes = await Task.Run(() => ReadInterfaceBytes(networkInterface));
+            if (bytes is null)
+            {
+                if (ReferenceEquals(_trafficNetworkInterface, networkInterface))
+                    _trafficNetworkInterface = null;
+                NoraNetworkInterfaceCache.Invalidate();
+                return;
+            }
+            if (generation != _trafficSamplerGeneration ||
+                _state != TunnelState.Connected ||
+                !string.Equals(hint, _trafficInterfaceHint, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            var now = DateTimeOffset.UtcNow;
+            var (sent, received) = bytes.Value;
+            if (_lastInterfaceTrafficSample == default || _lastInterfaceBytesSent < 0 || _lastInterfaceBytesReceived < 0)
+            {
+                _lastInterfaceTrafficSample = now;
+                _lastInterfaceBytesSent = sent;
+                _lastInterfaceBytesReceived = received;
+                return;
+            }
+
+            var elapsed = (now - _lastInterfaceTrafficSample).TotalSeconds;
+            var upDelta = Math.Max(0, sent - _lastInterfaceBytesSent);
+            var downDelta = Math.Max(0, received - _lastInterfaceBytesReceived);
             _lastInterfaceTrafficSample = now;
             _lastInterfaceBytesSent = sent;
             _lastInterfaceBytesReceived = received;
-            return;
+
+            // Do not turn traffic accumulated during sleep, debugger pauses or
+            // an unusually slow adapter refresh into a giant catch-up spike.
+            if (elapsed > 5)
+                return;
+            elapsed = Math.Max(0.2, elapsed);
+            RecordTrafficSample((long)(upDelta / elapsed), (long)(downDelta / elapsed), elapsed);
         }
-
-        var elapsed = Math.Clamp((now - _lastInterfaceTrafficSample).TotalSeconds, 0.2, 5.0);
-        var upDelta = Math.Max(0, sent - _lastInterfaceBytesSent);
-        var downDelta = Math.Max(0, received - _lastInterfaceBytesReceived);
-        _lastInterfaceTrafficSample = now;
-        _lastInterfaceBytesSent = sent;
-        _lastInterfaceBytesReceived = received;
-
-        RecordTrafficSample((long)(upDelta / elapsed), (long)(downDelta / elapsed), elapsed);
+        catch
+        {
+            _trafficNetworkInterface = null;
+            NoraNetworkInterfaceCache.Invalidate();
+        }
+        finally
+        {
+            Volatile.Write(ref _trafficSampleInFlight, 0);
+        }
     }
 
-    private static bool TryGetInterfaceBytes(string hint, out long sent, out long received)
+    private static (long Sent, long Received)? ReadInterfaceBytes(NetworkInterface networkInterface)
     {
-        sent = 0;
-        received = 0;
-        var interfaces = NetworkInterface.GetAllNetworkInterfaces()
-            .Where(x => x.OperationalStatus == OperationalStatus.Up)
-            .Select(x => new
-            {
-                Interface = x,
-                Score = string.Equals(x.Name, hint, StringComparison.OrdinalIgnoreCase) ? 0 :
-                    string.Equals(x.Description, hint, StringComparison.OrdinalIgnoreCase) ? 1 :
-                    x.Name.Contains(hint, StringComparison.OrdinalIgnoreCase) ? 2 :
-                    x.Description.Contains(hint, StringComparison.OrdinalIgnoreCase) ? 3 :
-                    99
-            })
-            .Where(x => x.Score < 99)
-            .OrderBy(x => x.Score)
-            .ToList();
-        var match = interfaces.FirstOrDefault()?.Interface;
-        if (match is null)
-            return false;
-        var stats = match.GetIPv4Statistics();
-        sent = stats.BytesSent;
-        received = stats.BytesReceived;
-        return true;
+        try
+        {
+            if (networkInterface.OperationalStatus != OperationalStatus.Up)
+                return null;
+            var stats = networkInterface.GetIPv4Statistics();
+            return (stats.BytesSent, stats.BytesReceived);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private void ResetInterfaceTrafficSampler()
+    {
+        Interlocked.Increment(ref _trafficSamplerGeneration);
+        _trafficNetworkInterface = null;
+        _nextTrafficInterfaceResolveAt = default;
+        _lastInterfaceTrafficSample = default;
+        _lastInterfaceBytesSent = -1;
+        _lastInterfaceBytesReceived = -1;
     }
 
     private void RecordTrafficSample(long up, long down, double elapsedSeconds)
@@ -6258,15 +6397,37 @@ internal sealed class NoraWpfWindow : Window
         RenderPage(PageKind.Servers);
         try
         {
-            foreach (var server in NoraSubscriptionStore.LoadAll().SelectMany(x => x.Servers))
+            using var concurrency = new SemaphoreSlim(6, 6);
+            async Task<(string Path, string Host, int Port, PingStatus Status)> ProbeTargetAsync(
+                string path,
+                string host,
+                int port,
+                Func<Task<PingStatus>> probe)
             {
-                _ping[server.LocalPath] = await ProbeAsync(server.Host, server.Port);
-                AppendLog($"Direct latency {server.Host}:{server.Port}: {_ping[server.LocalPath].Text}; {_ping[server.LocalPath].Detail}");
+                await concurrency.WaitAsync();
+                try { return (path, host, port, await probe()); }
+                finally { concurrency.Release(); }
             }
-            foreach (var profile in DiscoverProfiles().ToList())
+
+            var serverTasks = NoraSubscriptionStore.LoadAll()
+                .SelectMany(subscription => subscription.Servers)
+                .Select(server => ProbeTargetAsync(
+                    server.LocalPath,
+                    server.Host,
+                    server.Port,
+                    () => ProbeAsync(server.Host, server.Port)));
+            var profileTasks = DiscoverProfiles()
+                .ToList()
+                .Select(profile => ProbeTargetAsync(
+                    profile.Path,
+                    profile.Host,
+                    profile.Port,
+                    () => ProbeProfileAsync(profile)));
+            var results = await Task.WhenAll(serverTasks.Concat(profileTasks));
+            foreach (var result in results)
             {
-                _ping[profile.Path] = await ProbeProfileAsync(profile);
-                AppendLog($"Direct latency {profile.Host}:{profile.Port}: {_ping[profile.Path].Text}; {_ping[profile.Path].Detail}");
+                _ping[result.Path] = result.Status;
+                AppendLog($"Direct latency {result.Host}:{result.Port}: {result.Status.Text}; {result.Status.Detail}");
             }
         }
         finally
@@ -6286,17 +6447,7 @@ internal sealed class NoraWpfWindow : Window
 
     private static bool HasActiveTunnelAdapter()
     {
-        return NetworkInterface.GetAllNetworkInterfaces()
-            .Where(x => x.OperationalStatus == OperationalStatus.Up)
-            .Any(x =>
-                x.Name.Contains("Tunnel", StringComparison.OrdinalIgnoreCase) ||
-                x.Description.Contains("Tunnel", StringComparison.OrdinalIgnoreCase) ||
-                x.Name.Contains("Wintun", StringComparison.OrdinalIgnoreCase) ||
-                x.Description.Contains("Wintun", StringComparison.OrdinalIgnoreCase) ||
-                x.Name.Contains("WireGuard", StringComparison.OrdinalIgnoreCase) ||
-                x.Description.Contains("WireGuard", StringComparison.OrdinalIgnoreCase) ||
-                x.Name.Contains("TAP", StringComparison.OrdinalIgnoreCase) ||
-                x.Description.Contains("TAP", StringComparison.OrdinalIgnoreCase));
+        return NoraNetworkInterfaceCache.HasActiveTunnelAdapterCached();
     }
 
     private static async Task<PingStatus> ProbeAsync(string host, int port)
