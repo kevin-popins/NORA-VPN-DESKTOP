@@ -127,6 +127,16 @@ internal static class Program
 #endif
         }
 
+        if (args.Length == 1 && args[0].Equals("subscription-refresh-selftest", StringComparison.OrdinalIgnoreCase))
+        {
+#if WINDOWS
+            return NoraSubscriptionRefreshScheduler.RunSelfTest(Console.Out);
+#else
+            Console.Error.WriteLine("Subscription refresh scheduler self-test is only available in the Windows client build.");
+            return 2;
+#endif
+        }
+
         if (args.Length == 1 && args[0].Equals("country-flag-selftest", StringComparison.OrdinalIgnoreCase))
         {
 #if WINDOWS
@@ -326,6 +336,7 @@ internal static class Program
             Console.WriteLine("  nvp crypt5-selftest");
             Console.WriteLine("  nvp subscription-transport-selftest");
             Console.WriteLine("  nvp subscription-order-selftest");
+            Console.WriteLine("  nvp subscription-refresh-selftest");
             Console.WriteLine("  nvp country-flag-selftest");
             Console.WriteLine("  nvp direct-latency-selftest");
             Console.WriteLine("  nvp audio-capture-smoke");

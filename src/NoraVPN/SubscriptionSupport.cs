@@ -153,19 +153,23 @@ internal static class NoraSubscriptionStore
         return Store(ParsePayload(input, "", new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase), log), input);
     }
 
-    public static async Task<NoraSubscriptionInfo> RefreshAsync(NoraSubscriptionInfo subscription, Action<string> log)
+    public static async Task<NoraSubscriptionInfo> RefreshAsync(
+        NoraSubscriptionInfo subscription,
+        Action<string> log,
+        CancellationToken cancellationToken = default)
     {
         var source = subscription.SourceUrl.Trim();
         if (HappCrypt5Decoder.IsCrypt5Link(source))
         {
             var decrypted = HappCrypt5Decoder.Decrypt(source);
             if (Uri.TryCreate(decrypted, UriKind.Absolute, out var decryptedUri) && decryptedUri.Scheme is "http" or "https")
-                return await ImportUrlAsync(decryptedUri, log, source);
+                return await ImportUrlAsync(decryptedUri, log, source, cancellationToken: cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
             return Store(ParsePayload(decrypted, source, new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase), log), source);
         }
         if (!Uri.TryCreate(source, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https"))
             throw new NoraAppException("NORA-SUB-4002", "This subscription was imported without a refresh URL.");
-        return await ImportUrlAsync(uri, log);
+        return await ImportUrlAsync(uri, log, cancellationToken: cancellationToken);
     }
 
     public static IReadOnlyList<NoraSubscriptionInfo> LoadAll()
@@ -261,8 +265,28 @@ internal static class NoraSubscriptionStore
             item.SubscriptionTitle = subscription.Title;
             item.LocalPath = ServerPath(dir, item.Id);
         }
-        File.WriteAllText(subscriptionPath, JsonSerializer.Serialize(subscription, JsonOptions));
+        WriteAllTextAtomic(subscriptionPath, JsonSerializer.Serialize(subscription, JsonOptions));
         return before != subscription.Servers.Count;
+    }
+
+    private static void WriteAllTextAtomic(string path, string contents)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
+        var temporaryPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            File.WriteAllText(temporaryPath, contents);
+            File.Move(temporaryPath, path, overwrite: true);
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(temporaryPath))
+                    File.Delete(temporaryPath);
+            }
+            catch { }
+        }
     }
 
     private static void EnsureUnderRoot(string path)
@@ -1090,7 +1114,8 @@ internal static class NoraSubscriptionStore
         Uri uri,
         Action<string> log,
         string? sourceReference = null,
-        int redirectDepth = 0)
+        int redirectDepth = 0,
+        CancellationToken cancellationToken = default)
     {
         if (redirectDepth > 3)
             throw new NoraAppException("NORA-SUB-4002", "The encrypted subscription contains too many nested links.");
@@ -1101,11 +1126,12 @@ internal static class NoraSubscriptionStore
         var lastError = "no response";
         foreach (var userAgent in SubscriptionUserAgents)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var request = new HttpRequestMessage(HttpMethod.Get, uri);
             AddSubscriptionIdentityHeaders(request, userAgent, hwid);
 
-            using var response = await http.SendAsync(request);
-            var body = await response.Content.ReadAsStringAsync();
+            using var response = await http.SendAsync(request, cancellationToken);
+            var body = await response.Content.ReadAsStringAsync(cancellationToken);
             if (!response.IsSuccessStatusCode)
             {
                 lastError = $"{(int)response.StatusCode}: {TrimForError(body)}";
@@ -1124,7 +1150,7 @@ internal static class NoraSubscriptionStore
                 body = HappCrypt5Decoder.Decrypt(body);
                 log("Encrypted HAPP response unlocked.");
                 if (Uri.TryCreate(body, UriKind.Absolute, out var nestedUri) && nestedUri.Scheme is "http" or "https")
-                    return await ImportUrlAsync(nestedUri, log, sourceReference ?? uri.ToString(), redirectDepth + 1);
+                    return await ImportUrlAsync(nestedUri, log, sourceReference ?? uri.ToString(), redirectDepth + 1, cancellationToken);
             }
 
             var storedSource = sourceReference ?? uri.ToString();
@@ -1149,18 +1175,23 @@ internal static class NoraSubscriptionStore
         if (parsed is null)
             throw new NoraAppException("NORA-SUB-4002", $"Subscription server did not return a usable payload ({lastError})");
 
-        await ResolveMissingCountriesAsync(parsed, log);
+        await ResolveMissingCountriesAsync(parsed, log, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
         return Store(parsed, sourceReference ?? uri.ToString());
     }
 
-    private static async Task ResolveMissingCountriesAsync(NoraSubscriptionInfo sub, Action<string> log)
+    private static async Task ResolveMissingCountriesAsync(
+        NoraSubscriptionInfo sub,
+        Action<string> log,
+        CancellationToken cancellationToken = default)
     {
         using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
         foreach (var server in sub.Servers)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (!NeedsCountryLookup(server.Country))
                 continue;
-            var resolved = await ResolveCountryAsync(http, server.Host);
+            var resolved = await ResolveCountryAsync(http, server.Host, cancellationToken);
             if (string.IsNullOrWhiteSpace(resolved))
                 continue;
             server.Country = resolved;
@@ -1171,7 +1202,10 @@ internal static class NoraSubscriptionStore
     private static bool NeedsCountryLookup(string country)
         => string.IsNullOrWhiteSpace(country) || country.Equals("Unknown", StringComparison.OrdinalIgnoreCase);
 
-    private static async Task<string> ResolveCountryAsync(HttpClient http, string host)
+    private static async Task<string> ResolveCountryAsync(
+        HttpClient http,
+        string host,
+        CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(host))
             return "";
@@ -1189,10 +1223,10 @@ internal static class NoraSubscriptionStore
         {
             try
             {
-                using var response = await http.GetAsync(url);
+                using var response = await http.GetAsync(url, cancellationToken);
                 if (!response.IsSuccessStatusCode)
                     continue;
-                using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+                using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken));
                 var root = doc.RootElement;
                 var country = First(Str(root, "country_code"), Str(root, "countryCode"), Str(root, "country"), Str(root, "country_name"));
                 if (!string.IsNullOrWhiteSpace(country) && !country.Equals("reserved", StringComparison.OrdinalIgnoreCase))
@@ -1232,15 +1266,21 @@ internal static class NoraSubscriptionStore
         sub.DisplayOrder = previous?.DisplayOrder > 0
             ? previous.DisplayOrder
             : NextSubscriptionDisplayOrder();
-        var previousOrders = previous?.Servers
+        var previousServers = previous?.Servers ?? [];
+        var previousOrders = previousServers
             .Where(server => !string.IsNullOrWhiteSpace(server.Id))
-            .ToDictionary(server => server.Id, server => server.DisplayOrder, StringComparer.OrdinalIgnoreCase)
-            ?? new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            .GroupBy(server => server.Id, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Select(server => server.DisplayOrder).Where(order => order > 0).DefaultIfEmpty(0).Min(), StringComparer.OrdinalIgnoreCase);
+        var previousRuntimeOrders = previousServers
+            .GroupBy(RuntimeIdentity, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Select(server => server.DisplayOrder).Where(order => order > 0).DefaultIfEmpty(0).Min(), StringComparer.Ordinal);
         var nextServerOrder = Math.Max(0, previousOrders.Values.DefaultIfEmpty(0).Max());
         foreach (var server in sub.Servers)
         {
             if (previousOrders.TryGetValue(server.Id, out var priorOrder) && priorOrder > 0)
                 server.DisplayOrder = priorOrder;
+            else if (previousRuntimeOrders.TryGetValue(RuntimeIdentity(server), out var migratedOrder) && migratedOrder > 0)
+                server.DisplayOrder = migratedOrder;
             else
                 server.DisplayOrder = ++nextServerOrder;
         }
@@ -1252,7 +1292,7 @@ internal static class NoraSubscriptionStore
             server.SubscriptionId = sub.Id;
             server.SubscriptionTitle = sub.Title;
             server.LocalPath = ServerPath(dir, server.Id);
-            File.WriteAllText(server.LocalPath, JsonSerializer.Serialize(server, JsonOptions));
+            WriteAllTextAtomic(server.LocalPath, JsonSerializer.Serialize(server, JsonOptions));
         }
         var liveFiles = sub.Servers.Select(x => Path.GetFullPath(x.LocalPath)).ToHashSet(StringComparer.OrdinalIgnoreCase);
         foreach (var stale in Directory.GetFiles(dir, "server-*.json", SearchOption.TopDirectoryOnly))
@@ -1260,7 +1300,7 @@ internal static class NoraSubscriptionStore
             if (!liveFiles.Contains(Path.GetFullPath(stale)))
                 File.Delete(stale);
         }
-        File.WriteAllText(subscriptionPath, JsonSerializer.Serialize(sub, JsonOptions));
+        WriteAllTextAtomic(subscriptionPath, JsonSerializer.Serialize(sub, JsonOptions));
         return sub;
     }
 
@@ -1360,9 +1400,9 @@ internal static class NoraSubscriptionStore
             server.SubscriptionId = subscription.Id;
             server.SubscriptionTitle = subscription.Title;
             server.LocalPath = ServerPath(dir, server.Id);
-            File.WriteAllText(server.LocalPath, JsonSerializer.Serialize(server, JsonOptions));
+            WriteAllTextAtomic(server.LocalPath, JsonSerializer.Serialize(server, JsonOptions));
         }
-        File.WriteAllText(Path.Combine(dir, "subscription.json"), JsonSerializer.Serialize(subscription, JsonOptions));
+        WriteAllTextAtomic(Path.Combine(dir, "subscription.json"), JsonSerializer.Serialize(subscription, JsonOptions));
     }
 
     public static bool IsAutomaticServer(NoraSubscriptionServer server)
@@ -1434,6 +1474,37 @@ internal static class NoraSubscriptionStore
             var named = new NoraSubscriptionServer { Id = "named", Name = "Netherlands", Protocol = "VLESS", Network = "xhttp" };
             var failover = BuildAutomaticFailoverCandidates(primary, [primary, named, backup]);
 
+            const string unicodeTitle = "🍄 За грибами 🇳🇱";
+            const string unicodeName = "🇷🇺 ВНИЗУ Обходы (4G/LTE) ⬇️";
+            var doubleEncodedName = Uri.EscapeDataString(unicodeName).Replace("%", "%25", StringComparison.Ordinal);
+            var duplicateLabel = Uri.EscapeDataString("📊 Осталось: 100.00 GiB");
+            var preferredDuplicateName = Uri.EscapeDataString("🇷🇺 RU • Все операторы 🍊");
+            var uniqueName = Uri.EscapeDataString("🇳🇱 Amsterdam 🌷");
+            var defaultName = Uri.EscapeDataString("🇬🇮 Gibraltar");
+            var reorderedExtraOne = Uri.EscapeDataString("{\"headers\":{\"X-Test\":\"one\"},\"noGRPCHeader\":true}");
+            var reorderedExtraTwo = Uri.EscapeDataString("{\"noGRPCHeader\":true,\"headers\":{\"X-Test\":\"one\"}}");
+            var duplicatePayload = string.Join('\n',
+                $"vless://22222222-2222-4222-8222-222222222222@198.51.100.20:443?encryption=none&security=reality&sni=edge.example&fp=firefox&pbk=dedup-key&sid=beef&type=xhttp&path=%2Fedge#{doubleEncodedName}",
+                $"vless://22222222-2222-4222-8222-222222222222@198.51.100.20:443?path=%2Fedge&type=xhttp&sid=beef&pbk=dedup-key&fp=firefox&sni=edge.example&security=reality&encryption=none#{duplicateLabel}",
+                $"vless://22222222-2222-4222-8222-222222222222@198.51.100.20:443?security=reality&encryption=none&sni=edge.example&fp=firefox&pbk=dedup-key&sid=beef&type=xhttp&path=%2Fedge#{preferredDuplicateName}",
+                $"vless://33333333-3333-4333-8333-333333333333@198.51.100.21:443?encryption=none&security=reality&sni=nl.example&fp=firefox&pbk=unique-key&sid=cafe&type=xhttp&path=%2Fnl#{uniqueName}",
+                $"vless://44444444-4444-4444-8444-444444444444@198.51.100.22:443?encryption=none&security=reality&sni=defaults.example&fp=firefox&pbk=defaults-key&sid=face&type=xhttp#{defaultName}",
+                "vless://44444444-4444-4444-8444-444444444444@198.51.100.22:443?mode=auto&path=%2F&type=splithttp&sid=face&pbk=defaults-key&fp=firefox&sni=defaults.example&security=reality&encryption=none#AUTO",
+                $"vless://55555555-5555-4555-8555-555555555555@198.51.100.23:443?encryption=none&security=reality&sni=extra.example&fp=firefox&pbk=extra-key&sid=feed&type=xhttp&extra={reorderedExtraOne}#🇬🇧%20GB%20London",
+                $"vless://55555555-5555-4555-8555-555555555555@198.51.100.23:443?extra={reorderedExtraTwo}&type=xhttp&sid=feed&pbk=extra-key&fp=firefox&sni=extra.example&security=reality&encryption=none#AUTO");
+            var unicodeHeaders = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["profile-title*"] = "UTF-8''" + Uri.EscapeDataString(unicodeTitle).Replace("%", "%25", StringComparison.Ordinal)
+            };
+            var parsedFixture = ParsePayload(
+                Convert.ToBase64String(Encoding.UTF8.GetBytes(duplicatePayload)),
+                "https://subscription.fixture.invalid/unicode",
+                unicodeHeaders,
+                _ => { });
+            var persistedFixture = JsonSerializer.Deserialize<NoraSubscriptionInfo>(
+                JsonSerializer.Serialize(parsedFixture, JsonOptions), JsonOptions)
+                ?? throw new InvalidOperationException("The Unicode fixture did not survive JSON persistence.");
+
             var endpointPool = new[]
             {
                 IPAddress.Parse("198.51.100.44"),
@@ -1474,9 +1545,16 @@ internal static class NoraSubscriptionStore
                          xhttp.GetProperty("mode").GetString() == "stream-one" &&
                          pinnedPool.SequenceEqual(["198.51.100.44", "198.51.100.45"], StringComparer.Ordinal) &&
                          pinnedStrategy == "ForceIPv4" &&
-                         failover.Count == 2 && failover[0].Id == primary.Id && failover[1].Id == backup.Id;
+                         failover.Count == 2 && failover[0].Id == primary.Id && failover[1].Id == backup.Id &&
+                         persistedFixture.Title == unicodeTitle &&
+                         persistedFixture.Servers.Count == 4 &&
+                         persistedFixture.Servers[0].Name == "🇷🇺 RU • Все операторы 🍊" &&
+                         persistedFixture.Servers[0].Country == "Russia" &&
+                         persistedFixture.Servers[1].Name == "🇳🇱 Amsterdam 🌷" &&
+                         persistedFixture.Servers[2].Name == "🇬🇮 Gibraltar" &&
+                         persistedFixture.Servers[3].Name == "🇬🇧 GB London";
             output.WriteLine(passed
-                ? "SUBSCRIPTION TRANSPORT SELF-TEST PASS: xhttp=preserved; auto-failover=bounded; endpoint-pool=pinned"
+                ? "SUBSCRIPTION TRANSPORT SELF-TEST PASS: xhttp=preserved; auto-failover=bounded; endpoint-pool=pinned; duplicates=removed; unicode=preserved"
                 : "SUBSCRIPTION TRANSPORT SELF-TEST FAIL");
             return passed ? 0 : 1;
         }
@@ -1544,6 +1622,41 @@ internal static class NoraSubscriptionStore
             var persistedSubscriptions = LoadAll().Select(item => item.Id).ToArray();
             var persistedServers = refreshed.Servers.Select(item => item.Id).ToArray();
 
+            static NoraSubscriptionServer MigrationNode(string id, string name, string host) => new()
+            {
+                Id = id,
+                Name = name,
+                Host = host,
+                Port = 443,
+                Uuid = "66666666-6666-4666-8666-666666666666",
+                Network = "xhttp",
+                Security = "reality",
+                Sni = "migration.example",
+                Fingerprint = "firefox",
+                PublicKey = "migration-key",
+                ShortId = "cafe"
+            };
+            var legacyA = MigrationNode("legacy-name-a", "Legacy A", "198.51.100.31");
+            var legacyB = MigrationNode("legacy-name-b", "Legacy B", "198.51.100.32");
+            var legacySubscription = Store(new NoraSubscriptionInfo
+            {
+                Id = "migration-subscription",
+                Title = "Migration",
+                Servers = [legacyA, legacyB]
+            }, "fixture:migration");
+            var legacyMoved = MoveServer(legacySubscription.Id, legacyB.Id, -1);
+            var semanticA = MigrationNode("", "Renamed A", legacyA.Host);
+            var semanticB = MigrationNode("", "Renamed B", legacyB.Host);
+            semanticA.Id = StableId("runtime-v1|" + RuntimeIdentity(semanticA));
+            semanticB.Id = StableId("runtime-v1|" + RuntimeIdentity(semanticB));
+            var migrated = Store(new NoraSubscriptionInfo
+            {
+                Id = legacySubscription.Id,
+                Title = legacySubscription.Title,
+                Servers = [semanticA, semanticB]
+            }, "fixture:migration");
+            var migratedIds = migrated.Servers.Select(item => item.Id).ToArray();
+
             var passed = orderedSubscriptions.SequenceEqual(["first", "second", "third"], StringComparer.Ordinal) &&
                          moved &&
                          servers.Select(item => item.Id).SequenceEqual(["b", "a", "c"], StringComparer.Ordinal) &&
@@ -1551,9 +1664,11 @@ internal static class NoraSubscriptionStore
                          first.DisplayOrder == 1 && second.DisplayOrder == 2 &&
                          movedSubscription && movedServer &&
                          persistedSubscriptions.SequenceEqual(["second-subscription", "first-subscription"], StringComparer.Ordinal) &&
-                         persistedServers.SequenceEqual(["second-b", "second-a", "second-c"], StringComparer.Ordinal);
+                         persistedServers.SequenceEqual(["second-b", "second-a", "second-c"], StringComparer.Ordinal) &&
+                         legacyMoved &&
+                         migratedIds.SequenceEqual([semanticB.Id, semanticA.Id], StringComparer.Ordinal);
             output.WriteLine(passed
-                ? "SUBSCRIPTION ORDER SELF-TEST PASS: persisted-order=stable; moves=bounded"
+                ? "SUBSCRIPTION ORDER SELF-TEST PASS: persisted-order=stable; semantic-id-migration=stable; moves=bounded"
                 : "SUBSCRIPTION ORDER SELF-TEST FAIL: unexpected ordering result");
             return passed ? 0 : 1;
         }
@@ -1616,10 +1731,141 @@ internal static class NoraSubscriptionStore
             else
                 sub.Servers = ParseShareLinks(payload, title).ToList();
         }
+        sub.Title = NormalizeUnicodeText(sub.Title);
+        sub.Announce = NormalizeUnicodeText(sub.Announce);
+        foreach (var server in sub.Servers)
+        {
+            server.Name = NormalizeUnicodeText(server.Name);
+            server.Country = NormalizeUnicodeText(server.Country);
+        }
+        var parsedServerCount = sub.Servers.Count;
+        sub.Servers = DeduplicateServers(sub.Servers).ToList();
         if (sub.Servers.Count == 0)
             throw new NoraAppException("NORA-SUB-4003", "Subscription contains no supported VLESS servers.");
+        if (parsedServerCount != sub.Servers.Count)
+            log($"Ignored {parsedServerCount - sub.Servers.Count} duplicate subscription server(s).");
         log($"Imported subscription `{sub.Title}` with {sub.Servers.Count} supported servers.");
         return sub;
+    }
+
+    private static IReadOnlyList<NoraSubscriptionServer> DeduplicateServers(IEnumerable<NoraSubscriptionServer> servers)
+    {
+        var selected = new List<NoraSubscriptionServer>();
+        var indexes = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var server in servers)
+        {
+            // Provider panels commonly append quota/status rows as complete VLESS
+            // links. Their labels differ, but the connection is identical. Keep the
+            // first real node and compare every setting that can change runtime
+            // behaviour; presentation-only name/country fields are intentionally
+            // excluded.
+            var identity = RuntimeIdentity(server);
+            server.Id = StableId("runtime-v1|" + identity);
+            if (!indexes.TryGetValue(identity, out var existingIndex))
+            {
+                indexes[identity] = selected.Count;
+                selected.Add(server);
+                continue;
+            }
+
+            // The same connection is often repeated under quota/instruction
+            // labels and then under its useful country/route name. Keep the most
+            // informative presentation while retaining one runtime node.
+            if (DisplayNameQuality(server.Name) > DisplayNameQuality(selected[existingIndex].Name))
+                selected[existingIndex] = server;
+        }
+        return selected;
+    }
+
+    private static int DisplayNameQuality(string? value)
+    {
+        var name = NormalizeUnicodeText(value ?? "");
+        if (name.Length == 0)
+            return int.MinValue;
+
+        var score = Math.Min(name.Length, 80);
+        if (CountryCodeFromFlag(name).Length > 0)
+            score += 200;
+        if (Regex.IsMatch(name, @"(?:остал(?:ось|ось)|remaining|traffic|quota|\d+(?:[.,]\d+)?\s*(?:gib|gb)\b)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+            score -= 600;
+        if (Regex.IsMatch(name, @"(?:внизу|below|обход(?:ы|ной)|4g\s*/?\s*lte)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+            score -= 300;
+        if (name.Contains("🌟", StringComparison.Ordinal))
+            score -= 20;
+        return score;
+    }
+
+    internal static bool SameRuntimeConnection(NoraSubscriptionServer first, NoraSubscriptionServer second)
+        => string.Equals(RuntimeIdentity(first), RuntimeIdentity(second), StringComparison.Ordinal);
+
+    internal static string RuntimeIdentity(NoraSubscriptionServer server)
+    {
+        var outbound = ExtractVlessOutbound(server.RawConfigJson) ?? BuildXrayVlessOutbound(server);
+        outbound["tag"] = "proxy";
+        RemoveLocalInterfaceBindings(outbound);
+        return CanonicalJson(outbound.ToJsonString()) + '\u001f' + RoutePolicyIdentity(server.RawConfigJson);
+    }
+
+    private static string CanonicalJson(string json)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            using var stream = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(stream))
+                WriteCanonicalJson(document.RootElement, writer);
+            return Encoding.UTF8.GetString(stream.ToArray());
+        }
+        catch
+        {
+            return NormalizeUnicodeText(json);
+        }
+    }
+
+    private static void WriteCanonicalJson(JsonElement element, Utf8JsonWriter writer)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                writer.WriteStartObject();
+                foreach (var property in element.EnumerateObject().OrderBy(property => property.Name, StringComparer.Ordinal))
+                {
+                    writer.WritePropertyName(property.Name);
+                    WriteCanonicalJson(property.Value, writer);
+                }
+                writer.WriteEndObject();
+                break;
+            case JsonValueKind.Array:
+                writer.WriteStartArray();
+                foreach (var item in element.EnumerateArray())
+                    WriteCanonicalJson(item, writer);
+                writer.WriteEndArray();
+                break;
+            default:
+                element.WriteTo(writer);
+                break;
+        }
+    }
+
+    private static string RoutePolicyIdentity(string rawConfigJson)
+    {
+        var policy = ParseXrayRoutingPolicy(rawConfigJson);
+        if (policy is null)
+            return "";
+
+        static string Join(IEnumerable<string> values) => string.Join(',', values
+            .Select(value => value.Trim().Normalize(NormalizationForm.FormC).ToLowerInvariant())
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(value => value, StringComparer.Ordinal));
+
+        return string.Join('|',
+            Join(policy.Direct.Domains), Join(policy.Direct.DomainSuffixes), Join(policy.Direct.DomainKeywords),
+            Join(policy.Direct.DomainRegexes), Join(policy.Direct.IpCidrs),
+            Join(policy.Proxy.Domains), Join(policy.Proxy.DomainSuffixes), Join(policy.Proxy.DomainKeywords),
+            Join(policy.Proxy.DomainRegexes), Join(policy.Proxy.IpCidrs),
+            Join(policy.Block.Domains), Join(policy.Block.DomainSuffixes), Join(policy.Block.DomainKeywords),
+            Join(policy.Block.DomainRegexes), Join(policy.Block.IpCidrs),
+            policy.BlockBittorrent ? "1" : "0");
     }
 
     private static IEnumerable<NoraSubscriptionServer> ParseXrayJson(string json, string title)
@@ -1782,7 +2028,7 @@ internal static class NoraSubscriptionStore
             var uri = new Uri(link);
             var uuid = Uri.UnescapeDataString(uri.UserInfo);
             var query = ParseQuery(uri.Query);
-            var name = Uri.UnescapeDataString(uri.Fragment.TrimStart('#'));
+            var name = DecodeUriText(uri.Fragment.TrimStart('#'));
             if (string.IsNullOrWhiteSpace(name))
                 name = $"{title} VLESS";
             server = new NoraSubscriptionServer
@@ -1854,18 +2100,42 @@ internal static class NoraSubscriptionStore
 
     private static string DecodeHeaderText(string value)
     {
-        value = DecodeRfc5987(value).Trim();
+        value = NormalizeUnicodeText(DecodeRfc5987(value));
         if (!value.StartsWith("base64:", StringComparison.OrdinalIgnoreCase))
             return value;
-        return TryDecodeBase64Text(value["base64:".Length..]);
+        return NormalizeUnicodeText(TryDecodeBase64Text(value["base64:".Length..]));
     }
 
     private static string DecodeRfc5987(string value)
     {
         var marker = "UTF-8''";
         var index = value.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
-        return index >= 0 ? Uri.UnescapeDataString(value[(index + marker.Length)..]) : value;
+        return index >= 0 ? DecodeUriText(value[(index + marker.Length)..]) : value;
     }
+
+    private static string DecodeUriText(string value)
+    {
+        var decoded = value;
+        try
+        {
+            decoded = Uri.UnescapeDataString(decoded);
+            // Some subscription panels percent-encode the already encoded fragment
+            // or RFC 5987 title. Decode one extra layer only when the first pass still
+            // contains a UTF-8 lead byte, avoiding accidental changes to ordinary '%'
+            // text and query payloads.
+            if (Regex.IsMatch(decoded, @"%(?:C[2-9A-Fa-f]|D[0-9A-Fa-f]|E[0-9A-Fa-f]|F[0-4])", RegexOptions.CultureInvariant))
+                decoded = Uri.UnescapeDataString(decoded);
+        }
+        catch
+        {
+            // A malformed display fragment must not discard an otherwise usable
+            // server. Preserve it literally and let the caller use the connection.
+        }
+        return NormalizeUnicodeText(decoded);
+    }
+
+    private static string NormalizeUnicodeText(string value)
+        => string.IsNullOrEmpty(value) ? value : value.Trim().Trim('\uFEFF').Normalize(NormalizationForm.FormC);
 
     private static string TryBase64Decode(string value)
     {
@@ -2309,6 +2579,10 @@ internal static class NoraDirectLatencyProbe
                     candidates.Add((
                         new PhysicalRoute(address, index, network.Name),
                         network.NetworkInterfaceType is NetworkInterfaceType.Ethernet or NetworkInterfaceType.Wireless80211 ? 0 : 1));
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
             }
             catch
             {

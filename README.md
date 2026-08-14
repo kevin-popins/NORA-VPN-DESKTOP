@@ -69,6 +69,9 @@ NORA есть живой главный экран, карта, аккуратн
   показывает изменения скорости без резких скачков между точками.
 - **Диагностика подключения.** На странице Logs можно запустить проверку
   соединения и получить готовый отчёт, если VPN не подключается.
+- **Автообновление подписок.** URL-подписки обновляются при запуске NORA и затем
+  по интервалу, который прислал провайдер. Одинаковые VLESS-узлы с разными
+  служебными подписями показываются один раз.
 
 ### Пресеты маршрутизации
 
@@ -78,6 +81,9 @@ Discord, а остальные приложения продолжают исп�
 
 Открыть режим можно кнопкой с иконкой компьютера слева на главном экране.
 Сейчас Discord Mode работает с VLESS и KRot; AmneziaWG пока не поддерживается.
+Если VPN уже подключён, NORA сама остановит выбранный сервер, переключит режим
+и подключит тот же сервер снова. При ошибке приложение возвращает прежний режим
+и пытается восстановить предыдущее подключение.
 Режим находится в бета-версии, поэтому возможны ошибки. В будущем я планирую
 добавить больше пресетов маршрутизации.
 
@@ -133,6 +139,9 @@ live home screen, a map, tidy traffic stats, and an easy-to-read server list.
   speed changes without abrupt jumps between samples.
 - **Connection diagnostics.** The Logs page can run a connection test and
   produce a ready-to-share report when the VPN cannot connect.
+- **Automatic subscription refresh.** URL subscriptions refresh when NORA
+  starts and then at the interval supplied by the provider. Identical VLESS
+  nodes with different status labels appear only once.
 
 ### Routing presets
 
@@ -141,7 +150,10 @@ the VPN. The first preset is **Discord Mode**: only Discord goes through the
 selected VPN server, while other apps continue using the normal connection.
 
 Open it with the computer icon on the left side of the Home screen. Discord
-Mode currently works with VLESS and KRot; AmneziaWG is not supported yet. The
+Mode currently works with VLESS and KRot; AmneziaWG is not supported yet.
+When a VPN is already connected, NORA stops the selected server, changes the
+routing mode, and reconnects that same server. If the transition fails, NORA
+restores the previous mode and attempts to restore the previous connection. The
 mode is in beta, so bugs are possible. I plan to add more routing presets in
 future releases.
 

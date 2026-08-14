@@ -109,6 +109,223 @@ internal interface INoraDiscordModeCore
     Task VerifyDiscordPathAsync(TimeSpan timeout, CancellationToken cancellationToken);
 }
 
+internal sealed record NoraDiscordModeTransitionResult(
+    bool Success,
+    bool Disconnected,
+    bool Reconnected,
+    bool RolledBack,
+    bool PreviousModeRestored,
+    Exception? Error);
+
+/// <summary>
+/// Coordinates a routing-mode switch as a transaction. The delegates keep the
+/// policy independently testable without starting a VPN core, TUN or route.
+/// </summary>
+internal static class NoraDiscordModeTransition
+{
+    public static async Task<NoraDiscordModeTransitionResult> RunAsync(
+        bool targetEnabled,
+        bool previousEnabled,
+        bool wasConnected,
+        Func<Task<bool>> disconnect,
+        Func<CancellationToken, Task> prepare,
+        Action<bool> persistMode,
+        Action restoreSelection,
+        Func<Task<bool>> reconnect,
+        Action<string> status,
+        CancellationToken cancellationToken = default)
+    {
+        var disconnected = false;
+        var modeChanged = false;
+        try
+        {
+            if (wasConnected)
+            {
+                status("Disconnecting the current VPN connection…");
+                if (!await disconnect().ConfigureAwait(true))
+                {
+                    restoreSelection();
+                    return new NoraDiscordModeTransitionResult(false, false, false, false, true, null);
+                }
+                disconnected = true;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            if (targetEnabled)
+            {
+                status("Preparing Discord Mode…");
+                await prepare(cancellationToken).ConfigureAwait(true);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            persistMode(targetEnabled);
+            modeChanged = true;
+            restoreSelection();
+
+            var reconnected = false;
+            if (wasConnected)
+            {
+                status(targetEnabled
+                    ? "Reconnecting the previous server in Discord Mode…"
+                    : "Reconnecting the previous server in normal VPN mode…");
+                reconnected = await reconnect().ConfigureAwait(true);
+                if (!reconnected)
+                    throw new InvalidOperationException("The previous VPN server could not reconnect after the routing mode changed.");
+            }
+
+            return new NoraDiscordModeTransitionResult(true, disconnected, reconnected, false, false, null);
+        }
+        catch (Exception ex)
+        {
+            var failures = new List<Exception> { ex };
+            var previousModeRestored = !modeChanged;
+            if (modeChanged)
+            {
+                try
+                {
+                    persistMode(previousEnabled);
+                    previousModeRestored = true;
+                }
+                catch (Exception rollbackModeError)
+                {
+                    failures.Add(rollbackModeError);
+                }
+            }
+            var selectionRestored = false;
+            try
+            {
+                restoreSelection();
+                selectionRestored = true;
+            }
+            catch (Exception selectionError)
+            {
+                failures.Add(selectionError);
+            }
+
+            var rollbackReconnected = false;
+            if (wasConnected && disconnected && previousModeRestored && selectionRestored)
+            {
+                status("Restoring the previous VPN connection…");
+                try
+                {
+                    rollbackReconnected = await reconnect().ConfigureAwait(true);
+                }
+                catch (Exception reconnectError)
+                {
+                    failures.Add(reconnectError);
+                }
+            }
+            var rolledBack = previousModeRestored && selectionRestored &&
+                             (!wasConnected || !disconnected || rollbackReconnected);
+            var error = failures.Count == 1 ? failures[0] : new AggregateException(failures);
+            return new NoraDiscordModeTransitionResult(
+                false,
+                disconnected,
+                rollbackReconnected,
+                rolledBack,
+                previousModeRestored,
+                error);
+        }
+    }
+
+    internal static bool RunSelfTest(out string detail)
+    {
+        static Func<Task<bool>> Step(List<string> trace, string step, bool result = true) => () =>
+        {
+            trace.Add(step);
+            return Task.FromResult(result);
+        };
+        static Func<CancellationToken, Task> Prepare(List<string> trace, bool fail = false) => _ =>
+        {
+            trace.Add("P");
+            return fail ? Task.FromException(new InvalidOperationException("fixture prepare failure")) : Task.CompletedTask;
+        };
+
+        var successTrace = new List<string>();
+        var successMode = false;
+        var success = RunAsync(
+            true, false, true,
+            Step(successTrace, "D"), Prepare(successTrace),
+            value => { successMode = value; successTrace.Add("E"); },
+            () => successTrace.Add("R"), Step(successTrace, "C"), _ => { }).GetAwaiter().GetResult();
+
+        var readyTrace = new List<string>();
+        var ready = RunAsync(
+            true, false, false,
+            Step(readyTrace, "D"), Prepare(readyTrace),
+            _ => readyTrace.Add("E"), () => readyTrace.Add("R"),
+            Step(readyTrace, "C"), _ => { }).GetAwaiter().GetResult();
+
+        var prepareTrace = new List<string>();
+        var prepareMode = false;
+        var prepareFailure = RunAsync(
+            true, false, true,
+            Step(prepareTrace, "D"), Prepare(prepareTrace, fail: true),
+            value => { prepareMode = value; prepareTrace.Add("E"); },
+            () => prepareTrace.Add("R"), Step(prepareTrace, "C"), _ => { }).GetAwaiter().GetResult();
+
+        var reconnectTrace = new List<string>();
+        var reconnectMode = false;
+        var reconnectCalls = 0;
+        var reconnectFailure = RunAsync(
+            true, false, true,
+            Step(reconnectTrace, "D"), Prepare(reconnectTrace),
+            value => { reconnectMode = value; reconnectTrace.Add("E"); },
+            () => reconnectTrace.Add("R"),
+            () =>
+            {
+                reconnectTrace.Add("C");
+                reconnectCalls++;
+                return Task.FromResult(reconnectCalls > 1);
+            }, _ => { }).GetAwaiter().GetResult();
+
+        var stopTrace = new List<string>();
+        var stopFailure = RunAsync(
+            true, false, true,
+            Step(stopTrace, "D", result: false), Prepare(stopTrace),
+            _ => stopTrace.Add("E"), () => stopTrace.Add("R"),
+            Step(stopTrace, "C"), _ => { }).GetAwaiter().GetResult();
+
+        var rollbackPersistTrace = new List<string>();
+        var rollbackPersistCalls = 0;
+        var rollbackReconnectCalls = 0;
+        var rollbackPersistFailure = RunAsync(
+            true, false, true,
+            Step(rollbackPersistTrace, "D"), Prepare(rollbackPersistTrace),
+            _ =>
+            {
+                rollbackPersistTrace.Add("E");
+                rollbackPersistCalls++;
+                if (rollbackPersistCalls > 1)
+                    throw new IOException("fixture rollback persistence failure");
+            },
+            () => rollbackPersistTrace.Add("R"),
+            () =>
+            {
+                rollbackPersistTrace.Add("C");
+                rollbackReconnectCalls++;
+                return Task.FromResult(false);
+            }, _ => { }).GetAwaiter().GetResult();
+
+        var passed = success.Success && successMode && success.Reconnected &&
+                     successTrace.SequenceEqual(["D", "P", "E", "R", "C"], StringComparer.Ordinal) &&
+                     ready.Success && readyTrace.SequenceEqual(["P", "E", "R"], StringComparer.Ordinal) &&
+                     !prepareFailure.Success && prepareFailure.RolledBack && prepareFailure.Reconnected && !prepareMode &&
+                     prepareTrace.SequenceEqual(["D", "P", "R", "C"], StringComparer.Ordinal) &&
+                     !reconnectFailure.Success && reconnectFailure.RolledBack && reconnectFailure.Reconnected && !reconnectMode &&
+                     reconnectTrace.SequenceEqual(["D", "P", "E", "R", "C", "E", "R", "C"], StringComparer.Ordinal) &&
+                     !stopFailure.Success && !stopFailure.Disconnected &&
+                     stopTrace.SequenceEqual(["D", "R"], StringComparer.Ordinal) &&
+                     !rollbackPersistFailure.Success && !rollbackPersistFailure.RolledBack &&
+                     !rollbackPersistFailure.PreviousModeRestored && rollbackReconnectCalls == 1 &&
+                     rollbackPersistTrace.SequenceEqual(["D", "P", "E", "R", "C", "E", "R"], StringComparer.Ordinal);
+        detail = passed
+            ? "transition=disconnect/prepare/persist/restore/reconnect; rollback=verified"
+            : "transition trace or rollback semantics are invalid";
+        return passed;
+    }
+}
+
 internal static class NoraDiscordRouting
 {
     internal static readonly string[] ProcessNames =
@@ -263,11 +480,12 @@ internal static class NoraDiscordRouting
             var persistedOn = NoraDiscordModeSettings.Enabled;
             NoraDiscordModeSettings.SetEnabledOrThrow(false);
             var persistedOff = !NoraDiscordModeSettings.Enabled;
+            var transitionPassed = NoraDiscordModeTransition.RunSelfTest(out var transitionDetail);
             var socksRoot = socksJson.RootElement;
             var boundRoot = boundJson.RootElement;
             var rule = socksRoot.GetProperty("route").GetProperty("rules")[0];
             var names = rule.GetProperty("process_name").EnumerateArray().Select(x => x.GetString()).ToArray();
-            var passed = persistedOn && persistedOff &&
+            var passed = persistedOn && persistedOff && transitionPassed &&
                          ProcessNames.All(name => names.Contains(name, StringComparer.OrdinalIgnoreCase)) &&
                          rule.GetProperty("outbound").GetString() == "vpn" &&
                          socksRoot.GetProperty("route").GetProperty("final").GetString() == "direct" &&
@@ -283,7 +501,7 @@ internal static class NoraDiscordRouting
 
             CheckConfigAsync(socksPath, TimeSpan.FromSeconds(10), CancellationToken.None).GetAwaiter().GetResult();
             CheckConfigAsync(interfacePath, TimeSpan.FromSeconds(10), CancellationToken.None).GetAwaiter().GetResult();
-            output.WriteLine("DISCORD ROUTING SELF-TEST PASS: Discord-only process rules; final=direct; VLESS SOCKS and KRot interface egress valid");
+            output.WriteLine("DISCORD ROUTING SELF-TEST PASS: Discord-only process rules; final=direct; VLESS SOCKS and KRot interface egress valid; " + transitionDetail);
             return 0;
         }
         catch (Exception ex)

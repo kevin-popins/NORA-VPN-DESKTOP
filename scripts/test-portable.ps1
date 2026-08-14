@@ -82,9 +82,11 @@ if ($LASTEXITCODE -ne 0) {
 $isAdministrator = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($isAdministrator) {
-    $discordSelfTest = Start-Process -FilePath (Join-Path $root "NoraVPN.exe") -ArgumentList @("discord-routing-selftest") -WorkingDirectory $root -WindowStyle Hidden -Wait -PassThru
-    if ($discordSelfTest.ExitCode -ne 0) {
-        throw "Discord routing self-test failed with exit code $($discordSelfTest.ExitCode)"
+    foreach ($selfTestName in @("subscription-transport-selftest", "subscription-order-selftest", "subscription-refresh-selftest", "country-flag-selftest", "discord-routing-selftest")) {
+        $selfTest = Start-Process -FilePath (Join-Path $root "NoraVPN.exe") -ArgumentList @($selfTestName) -WorkingDirectory $root -WindowStyle Hidden -Wait -PassThru
+        if ($selfTest.ExitCode -ne 0) {
+            throw "$selfTestName failed with exit code $($selfTest.ExitCode)"
+        }
     }
 }
 else {
@@ -92,11 +94,13 @@ else {
     if (-not (Test-Path -LiteralPath $buildDll)) {
         throw "Non-elevated portable verification requires the Release build output: $buildDll"
     }
-    dotnet $buildDll discord-routing-selftest
-    if ($LASTEXITCODE -ne 0) {
-        throw "Discord routing self-test failed from Release build output with exit code $LASTEXITCODE"
+    foreach ($selfTestName in @("subscription-transport-selftest", "subscription-order-selftest", "subscription-refresh-selftest", "country-flag-selftest", "discord-routing-selftest")) {
+        dotnet $buildDll $selfTestName
+        if ($LASTEXITCODE -ne 0) {
+            throw "$selfTestName failed from Release build output with exit code $LASTEXITCODE"
+        }
     }
-    Write-Warning "Portable NoraVPN.exe requires elevation; routing logic was verified from the matching Release build without opening a UAC prompt."
+    Write-Warning "Portable NoraVPN.exe requires elevation; subscription and routing logic were verified from the matching Release build without opening a UAC prompt."
 }
 
-Write-Host "PORTABLE CORE CHECK PASS: all required assets, $($brandIcon.Count) title/tray frames, $($taskbarIcon.Count) taskbar frames, $flagCount country flags, $emojiCount color emoji, VPN cores, and Discord Mode routing are present and executable."
+Write-Host "PORTABLE CORE CHECK PASS: all required assets, $($brandIcon.Count) title/tray frames, $($taskbarIcon.Count) taskbar frames, $flagCount country flags, $emojiCount color emoji, VPN cores, subscription refresh, and Discord Mode routing are present and executable."

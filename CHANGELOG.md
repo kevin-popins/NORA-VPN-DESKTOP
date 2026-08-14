@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- Fixed duplicated VLESS subscription nodes by comparing complete runtime
+  connection settings instead of provider display labels.
+- Preserved double-encoded Unicode titles and server names and added a graceful
+  bundled-image fallback for unsupported ZWJ emoji sequences.
+- Added automatic subscription refresh at application startup and at each
+  provider-supplied update interval, with coalesced writes and quiet retry after
+  transient failures.
+- Preserved selected nodes and custom ordering while migrating existing
+  subscriptions to semantic IDs; subscription file mutations are serialized
+  and written atomically.
+- Discord Mode can now safely switch an active VLESS or KRot connection: NORA
+  stops the current tunnel, changes routing mode, and reconnects the selected
+  server. Failed transitions roll back to the previous mode and connection.
+
 ## 0.1.0-pre.4 — 2026-07-16
 
 - Kept the interface responsive while Windows scans physical and virtual

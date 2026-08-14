@@ -557,6 +557,8 @@ internal sealed class NoraWpfWindow : Window
     private readonly DispatcherTimer _clock = new() { Interval = TimeSpan.FromSeconds(1) };
     private readonly DispatcherTimer _trafficSampleTimer = new() { Interval = TimeSpan.FromMilliseconds(250) };
     private readonly DispatcherTimer _managedRefreshTimer = new() { Interval = TimeSpan.FromSeconds(20) };
+    private readonly NoraSubscriptionRefreshCoordinator _subscriptionRefreshCoordinator;
+    private readonly NoraSubscriptionRefreshScheduler _subscriptionRefreshScheduler;
     private readonly Stopwatch _connectedFor = new();
     private readonly StringBuilder _logs = new();
     private NoraRunLog? _runLog;
@@ -583,12 +585,14 @@ internal sealed class NoraWpfWindow : Window
     private CancellationTokenSource? _connectCancellation;
     private CancellationTokenSource? _diagnosticCancellation;
     private bool _diagnosticRunning;
+    private bool _discordModeTransitionInProgress;
     private string _diagnosticStatus = "";
     private string _latestDiagnosticReport = "";
     private NoraCoreLogLimiter _coreLogLimiter = new();
     private string _activeProfilePath = "";
     private NvpConfig? _activeConfig;
     private NoraSubscriptionServer? _activeSubscriptionServer;
+    private NoraSubscriptionServer? _pendingSubscriptionSelection;
     private string _activeExternalProtocol = "";
     private TunnelState _state = TunnelState.Ready;
     private PageKind _page = PageKind.Home;
@@ -632,6 +636,11 @@ internal sealed class NoraWpfWindow : Window
     public NoraWpfWindow(bool enableTray = true)
     {
         _trayEnabled = enableTray;
+        _subscriptionRefreshCoordinator = new NoraSubscriptionRefreshCoordinator(RefreshSubscriptionOffUiAsync);
+        _subscriptionRefreshScheduler = new NoraSubscriptionRefreshScheduler(
+            NoraSubscriptionStore.LoadAll,
+            _subscriptionRefreshCoordinator,
+            HandleAutomaticSubscriptionRefresh);
         _runLog = NoraRunLog.StartNew();
         Title = "NORA VPN";
         Icon = LoadBrandWindowIcon();
@@ -783,6 +792,14 @@ internal sealed class NoraWpfWindow : Window
                 hadSlideshow != NoraPremiumService.ServerSlideshowEffective)
                 RenderPage(_page);
         };
+        Loaded += (_, _) =>
+        {
+            // Preview/snapshot modes must stay offline and deterministic. A real
+            // window refreshes every URL-backed subscription immediately.
+            if (_trayEnabled &&
+                !string.Equals(Environment.GetEnvironmentVariable("NORA_GUI_VISUAL_READY"), "1", StringComparison.Ordinal))
+                _subscriptionRefreshScheduler.Start();
+        };
         _clock.Start();
         _ = NoraNetworkInterfaceCache.WarmAsync();
         _trafficSampleTimer.Tick += (_, _) =>
@@ -806,6 +823,7 @@ internal sealed class NoraWpfWindow : Window
         Closed += (_, _) =>
         {
             _diagnosticCancellation?.Cancel();
+            _subscriptionRefreshScheduler.Dispose();
             _trafficSampleTimer.Stop();
             ResetInterfaceTrafficSampler();
             DisposeTray();
@@ -3113,7 +3131,9 @@ internal sealed class NoraWpfWindow : Window
         });
         actionCopy.Children.Add(new TextBlock
         {
-            Text = enabled ? "Turn it off to restore normal full-device VPN." : "Enable before connecting to a server.",
+            Text = enabled
+                ? "Switching off reconnects your server normally."
+                : "Switch now — NORA reconnects your server.",
             FontSize = 12,
             Foreground = NoraWpfTheme.MutedBrush,
             Margin = new Thickness(0, 3, 0, 0)
@@ -3121,7 +3141,7 @@ internal sealed class NoraWpfWindow : Window
         action.Children.Add(actionCopy);
 
         var toggle = BuildModeToggle(enabled);
-        toggle.IsEnabled = !snapshot;
+        toggle.IsEnabled = !snapshot && !_discordModeTransitionInProgress;
         toggle.Click += async (_, _) => await SetDiscordModeAsync(!enabled);
         Grid.SetColumn(toggle, 1);
         action.Children.Add(toggle);
@@ -3988,22 +4008,106 @@ internal sealed class NoraWpfWindow : Window
         try
         {
             ShowToast("Refreshing subscription", $"Updating {sub.Title}...", ToastKind.Info);
-            var refreshed = await NoraSubscriptionStore.RefreshAsync(sub, AppendLog);
-            _expandedSubscriptionId = refreshed.Id;
-            if (_activeSubscriptionServer is not null &&
-                string.Equals(_activeSubscriptionServer.SubscriptionId, sub.Id, StringComparison.OrdinalIgnoreCase))
-            {
-                var replacement = refreshed.Servers.FirstOrDefault(x => string.Equals(x.Id, _activeSubscriptionServer.Id, StringComparison.OrdinalIgnoreCase))
-                                  ?? refreshed.Servers.FirstOrDefault();
-                if (replacement is not null)
-                    SetActiveSubscriptionServer(replacement);
-            }
+            var refreshed = await _subscriptionRefreshCoordinator.RefreshAsync(sub);
+            ApplyRefreshedSubscription(sub, refreshed, expand: true);
             RenderPage(PageKind.Servers);
             ShowToast("Subscription updated", $"{refreshed.Title}: {refreshed.Servers.Count} servers loaded.", ToastKind.Success);
         }
         catch (Exception ex)
         {
             ReportFailure(NoraOperation.ImportProfile, ex);
+        }
+    }
+
+    private async Task<NoraSubscriptionInfo> RefreshSubscriptionOffUiAsync(
+        NoraSubscriptionInfo subscription,
+        CancellationToken cancellationToken)
+    {
+        var logLines = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        NoraSubscriptionInfo? refreshed = null;
+        Exception? failure = null;
+        try
+        {
+            refreshed = await Task.Run(
+                async () =>
+                {
+                    var current = NoraSubscriptionStore.LoadAll().FirstOrDefault(candidate =>
+                        string.Equals(candidate.Id, subscription.Id, StringComparison.OrdinalIgnoreCase));
+                    if (current is null)
+                        throw new NoraSubscriptionRemovedException(subscription.Id);
+                    return await NoraSubscriptionStore.RefreshAsync(current, logLines.Enqueue, cancellationToken);
+                },
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            failure = ex;
+        }
+
+        if (!Dispatcher.HasShutdownStarted && !Dispatcher.HasShutdownFinished)
+        {
+            await Dispatcher.InvokeAsync(() =>
+            {
+                while (logLines.TryDequeue(out var line))
+                    AppendLog(line);
+            });
+        }
+
+        if (failure is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+        return refreshed!;
+    }
+
+    private void HandleAutomaticSubscriptionRefresh(NoraSubscriptionRefreshResult result)
+    {
+        if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
+            return;
+        Dispatcher.BeginInvoke(() =>
+        {
+            if (result.Error is not null)
+            {
+                var incident = NoraErrors.Classify(NoraOperation.ImportProfile, result.Error);
+                AppendLog($"Automatic subscription refresh failed for {result.Subscription.Title}: {incident.Code} · {incident.Message}");
+                return;
+            }
+            if (result.Refreshed is null)
+                return;
+
+            ApplyRefreshedSubscription(result.Subscription, result.Refreshed, expand: false);
+            AppendLog($"Subscription updated automatically: {result.Refreshed.Title} ({result.Refreshed.Servers.Count} servers)");
+            if (_page == PageKind.Servers)
+                RenderPage(PageKind.Servers);
+        });
+    }
+
+    private void ApplyRefreshedSubscription(
+        NoraSubscriptionInfo original,
+        NoraSubscriptionInfo refreshed,
+        bool expand)
+    {
+        if (expand || string.Equals(_expandedSubscriptionId, original.Id, StringComparison.OrdinalIgnoreCase))
+            _expandedSubscriptionId = refreshed.Id;
+        if (_activeSubscriptionServer is null ||
+            !string.Equals(_activeSubscriptionServer.SubscriptionId, original.Id, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var replacement = refreshed.Servers.FirstOrDefault(server =>
+                              string.Equals(server.Id, _activeSubscriptionServer.Id, StringComparison.OrdinalIgnoreCase))
+                          ?? refreshed.Servers.FirstOrDefault(server =>
+                              NoraSubscriptionStore.SameRuntimeConnection(server, _activeSubscriptionServer));
+        // A provider may replace its entire node set while one of the old nodes is
+        // still carrying the live tunnel. Never make the UI selection disagree
+        // with that active core; the user can choose a new node after disconnecting.
+        if (replacement is null && _state is TunnelState.Ready or TunnelState.Failed)
+            replacement = refreshed.Servers.FirstOrDefault();
+        if (replacement is not null)
+        {
+            _pendingSubscriptionSelection = null;
+            SetActiveSubscriptionServer(replacement);
+        }
+        else if (_state is TunnelState.Connected or TunnelState.Connecting or TunnelState.Disconnecting)
+        {
+            _pendingSubscriptionSelection = refreshed.Servers.FirstOrDefault();
         }
     }
 
@@ -4030,7 +4134,7 @@ internal sealed class NoraWpfWindow : Window
             if (deletingActive && _state == TunnelState.Connected && !await DisconnectAsync(NoraOperation.Disconnect))
                 return;
 
-            NoraSubscriptionStore.DeleteSubscription(sub);
+            await _subscriptionRefreshCoordinator.RunExclusiveSyncAsync(() => NoraSubscriptionStore.DeleteSubscription(sub));
             if (string.Equals(_expandedSubscriptionId, sub.Id, StringComparison.OrdinalIgnoreCase))
                 _expandedSubscriptionId = "";
             if (deletingActive)
@@ -4067,7 +4171,7 @@ internal sealed class NoraWpfWindow : Window
             if (deletingActive && _state == TunnelState.Connected && !await DisconnectAsync(NoraOperation.Disconnect))
                 return;
 
-            NoraSubscriptionStore.DeleteServer(server);
+            await _subscriptionRefreshCoordinator.RunExclusiveSyncAsync(() => NoraSubscriptionStore.DeleteServer(server));
             _ping.Remove(server.LocalPath);
             if (deletingActive)
                 SelectFirstAvailableProfile();
@@ -4118,6 +4222,8 @@ internal sealed class NoraWpfWindow : Window
 
     private async Task ActivateSubscriptionServerAsync(NoraSubscriptionServer server)
     {
+        if (_discordModeTransitionInProgress)
+            return;
         if (_state is TunnelState.Connecting or TunnelState.Disconnecting)
         {
             ShowToast("Action in progress", "Wait until the current tunnel operation finishes.", ToastKind.Info);
@@ -4149,6 +4255,8 @@ internal sealed class NoraWpfWindow : Window
 
     private async Task ActivateProfileAsync(string path)
     {
+        if (_discordModeTransitionInProgress)
+            return;
         if (_state is TunnelState.Connecting or TunnelState.Disconnecting)
         {
             ShowToast("Action in progress", "Wait until the current tunnel operation finishes.", ToastKind.Info);
@@ -4491,41 +4599,63 @@ internal sealed class NoraWpfWindow : Window
 
     private static ImageSource? LoadEmoji(string token)
     {
-        var key = string.Join('-', token.EnumerateRunes()
-            .Select(rune => rune.Value)
-            .Where(value => value != 0xFE0F)
-            .Select(value => value.ToString("x", CultureInfo.InvariantCulture)));
-        if (key.Length == 0)
+        var keys = EmojiAssetKeys(token);
+        if (keys.Count == 0)
             return null;
+        var cacheKey = keys[0];
 
         lock (EmojiImageCacheSync)
         {
-            if (EmojiImageCache.TryGetValue(key, out var cached))
+            if (EmojiImageCache.TryGetValue(cacheKey, out var cached))
                 return cached;
 
-            var path = Path.Combine(AppContext.BaseDirectory, "assets", "emoji", key + ".png");
-            if (!File.Exists(path))
+            foreach (var key in keys)
             {
-                EmojiImageCache[key] = null;
-                return null;
+                var path = Path.Combine(AppContext.BaseDirectory, "assets", "emoji", key + ".png");
+                if (!File.Exists(path))
+                    continue;
+                try
+                {
+                    var image = new BitmapImage();
+                    image.BeginInit();
+                    image.CacheOption = BitmapCacheOption.OnLoad;
+                    image.UriSource = new Uri(path, UriKind.Absolute);
+                    image.EndInit();
+                    image.Freeze();
+                    EmojiImageCache[cacheKey] = image;
+                    return image;
+                }
+                catch
+                {
+                }
             }
-            try
-            {
-                var image = new BitmapImage();
-                image.BeginInit();
-                image.CacheOption = BitmapCacheOption.OnLoad;
-                image.UriSource = new Uri(path, UriKind.Absolute);
-                image.EndInit();
-                image.Freeze();
-                EmojiImageCache[key] = image;
-                return image;
-            }
-            catch
-            {
-                EmojiImageCache[key] = null;
-                return null;
-            }
+            EmojiImageCache[cacheKey] = null;
+            return null;
         }
+    }
+
+    internal static IReadOnlyList<string> EmojiAssetKeys(string token)
+    {
+        static string Key(string value) => string.Join('-', value.EnumerateRunes()
+            .Select(rune => rune.Value)
+            .Where(codePoint => codePoint != 0xFE0F)
+            .Select(codePoint => codePoint.ToString("x", CultureInfo.InvariantCulture)));
+
+        var exact = Key(token);
+        if (exact.Length == 0)
+            return [];
+        var candidates = new List<string> { exact };
+        var joiner = token.IndexOf('\u200D');
+        if (joiner > 0)
+        {
+            // Newer ZWJ emoji can arrive before the bundled image set supports
+            // the complete sequence. Fall back to its leading semantic glyph
+            // (for example brown-mushroom -> mushroom) instead of a tofu square.
+            var leading = Key(token[..joiner]);
+            if (leading.Length > 0 && !string.Equals(leading, exact, StringComparison.OrdinalIgnoreCase))
+                candidates.Add(leading);
+        }
+        return candidates;
     }
 
     private static IEnumerable<string> EmojiTokens(string text)
@@ -4570,24 +4700,24 @@ internal sealed class NoraWpfWindow : Window
 
     private static bool IsRegionalIndicator(int value) => value is >= 0x1F1E6 and <= 0x1F1FF;
 
-    private Task MoveSubscriptionAsync(NoraSubscriptionInfo subscription, int direction)
+    private async Task MoveSubscriptionAsync(NoraSubscriptionInfo subscription, int direction)
     {
-        if (NoraSubscriptionStore.MoveSubscription(subscription.Id, direction))
+        if (await _subscriptionRefreshCoordinator.RunExclusiveSyncAsync(
+                () => NoraSubscriptionStore.MoveSubscription(subscription.Id, direction)))
         {
             AppendLog($"Saved subscription order for {subscription.Title}.");
             RenderPage(PageKind.Servers);
         }
-        return Task.CompletedTask;
     }
 
-    private Task MoveSubscriptionServerAsync(NoraSubscriptionInfo subscription, NoraSubscriptionServer server, int direction)
+    private async Task MoveSubscriptionServerAsync(NoraSubscriptionInfo subscription, NoraSubscriptionServer server, int direction)
     {
-        if (NoraSubscriptionStore.MoveServer(subscription.Id, server.Id, direction))
+        if (await _subscriptionRefreshCoordinator.RunExclusiveSyncAsync(
+                () => NoraSubscriptionStore.MoveServer(subscription.Id, server.Id, direction)))
         {
             AppendLog($"Saved server order for {server.Name}.");
             RenderPage(PageKind.Servers);
         }
-        return Task.CompletedTask;
     }
 
     private UIElement PingBadge(PingStatus ping)
@@ -5716,78 +5846,165 @@ internal sealed class NoraWpfWindow : Window
 
     private async Task SetDiscordModeAsync(bool enabled)
     {
-        if (enabled)
+        if (_discordModeTransitionInProgress)
+            return;
+        if (_state is TunnelState.Connecting or TunnelState.Disconnecting || _connectCancellation is not null)
         {
-            if (_state is TunnelState.Connecting or TunnelState.Connected or TunnelState.Disconnecting ||
-                _core is not null || _connectCancellation is not null)
-            {
-                ShowToast(
-                    "Disconnect first",
-                    "Disconnect from the current server before turning on Discord Mode.",
-                    ToastKind.Info);
-                return;
-            }
-
-            var progress = new NoraProgressWindow(
-                "Preparing Discord Mode",
-                "Checking the selective routing engine…")
-            {
-                Owner = this
-            };
-            var progressVisibleFor = Stopwatch.StartNew();
-            progress.Show();
-            try
-            {
-                await NoraDiscordModeSettings.PrepareAsync(
-                    status => Dispatcher.Invoke(() => progress.SetStatus(status)),
-                    AppendLog,
-                    CancellationToken.None);
-                NoraDiscordModeSettings.SetEnabledOrThrow(true);
-                AppendLog("[discord] Discord Mode enabled");
-                progress.SetStatus("Discord Mode is ready");
-                var remaining = TimeSpan.FromMilliseconds(1300) - progressVisibleFor.Elapsed;
-                if (remaining > TimeSpan.Zero)
-                    await Task.Delay(remaining);
-                progress.Close();
-                RenderPage(PageKind.Home);
-                ShowToast("Discord Mode is ready", "Choose a VLESS or KRot server and connect.", ToastKind.Success);
-            }
-            catch (Exception ex)
-            {
-                NoraDiscordModeSettings.Enabled = false;
-                var incident = ReportFailure(NoraOperation.DiscordMode, ex);
-                progress.SetError(incident.Title, incident.Message + Environment.NewLine + "What to do: " + incident.Action);
-            }
+            ShowToast("Action in progress", "Wait until the current tunnel operation finishes.", ToastKind.Info);
             return;
         }
 
-        if (_state == TunnelState.Disconnecting)
+        if (_state == TunnelState.Connected && _core is null)
         {
-            ShowToast("Disconnecting", "Wait until the current connection has stopped, then turn off Discord Mode.", ToastKind.Info);
+            ApplyState(TunnelState.Failed);
+            ReportFailure(
+                NoraOperation.DiscordMode,
+                new InvalidOperationException("The app reported a connected tunnel without an active VPN core."));
             return;
         }
 
-        if (_state == TunnelState.Connecting)
-            await CancelConnectingAsync();
-        else if (_core is not null || _state == TunnelState.Connected)
-            await DisconnectAsync();
+        var selectedProtocol = CurrentServerInfo().Protocol;
+        var hasSelection = _activeSubscriptionServer is not null ||
+                           _activeConfig is not null ||
+                           !string.IsNullOrWhiteSpace(_activeExternalProtocol);
+        var supportedSelection = !hasSelection ||
+                                 (_activeSubscriptionServer is not null &&
+                                  _activeSubscriptionServer.Protocol.Contains("VLESS", StringComparison.OrdinalIgnoreCase)) ||
+                                 (_activeSubscriptionServer is null && _activeConfig is not null &&
+                                  string.IsNullOrWhiteSpace(_activeExternalProtocol));
+        if (enabled && !supportedSelection)
+        {
+            var awg = selectedProtocol.Contains("AWG", StringComparison.OrdinalIgnoreCase);
+            AppendLog($"[discord] mode switch blocked because {selectedProtocol} is selected");
+            ShowToast(
+                awg ? "AWG is not supported" : "Protocol is not supported",
+                "Discord Mode works with VLESS and KRot servers. The current VPN connection was not changed.",
+                ToastKind.Info);
+            return;
+        }
+
+        var previousEnabled = NoraDiscordModeSettings.Enabled;
+        if (previousEnabled == enabled)
+        {
+            RenderPage(PageKind.Home);
+            return;
+        }
+
+        var selection = CaptureActiveSelection();
+        var wasConnected = _state == TunnelState.Connected && _core is not null;
+        var progress = new NoraProgressWindow(
+            enabled ? "Switching to Discord Mode" : "Returning to normal VPN",
+            wasConnected ? "Preparing to reconnect the selected server…" : "Preparing the routing mode…")
+        {
+            Owner = this
+        };
+        var progressVisibleFor = Stopwatch.StartNew();
+        _discordModeTransitionInProgress = true;
+        IsEnabled = false;
 
         try
         {
-            NoraDiscordModeSettings.SetEnabledOrThrow(false);
-            AppendLog("[discord] Discord Mode disabled");
+            progress.Show();
+            var result = await NoraDiscordModeTransition.RunAsync(
+                enabled,
+                previousEnabled,
+                wasConnected,
+                () => DisconnectAsync(NoraOperation.DiscordMode),
+                cancellationToken => enabled
+                    ? NoraDiscordModeSettings.PrepareAsync(
+                        status => Dispatcher.Invoke(() => progress.SetStatus(status)),
+                        AppendLog,
+                        cancellationToken)
+                    : Task.CompletedTask,
+                value =>
+                {
+                    NoraDiscordModeSettings.SetEnabledOrThrow(value);
+                    AppendLog(value ? "[discord] Discord Mode enabled" : "[discord] Discord Mode disabled");
+                },
+                () => RestoreActiveSelection(selection),
+                async () =>
+                {
+                    await ConnectAsync(fromDiscordModeTransition: true);
+                    return _state == TunnelState.Connected && _core is not null;
+                },
+                status => Dispatcher.Invoke(() => progress.SetStatus(status)),
+                CancellationToken.None);
+
+            if (!result.Success)
+            {
+                if (result.Error is null)
+                {
+                    progress.Close();
+                    RenderPage(PageKind.VoiceMode);
+                    return;
+                }
+
+                var incident = ReportFailure(NoraOperation.DiscordMode, result.Error);
+                var rollback = !wasConnected
+                    ? ""
+                    : !result.PreviousModeRestored
+                        ? Environment.NewLine + "The previous routing mode could not be restored, so NORA left the VPN disconnected."
+                    : result.Reconnected
+                        ? Environment.NewLine + "The previous VPN connection was restored."
+                        : Environment.NewLine + "The previous VPN connection could not be restored.";
+                progress.SetError(incident.Title, incident.Message + rollback + Environment.NewLine + "What to do: " + incident.Action);
+                RenderPage(PageKind.VoiceMode);
+                return;
+            }
+
+            progress.SetStatus(wasConnected
+                ? "The selected server is connected"
+                : enabled ? "Discord Mode is ready" : "Normal VPN mode is ready");
+            var remaining = TimeSpan.FromMilliseconds(900) - progressVisibleFor.Elapsed;
+            if (remaining > TimeSpan.Zero)
+                await Task.Delay(remaining);
+            progress.Close();
             RenderPage(PageKind.Home);
-            ShowToast("Discord Mode is off", "NORA has returned to normal full-device VPN mode.", ToastKind.Info);
+            if (enabled)
+            {
+                ShowToast(
+                    "Discord Mode is ready",
+                    wasConnected ? "The previous server was reconnected for Discord only." : "Choose a VLESS or KRot server and connect.",
+                    ToastKind.Success);
+            }
+            else
+            {
+                ShowToast(
+                    "Discord Mode is off",
+                    wasConnected ? "The previous server was reconnected in normal full-device mode." : "NORA has returned to normal full-device VPN mode.",
+                    ToastKind.Info);
+            }
         }
-        catch (Exception ex)
+        finally
         {
-            ReportFailure(NoraOperation.DiscordMode, ex);
-            RenderPage(PageKind.VoiceMode);
+            IsEnabled = true;
+            _discordModeTransitionInProgress = false;
         }
     }
 
-    private async Task ConnectAsync()
+    private ActiveSelectionSnapshot CaptureActiveSelection() => new(
+        _activeProfilePath,
+        _activeConfig,
+        _activeSubscriptionServer,
+        _activeExternalProtocol,
+        _showActiveEndpoint);
+
+    private void RestoreActiveSelection(ActiveSelectionSnapshot selection)
     {
+        _activeProfilePath = selection.ProfilePath;
+        _activeConfig = selection.Config;
+        _activeSubscriptionServer = selection.SubscriptionServer;
+        _activeExternalProtocol = selection.ExternalProtocol;
+        _showActiveEndpoint = selection.ShowActiveEndpoint;
+        NoraAppState.SaveActiveProfilePath(selection.ProfilePath);
+    }
+
+    private async Task ConnectAsync(bool fromDiscordModeTransition = false)
+    {
+        if (_discordModeTransitionInProgress && !fromDiscordModeTransition)
+            return;
+        if (!fromDiscordModeTransition && _core is null && _state is TunnelState.Ready or TunnelState.Failed)
+            ApplyPendingSubscriptionSelection();
         if (_diagnosticRunning)
         {
             ShowToast("Connection test is running", "Cancel the manual test on Logs before connecting.", ToastKind.Info);
@@ -6110,6 +6327,8 @@ internal sealed class NoraWpfWindow : Window
             _trafficInterfaceHint = "";
             ResetInterfaceTrafficSampler();
             ApplyState(TunnelState.Ready);
+            if (operation != NoraOperation.DiscordMode)
+                ApplyPendingSubscriptionSelection();
             return true;
         }
         catch (Exception ex)
@@ -6278,7 +6497,8 @@ internal sealed class NoraWpfWindow : Window
             if (HappCrypt5Decoder.IsCrypt5Link(text) ||
                 (Uri.TryCreate(text.Trim(), UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https"))
             {
-                var subscription = await NoraSubscriptionStore.ImportAsync(text, AppendLog);
+                var subscription = await _subscriptionRefreshCoordinator.RunExclusiveAsync(
+                    () => NoraSubscriptionStore.ImportAsync(text, AppendLog));
                 _expandedSubscriptionId = subscription.Id;
                 if (subscription.Servers.FirstOrDefault() is { } first)
                     SetActiveSubscriptionServer(first);
@@ -6288,7 +6508,8 @@ internal sealed class NoraWpfWindow : Window
             }
             if (text.Trim().StartsWith("vless://", StringComparison.OrdinalIgnoreCase))
             {
-                var subscription = await NoraSubscriptionStore.ImportAsync(text, AppendLog);
+                var subscription = await _subscriptionRefreshCoordinator.RunExclusiveAsync(
+                    () => NoraSubscriptionStore.ImportAsync(text, AppendLog));
                 _expandedSubscriptionId = subscription.Id;
                 if (subscription.Servers.FirstOrDefault() is { } first)
                     SetActiveSubscriptionServer(first);
@@ -6303,7 +6524,8 @@ internal sealed class NoraWpfWindow : Window
             {
                 // Xray/sing-box JSON config file or Clash/Mihomo YAML → config import path,
                 // which preserves the provider routing rules for split tunneling.
-                var subscription = await NoraSubscriptionStore.ImportAsync(text, AppendLog);
+                var subscription = await _subscriptionRefreshCoordinator.RunExclusiveAsync(
+                    () => NoraSubscriptionStore.ImportAsync(text, AppendLog));
                 if (subscription.Servers.Count == 0)
                     throw new NoraAppException("NORA-SUB-4003", "The config file did not contain any supported VLESS servers.");
                 _expandedSubscriptionId = subscription.Id;
@@ -6499,6 +6721,7 @@ internal sealed class NoraWpfWindow : Window
             }
             if (ProfileListItem.TryFromExternal(path, out var external))
             {
+                _pendingSubscriptionSelection = null;
                 _activeConfig = null;
                 _activeSubscriptionServer = null;
                 _activeExternalProtocol = external.Protocol;
@@ -6508,6 +6731,7 @@ internal sealed class NoraWpfWindow : Window
                 AppendLog("Selected " + external.Protocol + " profile " + external.Name);
                 return;
             }
+            _pendingSubscriptionSelection = null;
             _activeConfig = NvpConfig.Load(path);
             _activeSubscriptionServer = null;
             _activeExternalProtocol = "";
@@ -6523,6 +6747,7 @@ internal sealed class NoraWpfWindow : Window
 
     private void SetActiveSubscriptionServer(NoraSubscriptionServer server)
     {
+        _pendingSubscriptionSelection = null;
         _showActiveEndpoint = false;
         _activeSubscriptionServer = server;
         _activeConfig = null;
@@ -6531,6 +6756,17 @@ internal sealed class NoraWpfWindow : Window
         NoraAppState.SaveActiveProfilePath(server.LocalPath);
         _ = ProbeActiveAsync(server.LocalPath);
         AppendLog("Selected subscription server " + server.Name + " " + server.Host + ":" + server.Port);
+    }
+
+    private void ApplyPendingSubscriptionSelection()
+    {
+        if (_pendingSubscriptionSelection is not { } replacement)
+            return;
+        _pendingSubscriptionSelection = null;
+        SetActiveSubscriptionServer(replacement);
+        AppendLog("Selected a current subscription server after the provider removed the previous node.");
+        if (_page == PageKind.Servers)
+            RenderPage(PageKind.Servers);
     }
 
     private void SelectFirstAvailableProfile()
@@ -6547,6 +6783,7 @@ internal sealed class NoraWpfWindow : Window
         }
         _activeConfig = null;
         _activeSubscriptionServer = null;
+        _pendingSubscriptionSelection = null;
         _activeExternalProtocol = "";
         _activeProfilePath = "";
         NoraAppState.SaveActiveProfilePath("");
@@ -6740,6 +6977,13 @@ internal sealed class NoraWpfWindow : Window
 
     private void AppendLog(string message)
     {
+        if (!Dispatcher.CheckAccess())
+        {
+            if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
+                return;
+            Dispatcher.Invoke(() => AppendLog(message));
+            return;
+        }
         var line = $"[{DateTime.Now:HH:mm:ss}] {message}";
         _logs.AppendLine(line);
         TrimInMemoryLog();
@@ -7591,6 +7835,12 @@ internal sealed class NoraWpfWindow : Window
     private static string CountryFor(string host) => "Netherlands";
 
     private sealed record ServerInfo(string Name, string Host, int Port, string Country, bool Online, string Protocol);
+    private sealed record ActiveSelectionSnapshot(
+        string ProfilePath,
+        NvpConfig? Config,
+        NoraSubscriptionServer? SubscriptionServer,
+        string ExternalProtocol,
+        bool ShowActiveEndpoint);
     private sealed record ManagedServerInfo(string ProfilePath, string ServerProfilePath, string Name, string Host, int Port, string Country, string SshUser, string SshPassword)
     {
         public bool HasSshCredentials => !string.IsNullOrWhiteSpace(SshUser) && !string.IsNullOrWhiteSpace(SshPassword);
@@ -9806,12 +10056,15 @@ internal sealed class FlagIcon : FrameworkElement
             ("United Kingdom", "GB"),
             ("Kosovo", "XK")
         };
+        var emojiFallback = NoraWpfWindow.EmojiAssetKeys("🍄‍🟫");
         var passed = expected.All(item =>
             ResolveCountryCode(item.Item1) == item.Item2 &&
-            File.Exists(Path.Combine(AppContext.BaseDirectory, "assets", "flags", item.Item2.ToLowerInvariant() + ".png")));
+            File.Exists(Path.Combine(AppContext.BaseDirectory, "assets", "flags", item.Item2.ToLowerInvariant() + ".png"))) &&
+            emojiFallback.SequenceEqual(["1f344-200d-1f7eb", "1f344"], StringComparer.Ordinal) &&
+            File.Exists(Path.Combine(AppContext.BaseDirectory, "assets", "emoji", "1f344.png"));
         output.WriteLine(passed
-            ? "COUNTRY FLAG SELF-TEST PASS: ISO/EU aliases resolve to bundled PNG assets"
-            : "COUNTRY FLAG SELF-TEST FAIL: a country code or asset is missing");
+            ? "COUNTRY FLAG SELF-TEST PASS: ISO/EU aliases and unsupported ZWJ emoji fallback resolve to bundled PNG assets"
+            : "COUNTRY FLAG SELF-TEST FAIL: a country code, emoji fallback or asset is missing");
         return passed ? 0 : 1;
     }
 
