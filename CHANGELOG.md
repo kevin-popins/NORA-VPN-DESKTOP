@@ -2,13 +2,14 @@
 
 ## Unreleased
 
-- Fixed duplicated VLESS subscription nodes by comparing complete runtime
-  connection settings instead of provider display labels.
+- Restored provider ordering and distinct named VLESS routing variants while
+  keeping repeated quota and instruction rows to one occurrence each.
 - Preserved double-encoded Unicode titles and server names and added a graceful
   bundled-image fallback for unsupported ZWJ emoji sequences.
 - Added automatic subscription refresh at application startup and at each
   provider-supplied update interval, with coalesced writes and quiet retry after
-  transient failures.
+  transient failures. A single summary notification now confirms each automatic
+  refresh pass or explains that NORA will retry.
 - Preserved selected nodes and custom ordering while migrating existing
   subscriptions to semantic IDs; subscription file mutations are serialized
   and written atomically.

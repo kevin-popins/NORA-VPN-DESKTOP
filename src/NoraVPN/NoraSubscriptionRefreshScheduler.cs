@@ -9,6 +9,13 @@ internal sealed record NoraSubscriptionRefreshResult(
     NoraSubscriptionInfo? Refreshed,
     Exception? Error);
 
+internal sealed record NoraSubscriptionRefreshPassResult(
+    bool Startup,
+    int CandidateCount,
+    int Succeeded,
+    int Failed,
+    int Removed);
+
 internal sealed class NoraSubscriptionRemovedException(string subscriptionId)
     : OperationCanceledException($"Subscription {subscriptionId} no longer exists.");
 
@@ -115,6 +122,7 @@ internal sealed class NoraSubscriptionRefreshScheduler : IDisposable
     private readonly Func<IReadOnlyList<NoraSubscriptionInfo>> _loadSubscriptions;
     private readonly NoraSubscriptionRefreshCoordinator _coordinator;
     private readonly Action<NoraSubscriptionRefreshResult> _completed;
+    private readonly Action<NoraSubscriptionRefreshPassResult>? _passCompleted;
     private readonly Func<DateTimeOffset> _utcNow;
     private readonly TimeSpan _scanInterval;
     private readonly CancellationTokenSource _cancellation = new();
@@ -129,11 +137,13 @@ internal sealed class NoraSubscriptionRefreshScheduler : IDisposable
         NoraSubscriptionRefreshCoordinator coordinator,
         Action<NoraSubscriptionRefreshResult> completed,
         Func<DateTimeOffset>? utcNow = null,
-        TimeSpan? scanInterval = null)
+        TimeSpan? scanInterval = null,
+        Action<NoraSubscriptionRefreshPassResult>? passCompleted = null)
     {
         _loadSubscriptions = loadSubscriptions;
         _coordinator = coordinator;
         _completed = completed;
+        _passCompleted = passCompleted;
         _utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
         _scanInterval = scanInterval ?? TimeSpan.FromMinutes(1);
     }
@@ -152,6 +162,10 @@ internal sealed class NoraSubscriptionRefreshScheduler : IDisposable
             .Where(subscription => ShouldRefresh(subscription, now, startup, RetryTime(subscription)))
             .ToArray();
 
+        var succeeded = 0;
+        var failed = 0;
+        var removed = 0;
+
         foreach (var subscription in subscriptions)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -160,6 +174,7 @@ internal sealed class NoraSubscriptionRefreshScheduler : IDisposable
                 var refreshed = await _coordinator.RefreshAsync(subscription, cancellationToken).ConfigureAwait(false);
                 _retryAfter.TryRemove(RefreshKey(subscription), out _);
                 _completed(new NoraSubscriptionRefreshResult(subscription, refreshed, null));
+                succeeded++;
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -168,13 +183,17 @@ internal sealed class NoraSubscriptionRefreshScheduler : IDisposable
             catch (NoraSubscriptionRemovedException)
             {
                 _retryAfter.TryRemove(RefreshKey(subscription), out _);
+                removed++;
             }
             catch (Exception ex)
             {
                 _retryAfter[RefreshKey(subscription)] = _utcNow() + FailedRefreshRetryDelay;
                 _completed(new NoraSubscriptionRefreshResult(subscription, null, ex));
+                failed++;
             }
         }
+
+        NotifyPassCompleted(new NoraSubscriptionRefreshPassResult(startup, subscriptions.Length, succeeded, failed, removed));
     }
 
     internal static bool ShouldRefresh(
@@ -233,7 +252,14 @@ internal sealed class NoraSubscriptionRefreshScheduler : IDisposable
                 new NoraSubscriptionInfo { Title = "Subscription scheduler" },
                 null,
                 ex));
+            NotifyPassCompleted(new NoraSubscriptionRefreshPassResult(startup, 0, 0, 1, 0));
         }
+    }
+
+    private void NotifyPassCompleted(NoraSubscriptionRefreshPassResult result)
+    {
+        try { _passCompleted?.Invoke(result); }
+        catch { }
     }
 
     private DateTimeOffset? RetryTime(NoraSubscriptionInfo subscription)
@@ -312,6 +338,7 @@ internal sealed class NoraSubscriptionRefreshScheduler : IDisposable
         var coordinatorPassed = coalesced && firstStarted && calls == 2 && maximumActive == 1;
 
         var refreshedIds = new List<string>();
+        var passResults = new List<NoraSubscriptionRefreshPassResult>();
         var deterministicCoordinator = new NoraSubscriptionRefreshCoordinator((subscription, _) =>
         {
             refreshedIds.Add(subscription.Id);
@@ -321,12 +348,17 @@ internal sealed class NoraSubscriptionRefreshScheduler : IDisposable
             () => [fresh, due, launchOnly, localOnly],
             deterministicCoordinator,
             _ => { },
-            () => now);
+            () => now,
+            passCompleted: passResults.Add);
         scheduler.RunPassAsync(startup: false).GetAwaiter().GetResult();
-        var duePassPassed = refreshedIds.SequenceEqual(["due"], StringComparer.Ordinal);
+        var duePassPassed = refreshedIds.SequenceEqual(["due"], StringComparer.Ordinal) &&
+                            passResults.Count == 1 &&
+                            passResults[0] == new NoraSubscriptionRefreshPassResult(false, 1, 1, 0, 0);
         refreshedIds.Clear();
         scheduler.RunPassAsync(startup: true).GetAwaiter().GetResult();
-        var startupPassPassed = refreshedIds.SequenceEqual(["fresh", "due", "launch"], StringComparer.Ordinal);
+        var startupPassPassed = refreshedIds.SequenceEqual(["fresh", "due", "launch"], StringComparer.Ordinal) &&
+                                passResults.Count == 2 &&
+                                passResults[1] == new NoraSubscriptionRefreshPassResult(true, 3, 3, 0, 0);
 
         var retryNow = now;
         var retryCalls = 0;
@@ -349,13 +381,16 @@ internal sealed class NoraSubscriptionRefreshScheduler : IDisposable
         var retryPassed = retryCalls == 2 && retryResults.Count == 2 && retryResults.All(result => result.Error is IOException);
 
         var schedulerFailures = new List<NoraSubscriptionRefreshResult>();
+        var schedulerFailurePasses = new List<NoraSubscriptionRefreshPassResult>();
         using var resilientScheduler = new NoraSubscriptionRefreshScheduler(
             () => throw new IOException("fixture store read failure"),
             deterministicCoordinator,
             schedulerFailures.Add,
-            () => now);
+            () => now,
+            passCompleted: schedulerFailurePasses.Add);
         resilientScheduler.RunPassSafelyAsync(startup: true, CancellationToken.None).GetAwaiter().GetResult();
-        var resilientPassed = schedulerFailures.Count == 1 && schedulerFailures[0].Error is IOException;
+        var resilientPassed = schedulerFailures.Count == 1 && schedulerFailures[0].Error is IOException &&
+                              schedulerFailurePasses.Count == 1 && schedulerFailurePasses[0].Failed == 1;
 
         var removedCalls = 0;
         var removedResults = new List<NoraSubscriptionRefreshResult>();

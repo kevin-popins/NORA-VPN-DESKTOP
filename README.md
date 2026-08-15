@@ -70,8 +70,9 @@ NORA есть живой главный экран, карта, аккуратн
 - **Диагностика подключения.** На странице Logs можно запустить проверку
   соединения и получить готовый отчёт, если VPN не подключается.
 - **Автообновление подписок.** URL-подписки обновляются при запуске NORA и затем
-  по интервалу, который прислал провайдер. Одинаковые VLESS-узлы с разными
-  служебными подписями показываются один раз.
+  по интервалу, который прислал провайдер. После автообновления NORA показывает одно
+  итоговое уведомление. Порядок провайдера и именованные варианты маршрутов сохраняются,
+  а повторные строки с остатком трафика или инструкцией показываются по одной.
 
 ### Пресеты маршрутизации
 
@@ -140,8 +141,10 @@ live home screen, a map, tidy traffic stats, and an easy-to-read server list.
 - **Connection diagnostics.** The Logs page can run a connection test and
   produce a ready-to-share report when the VPN cannot connect.
 - **Automatic subscription refresh.** URL subscriptions refresh when NORA
-  starts and then at the interval supplied by the provider. Identical VLESS
-  nodes with different status labels appear only once.
+  starts and then at the interval supplied by the provider. NORA shows one
+  summary notification after an automatic refresh. Provider order and named
+  routing variants are retained, while repeated quota or instruction rows
+  appear only once.
 
 ### Routing presets
 

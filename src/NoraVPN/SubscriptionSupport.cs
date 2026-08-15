@@ -34,6 +34,9 @@ internal sealed class NoraSubscriptionInfo
     public long ExpireUnix { get; set; }
     public int UpdateIntervalHours { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
+    // Provider order is authoritative until the user explicitly moves a node
+    // in NORA's Arrange mode. Only then is the local order preserved on refresh.
+    public bool CustomServerOrder { get; set; }
     public List<NoraSubscriptionServer> Servers { get; set; } = [];
 }
 
@@ -1261,28 +1264,48 @@ internal static class NoraSubscriptionStore
         }
         catch { }
 
-        // The remote list may be reordered on every refresh. Keep an existing
-        // local order by stable server id and append genuinely new nodes after it.
+        // Follow the provider order by default. Preserve a local order only after
+        // the user explicitly moved a node in Arrange mode.
         sub.DisplayOrder = previous?.DisplayOrder > 0
             ? previous.DisplayOrder
             : NextSubscriptionDisplayOrder();
+        sub.CustomServerOrder = previous?.CustomServerOrder ?? false;
         var previousServers = previous?.Servers ?? [];
-        var previousOrders = previousServers
-            .Where(server => !string.IsNullOrWhiteSpace(server.Id))
-            .GroupBy(server => server.Id, StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(group => group.Key, group => group.Select(server => server.DisplayOrder).Where(order => order > 0).DefaultIfEmpty(0).Min(), StringComparer.OrdinalIgnoreCase);
-        var previousRuntimeOrders = previousServers
-            .GroupBy(RuntimeIdentity, StringComparer.Ordinal)
-            .ToDictionary(group => group.Key, group => group.Select(server => server.DisplayOrder).Where(order => order > 0).DefaultIfEmpty(0).Min(), StringComparer.Ordinal);
-        var nextServerOrder = Math.Max(0, previousOrders.Values.DefaultIfEmpty(0).Max());
-        foreach (var server in sub.Servers)
+        if (!sub.CustomServerOrder)
         {
-            if (previousOrders.TryGetValue(server.Id, out var priorOrder) && priorOrder > 0)
-                server.DisplayOrder = priorOrder;
-            else if (previousRuntimeOrders.TryGetValue(RuntimeIdentity(server), out var migratedOrder) && migratedOrder > 0)
-                server.DisplayOrder = migratedOrder;
-            else
-                server.DisplayOrder = ++nextServerOrder;
+            for (var index = 0; index < sub.Servers.Count; index++)
+                sub.Servers[index].DisplayOrder = index + 1;
+        }
+        else
+        {
+            var nextServerOrder = Math.Max(0, previousServers.Select(server => server.DisplayOrder).DefaultIfEmpty(0).Max());
+            var claimedPrevious = new HashSet<NoraSubscriptionServer>();
+            foreach (var server in sub.Servers)
+            {
+                var prior = previousServers.FirstOrDefault(previousServer =>
+                                !claimedPrevious.Contains(previousServer) &&
+                                previousServer.DisplayOrder > 0 &&
+                                string.Equals(previousServer.Id, server.Id, StringComparison.OrdinalIgnoreCase))
+                            ?? previousServers.FirstOrDefault(previousServer =>
+                                !claimedPrevious.Contains(previousServer) &&
+                                previousServer.DisplayOrder > 0 &&
+                                SameProviderEntry(previousServer, server))
+                            // Legacy releases keyed nodes only by runtime connection.
+                            // Claim that fallback once so newly restored named rows do not
+                            // all inherit the same local position.
+                            ?? previousServers.FirstOrDefault(previousServer =>
+                                !claimedPrevious.Contains(previousServer) &&
+                                previousServer.DisplayOrder > 0 &&
+                                SameRuntimeConnection(previousServer, server));
+                if (prior is null)
+                {
+                    server.DisplayOrder = ++nextServerOrder;
+                    continue;
+                }
+
+                claimedPrevious.Add(prior);
+                server.DisplayOrder = prior.DisplayOrder;
+            }
         }
         sub.Servers = OrderServers(sub.Servers).ToList();
 
@@ -1338,6 +1361,7 @@ internal static class NoraSubscriptionStore
 
         for (var order = 0; order < servers.Count; order++)
             servers[order].DisplayOrder = order + 1;
+        subscription.CustomServerOrder = true;
         subscription.Servers = servers;
         PersistSubscriptionOrder(subscription);
         return true;
@@ -1478,20 +1502,23 @@ internal static class NoraSubscriptionStore
             const string unicodeName = "🇷🇺 ВНИЗУ Обходы (4G/LTE) ⬇️";
             var doubleEncodedName = Uri.EscapeDataString(unicodeName).Replace("%", "%25", StringComparison.Ordinal);
             var duplicateLabel = Uri.EscapeDataString("📊 Осталось: 100.00 GiB");
-            var preferredDuplicateName = Uri.EscapeDataString("🇷🇺 RU • Все операторы 🍊");
+            var namedRoute = Uri.EscapeDataString("🇷🇺 RU • Все операторы 🍊");
             var uniqueName = Uri.EscapeDataString("🇳🇱 Amsterdam 🌷");
             var defaultName = Uri.EscapeDataString("🇬🇮 Gibraltar");
+            var gbLondonName = Uri.EscapeDataString("🇬🇧 GB London");
             var reorderedExtraOne = Uri.EscapeDataString("{\"headers\":{\"X-Test\":\"one\"},\"noGRPCHeader\":true}");
             var reorderedExtraTwo = Uri.EscapeDataString("{\"noGRPCHeader\":true,\"headers\":{\"X-Test\":\"one\"}}");
             var duplicatePayload = string.Join('\n',
                 $"vless://22222222-2222-4222-8222-222222222222@198.51.100.20:443?encryption=none&security=reality&sni=edge.example&fp=firefox&pbk=dedup-key&sid=beef&type=xhttp&path=%2Fedge#{doubleEncodedName}",
                 $"vless://22222222-2222-4222-8222-222222222222@198.51.100.20:443?path=%2Fedge&type=xhttp&sid=beef&pbk=dedup-key&fp=firefox&sni=edge.example&security=reality&encryption=none#{duplicateLabel}",
-                $"vless://22222222-2222-4222-8222-222222222222@198.51.100.20:443?security=reality&encryption=none&sni=edge.example&fp=firefox&pbk=dedup-key&sid=beef&type=xhttp&path=%2Fedge#{preferredDuplicateName}",
+                $"vless://22222222-2222-4222-8222-222222222222@198.51.100.20:443?security=reality&encryption=none&sni=edge.example&fp=firefox&pbk=dedup-key&sid=beef&type=xhttp&path=%2Fedge#{namedRoute}",
                 $"vless://33333333-3333-4333-8333-333333333333@198.51.100.21:443?encryption=none&security=reality&sni=nl.example&fp=firefox&pbk=unique-key&sid=cafe&type=xhttp&path=%2Fnl#{uniqueName}",
                 $"vless://44444444-4444-4444-8444-444444444444@198.51.100.22:443?encryption=none&security=reality&sni=defaults.example&fp=firefox&pbk=defaults-key&sid=face&type=xhttp#{defaultName}",
-                "vless://44444444-4444-4444-8444-444444444444@198.51.100.22:443?mode=auto&path=%2F&type=splithttp&sid=face&pbk=defaults-key&fp=firefox&sni=defaults.example&security=reality&encryption=none#AUTO",
-                $"vless://55555555-5555-4555-8555-555555555555@198.51.100.23:443?encryption=none&security=reality&sni=extra.example&fp=firefox&pbk=extra-key&sid=feed&type=xhttp&extra={reorderedExtraOne}#🇬🇧%20GB%20London",
-                $"vless://55555555-5555-4555-8555-555555555555@198.51.100.23:443?extra={reorderedExtraTwo}&type=xhttp&sid=feed&pbk=extra-key&fp=firefox&sni=extra.example&security=reality&encryption=none#AUTO");
+                $"vless://44444444-4444-4444-8444-444444444444@198.51.100.22:443?mode=auto&path=%2F&type=splithttp&sid=face&pbk=defaults-key&fp=firefox&sni=defaults.example&security=reality&encryption=none#{defaultName}",
+                $"vless://55555555-5555-4555-8555-555555555555@198.51.100.23:443?encryption=none&security=reality&sni=extra.example&fp=firefox&pbk=extra-key&sid=feed&type=xhttp&extra={reorderedExtraOne}#{gbLondonName}",
+                $"vless://55555555-5555-4555-8555-555555555555@198.51.100.23:443?extra={reorderedExtraTwo}&type=xhttp&sid=feed&pbk=extra-key&fp=firefox&sni=extra.example&security=reality&encryption=none#{gbLondonName}",
+                $"vless://77777777-7777-4777-8777-777777777777@198.51.100.24:443?encryption=none&security=reality&sni=info.example&fp=firefox&pbk=info-key&sid=aaaa&type=xhttp&path=%2Finfo#{doubleEncodedName}",
+                $"vless://88888888-8888-4888-8888-888888888888@198.51.100.25:443?encryption=none&security=reality&sni=quota.example&fp=firefox&pbk=quota-key&sid=bbbb&type=xhttp&path=%2Fquota#{duplicateLabel}");
             var unicodeHeaders = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
             {
                 ["profile-title*"] = "UTF-8''" + Uri.EscapeDataString(unicodeTitle).Replace("%", "%25", StringComparison.Ordinal)
@@ -1547,14 +1574,16 @@ internal static class NoraSubscriptionStore
                          pinnedStrategy == "ForceIPv4" &&
                          failover.Count == 2 && failover[0].Id == primary.Id && failover[1].Id == backup.Id &&
                          persistedFixture.Title == unicodeTitle &&
-                         persistedFixture.Servers.Count == 4 &&
-                         persistedFixture.Servers[0].Name == "🇷🇺 RU • Все операторы 🍊" &&
-                         persistedFixture.Servers[0].Country == "Russia" &&
-                         persistedFixture.Servers[1].Name == "🇳🇱 Amsterdam 🌷" &&
-                         persistedFixture.Servers[2].Name == "🇬🇮 Gibraltar" &&
-                         persistedFixture.Servers[3].Name == "🇬🇧 GB London";
+                          persistedFixture.Servers.Count == 6 &&
+                          persistedFixture.Servers[0].Name == unicodeName &&
+                          persistedFixture.Servers[0].Country == "Russia" &&
+                          persistedFixture.Servers[1].Name == "📊 Осталось: 100.00 GiB" &&
+                          persistedFixture.Servers[2].Name == "🇷🇺 RU • Все операторы 🍊" &&
+                          persistedFixture.Servers[3].Name == "🇳🇱 Amsterdam 🌷" &&
+                          persistedFixture.Servers[4].Name == "🇬🇮 Gibraltar" &&
+                          persistedFixture.Servers[5].Name == "🇬🇧 GB London";
             output.WriteLine(passed
-                ? "SUBSCRIPTION TRANSPORT SELF-TEST PASS: xhttp=preserved; auto-failover=bounded; endpoint-pool=pinned; duplicates=removed; unicode=preserved"
+                ? "SUBSCRIPTION TRANSPORT SELF-TEST PASS: xhttp=preserved; provider-order=preserved; info-placeholders=deduped; named-routes=preserved; unicode=preserved"
                 : "SUBSCRIPTION TRANSPORT SELF-TEST FAIL");
             return passed ? 0 : 1;
         }
@@ -1622,6 +1651,29 @@ internal static class NoraSubscriptionStore
             var persistedSubscriptions = LoadAll().Select(item => item.Id).ToArray();
             var persistedServers = refreshed.Servers.Select(item => item.Id).ToArray();
 
+            var providerOrdered = Store(new NoraSubscriptionInfo
+            {
+                Id = "provider-order-subscription",
+                Title = "Provider order",
+                Servers =
+                [
+                    new NoraSubscriptionServer { Id = "provider-ru", Name = "Russia", Host = "198.51.100.12", DisplayOrder = 1 },
+                    new NoraSubscriptionServer { Id = "provider-nl", Name = "Netherlands", Host = "198.51.100.11", DisplayOrder = 2 }
+                ]
+            }, "fixture:provider-order");
+            providerOrdered = Store(new NoraSubscriptionInfo
+            {
+                Id = providerOrdered.Id,
+                Title = providerOrdered.Title,
+                Servers =
+                [
+                    new NoraSubscriptionServer { Id = "provider-nl", Name = "Netherlands", Host = "198.51.100.11" },
+                    new NoraSubscriptionServer { Id = "provider-ru", Name = "Russia", Host = "198.51.100.12" }
+                ]
+            }, "fixture:provider-order");
+            var providerOrderFollowed = providerOrdered.Servers.Select(item => item.Id)
+                .SequenceEqual(["provider-nl", "provider-ru"], StringComparer.Ordinal);
+
             static NoraSubscriptionServer MigrationNode(string id, string name, string host) => new()
             {
                 Id = id,
@@ -1665,10 +1717,11 @@ internal static class NoraSubscriptionStore
                          movedSubscription && movedServer &&
                          persistedSubscriptions.SequenceEqual(["second-subscription", "first-subscription"], StringComparer.Ordinal) &&
                          persistedServers.SequenceEqual(["second-b", "second-a", "second-c"], StringComparer.Ordinal) &&
+                         providerOrderFollowed &&
                          legacyMoved &&
                          migratedIds.SequenceEqual([semanticB.Id, semanticA.Id], StringComparer.Ordinal);
             output.WriteLine(passed
-                ? "SUBSCRIPTION ORDER SELF-TEST PASS: persisted-order=stable; semantic-id-migration=stable; moves=bounded"
+                ? "SUBSCRIPTION ORDER SELF-TEST PASS: provider-order=followed; custom-order=stable; semantic-id-migration=stable; moves=bounded"
                 : "SUBSCRIPTION ORDER SELF-TEST FAIL: unexpected ordering result");
             return passed ? 0 : 1;
         }
@@ -1751,48 +1804,33 @@ internal static class NoraSubscriptionStore
     private static IReadOnlyList<NoraSubscriptionServer> DeduplicateServers(IEnumerable<NoraSubscriptionServer> servers)
     {
         var selected = new List<NoraSubscriptionServer>();
-        var indexes = new Dictionary<string, int>(StringComparer.Ordinal);
+        var identities = new HashSet<string>(StringComparer.Ordinal);
         foreach (var server in servers)
         {
-            // Provider panels commonly append quota/status rows as complete VLESS
-            // links. Their labels differ, but the connection is identical. Keep the
-            // first real node and compare every setting that can change runtime
-            // behaviour; presentation-only name/country fields are intentionally
-            // excluded.
-            var identity = RuntimeIdentity(server);
-            server.Id = StableId("runtime-v1|" + identity);
-            if (!indexes.TryGetValue(identity, out var existingIndex))
-            {
-                indexes[identity] = selected.Count;
+            // A provider can intentionally expose several named routing choices
+            // backed by the same VLESS connection. Names therefore belong to the
+            // entry identity. Only repeated informational rows (quota/instructions)
+            // collapse globally, and the first provider occurrence always wins.
+            var identity = ProviderEntryIdentity(server);
+            server.Id = StableId("provider-v2|" + identity);
+            if (identities.Add(identity))
                 selected.Add(server);
-                continue;
-            }
-
-            // The same connection is often repeated under quota/instruction
-            // labels and then under its useful country/route name. Keep the most
-            // informative presentation while retaining one runtime node.
-            if (DisplayNameQuality(server.Name) > DisplayNameQuality(selected[existingIndex].Name))
-                selected[existingIndex] = server;
         }
         return selected;
     }
 
-    private static int DisplayNameQuality(string? value)
-    {
-        var name = NormalizeUnicodeText(value ?? "");
-        if (name.Length == 0)
-            return int.MinValue;
+    internal static bool SameProviderEntry(NoraSubscriptionServer first, NoraSubscriptionServer second)
+        => string.Equals(ProviderEntryIdentity(first), ProviderEntryIdentity(second), StringComparison.Ordinal);
 
-        var score = Math.Min(name.Length, 80);
-        if (CountryCodeFromFlag(name).Length > 0)
-            score += 200;
-        if (Regex.IsMatch(name, @"(?:остал(?:ось|ось)|remaining|traffic|quota|\d+(?:[.,]\d+)?\s*(?:gib|gb)\b)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
-            score -= 600;
-        if (Regex.IsMatch(name, @"(?:внизу|below|обход(?:ы|ной)|4g\s*/?\s*lte)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
-            score -= 300;
-        if (name.Contains("🌟", StringComparison.Ordinal))
-            score -= 20;
-        return score;
+    private static string ProviderEntryIdentity(NoraSubscriptionServer server)
+    {
+        var name = NormalizeUnicodeText(server.Name ?? "");
+        var normalizedName = Regex.Replace(name, @"\s+", " ").Trim().ToLowerInvariant();
+        if (Regex.IsMatch(normalizedName, @"(?:внизу|below|обход(?:ы|ной)|4g\s*/?\s*lte)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+            return "info-v1|routing-below";
+        if (Regex.IsMatch(normalizedName, @"(?:остал(?:ось|ось)|remaining|traffic|quota|\d+(?:[.,]\d+)?\s*(?:gib|gb)\b)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+            return "info-v1|quota-remaining";
+        return "entry-v2|" + RuntimeIdentity(server) + '\u001f' + normalizedName;
     }
 
     internal static bool SameRuntimeConnection(NoraSubscriptionServer first, NoraSubscriptionServer second)

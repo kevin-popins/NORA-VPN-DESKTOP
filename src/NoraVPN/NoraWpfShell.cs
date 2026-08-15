@@ -640,7 +640,8 @@ internal sealed class NoraWpfWindow : Window
         _subscriptionRefreshScheduler = new NoraSubscriptionRefreshScheduler(
             NoraSubscriptionStore.LoadAll,
             _subscriptionRefreshCoordinator,
-            HandleAutomaticSubscriptionRefresh);
+            HandleAutomaticSubscriptionRefresh,
+            passCompleted: HandleAutomaticSubscriptionRefreshPass);
         _runLog = NoraRunLog.StartNew();
         Title = "NORA VPN";
         Icon = LoadBrandWindowIcon();
@@ -745,6 +746,8 @@ internal sealed class NoraWpfWindow : Window
         }
         if (snapshotState == "error-toast")
             ShowErrorToast(NoraErrors.Create("NORA-CON-2010", NoraOperation.Connect, "Snapshot data-plane verification failure"));
+        if (snapshotState == "subscription-toast")
+            ShowToast("Subscriptions updated", "3 subscriptions refreshed automatically. Server lists are up to date.", ToastKind.Success);
         if (snapshotState == "welcome-info")
             ShowWelcomeInfoSheet();
 
@@ -4080,6 +4083,43 @@ internal sealed class NoraWpfWindow : Window
         });
     }
 
+    private void HandleAutomaticSubscriptionRefreshPass(NoraSubscriptionRefreshPassResult result)
+    {
+        if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished)
+            return;
+        Dispatcher.BeginInvoke(() =>
+        {
+            var attempted = result.Succeeded + result.Failed;
+            if (attempted <= 0)
+                return;
+
+            if (result.Failed == 0)
+            {
+                var subject = result.Succeeded == 1 ? "1 subscription" : $"{result.Succeeded} subscriptions";
+                ShowToast(
+                    "Subscriptions updated",
+                    $"{subject} refreshed automatically. Server lists are up to date.",
+                    ToastKind.Success);
+                return;
+            }
+
+            if (result.Succeeded > 0)
+            {
+                ShowToast(
+                    "Subscriptions partly updated",
+                    $"{result.Succeeded} refreshed · {result.Failed} will retry automatically.",
+                    ToastKind.Info);
+                return;
+            }
+
+            var failedSubject = result.Failed == 1 ? "1 subscription" : $"{result.Failed} subscriptions";
+            ShowToast(
+                "Subscription update delayed",
+                $"Could not refresh {failedSubject}. NORA will retry automatically.",
+                ToastKind.Info);
+        });
+    }
+
     private void ApplyRefreshedSubscription(
         NoraSubscriptionInfo original,
         NoraSubscriptionInfo refreshed,
@@ -4093,6 +4133,8 @@ internal sealed class NoraWpfWindow : Window
 
         var replacement = refreshed.Servers.FirstOrDefault(server =>
                               string.Equals(server.Id, _activeSubscriptionServer.Id, StringComparison.OrdinalIgnoreCase))
+                          ?? refreshed.Servers.FirstOrDefault(server =>
+                              NoraSubscriptionStore.SameProviderEntry(server, _activeSubscriptionServer))
                           ?? refreshed.Servers.FirstOrDefault(server =>
                               NoraSubscriptionStore.SameRuntimeConnection(server, _activeSubscriptionServer));
         // A provider may replace its entire node set while one of the old nodes is
