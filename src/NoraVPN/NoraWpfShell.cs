@@ -1198,6 +1198,12 @@ internal sealed class NoraWpfWindow : Window
             Dispatcher.BeginInvoke(DispatcherPriority.Send, new Action(ShowFromTray));
             return IntPtr.Zero;
         }
+        if (message == NoraSingleInstance.ShutdownMessage)
+        {
+            handled = true;
+            Dispatcher.BeginInvoke(DispatcherPriority.Send, new Action(async () => await ExitApplicationAsync()));
+            return IntPtr.Zero;
+        }
         if (message == WmDpiChanged)
             QueueScaleRefresh();
         return IntPtr.Zero;

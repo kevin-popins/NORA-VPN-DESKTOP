@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Added a branded bilingual Windows Setup with a stable product identity,
+  Program Files installation, Start/Desktop shortcuts, license and network-use
+  notices, repair/update support, downgrade protection and safe running-app
+  shutdown. Updates and default uninstall preserve subscriptions, profiles,
+  selected server, Premium activation and all preferences.
+- Added isolated installer lifecycle QA that checks `premium.dat` and all other
+  durable user-state sentinels byte-for-byte across clean install, upgrade,
+  repair, keep-data uninstall and reinstall. User-data removal remains a
+  separate explicit action.
 - Fixed the close-to-tray notice so its `Got it` button is not clipped by the
   native Windows frame or display scaling.
 - Server selection now returns directly to Home, and moving nodes in a long

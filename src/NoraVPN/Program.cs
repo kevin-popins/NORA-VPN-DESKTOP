@@ -34,6 +34,16 @@ internal static class Program
 #endif
         if (args.Length == 1 && args[0].Equals("discord-routing-selftest", StringComparison.OrdinalIgnoreCase))
             return NoraDiscordRouting.RunSelfTest(Console.Out);
+
+        if (args.Length == 1 && args[0].Equals("shutdown-for-update", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!NvpClient.IsAdministrator())
+            {
+                Console.Error.WriteLine("NORA update shutdown requires an elevated installer process.");
+                return 5;
+            }
+            return NoraSingleInstance.TryShutdownExisting(TimeSpan.FromSeconds(35), Console.Error) ? 0 : 6;
+        }
 #endif
 
         if (args.Length == 0)
@@ -382,6 +392,7 @@ internal static class Program
             Console.WriteLine("  nvp ui-scale-selftest");
             Console.WriteLine("  nvp direct-latency-probe <host> <port>");
             Console.WriteLine("  nvp ui-connect-cancel-smoke <result.json>");
+            Console.WriteLine("  nvp shutdown-for-update");
             return 2;
         }
 
@@ -684,12 +695,15 @@ internal static class NoraSingleInstance
 {
     private const string MutexName = @"Local\NORA.VPN.Desktop.SingleInstance.v1";
     private const string ActivationMessageName = "NORA.VPN.Desktop.Activate.v1";
+    private const string ShutdownMessageName = "NORA.VPN.Desktop.ShutdownForUpdate.v1";
     private const uint MessageFilterAllow = 1;
     private static readonly int ActivationMessageValue = unchecked((int)RegisterWindowMessage(ActivationMessageName));
+    private static readonly int ShutdownMessageValue = unchecked((int)RegisterWindowMessage(ShutdownMessageName));
     private static readonly object Sync = new();
     private static Mutex? _primaryMutex;
 
     internal static int ActivationMessage => ActivationMessageValue;
+    internal static int ShutdownMessage => ShutdownMessageValue;
 
     public static bool TryClaimPrimary()
     {
@@ -722,6 +736,55 @@ internal static class NoraSingleInstance
             Thread.Sleep(50);
         }
         while (true);
+    }
+
+    public static bool TryShutdownExisting(TimeSpan timeout, TextWriter? error = null)
+    {
+        try
+        {
+            var path = MarkerPath();
+            if (!File.Exists(path))
+                return true;
+            var marker = JsonSerializer.Deserialize<InstanceMarker>(File.ReadAllText(path));
+            if (marker is null || marker.WindowHandle == 0)
+            {
+                DeleteStaleMarker(path);
+                return true;
+            }
+
+            using var process = Process.GetProcessById(marker.ProcessId);
+            if (process.HasExited || !string.Equals(marker.ProcessName, CurrentProcessName(), StringComparison.OrdinalIgnoreCase))
+            {
+                DeleteStaleMarker(path);
+                return true;
+            }
+            if (marker.ProcessId == Environment.ProcessId)
+                return false;
+            if (ShutdownMessageValue == 0 ||
+                !PostMessage(new IntPtr(marker.WindowHandle), unchecked((uint)ShutdownMessageValue), IntPtr.Zero, IntPtr.Zero))
+            {
+                error?.WriteLine("NORA is running but did not accept the safe update shutdown request.");
+                return false;
+            }
+
+            if (!process.WaitForExit((int)Math.Clamp(timeout.TotalMilliseconds, 1000, 120000)))
+            {
+                error?.WriteLine("NORA did not finish disconnecting and exit before the update timeout.");
+                return false;
+            }
+            DeleteStaleMarker(path);
+            return true;
+        }
+        catch (ArgumentException)
+        {
+            DeleteStaleMarker(MarkerPath());
+            return true;
+        }
+        catch (Exception exception)
+        {
+            error?.WriteLine("Safe update shutdown failed: " + exception.Message);
+            return false;
+        }
     }
 
     public static void PublishWindow(IntPtr hwnd)

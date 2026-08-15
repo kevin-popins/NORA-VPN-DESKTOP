@@ -101,8 +101,10 @@ AmneziaWG. Я сделал его для личного VPN-сервера на 
 
 ### Как начать
 
-1. Скачайте portable-версию из **Releases** и распакуйте архив.
-2. Запустите `NoraVPN.exe` от имени администратора.
+1. Скачайте Setup из **Releases** и пройдите установку. Portable-архив также
+   остаётся доступен для запуска без установки.
+2. Запустите NORA VPN; установочная версия создаёт ярлык в меню «Пуск» и по
+   желанию на рабочем столе.
 3. На странице **Add** добавьте подписку, конфиг или свой KRot-сервер.
 4. Выберите сервер на странице **Servers** и нажмите Connect.
 
@@ -110,6 +112,8 @@ AmneziaWG. Я сделал его для личного VPN-сервера на 
 NORA VPN описаны отдельно в [правилах использования бренда](TRADEMARKS.md).
 Проекты и библиотеки, которые я использовал, указаны в [NOTICE](NOTICE) и
 [THIRD_PARTY.md](docs/THIRD_PARTY.md).
+Устройство установки, обновления и сохранения пользовательских данных описано
+в [документации установщика](docs/INSTALLER.md).
 
 ---
 
@@ -182,8 +186,9 @@ for more.
 
 ### Getting started
 
-1. Download the portable version from **Releases** and unpack it.
-2. Run `NoraVPN.exe` as administrator.
+1. Download Setup from **Releases** and complete installation. The portable ZIP
+   remains available when an installation is not desired.
+2. Launch NORA VPN from Start or the optional desktop shortcut.
 3. On **Add**, import a subscription or configuration, or add your KRot server.
 4. Choose a server on **Servers** and press Connect.
 
@@ -191,3 +196,4 @@ I publish NORA VPN under the [Apache License 2.0](LICENSE). The NORA VPN name
 and logo are covered separately by the [brand-use policy](TRADEMARKS.md). The
 projects and libraries I used are listed in [NOTICE](NOTICE) and
 [THIRD_PARTY.md](docs/THIRD_PARTY.md).
+See [installer documentation](docs/INSTALLER.md) for upgrade and data-preservation behavior.
