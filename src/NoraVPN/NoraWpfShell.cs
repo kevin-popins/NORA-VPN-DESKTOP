@@ -581,6 +581,7 @@ internal sealed class NoraWpfWindow : Window
     private readonly List<NoraTrafficGraph> _graphs = [];
     private readonly Dictionary<string, TextBlock> _userStatusText = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, TextBlock> _userTrafficText = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, FrameworkElement> _serverRowElements = new(StringComparer.OrdinalIgnoreCase);
     private static readonly object ImageCacheSync = new();
     private static readonly Dictionary<string, IReadOnlyList<ImageSource>> LocationImageCache = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Dictionary<string, ImageSource> NamedImageCache = new(StringComparer.OrdinalIgnoreCase);
@@ -589,6 +590,8 @@ internal sealed class NoraWpfWindow : Window
     private static readonly Dictionary<string, ImageSource?> EmojiImageCache = new(StringComparer.OrdinalIgnoreCase);
 
     private NoraConnectButton? _connectButton;
+    private ScrollViewer? _serversScrollViewer;
+    private ServerViewportAnchor? _pendingServerViewportAnchor;
     private NoraCyberGrid? _heroGrid;
     private NoraAudioBarBackdrop? _audioBackdrop;
     private TextBlock? _discordModeStatusText;
@@ -1459,6 +1462,12 @@ internal sealed class NoraWpfWindow : Window
         _heroGrid = null;
         _discordModeStatusText = null;
         _welcomeOverlayHost = null;
+        if (page != PageKind.Servers)
+        {
+            _serversScrollViewer = null;
+            _serverRowElements.Clear();
+            _pendingServerViewportAnchor = null;
+        }
         _contentHost.ClipToBounds = true;
         _contentHost.Children.Clear();
         _homeAtmosphereHost.Children.Clear();
@@ -2849,6 +2858,8 @@ internal sealed class NoraWpfWindow : Window
                      ("Germany", ["germany", "deutschland", "германия", "berlin", "берлин", "frankfurt", "франкфурт"]),
                      ("Netherlands", ["netherlands", "holland", "нидерланды", "голландия", "amsterdam", "амстердам"]),
                      ("Poland", ["poland", "polska", "польша", "warsaw", "варшава"]),
+                     ("Latvia", ["latvia", "латвия", "riga", "рига"]),
+                     ("Sweden", ["sweden", "швеция", "stockholm", "стокгольм"]),
                      ("India", ["india", "индия"]),
                      ("KZ", ["kazakhstan", "казахстан"]),
                      ("TR", ["turkey", "türkiye", "turkiye", "турция"]),
@@ -2890,6 +2901,8 @@ internal sealed class NoraWpfWindow : Window
             "lithuania" or "литва" => "Lithuania",
             "netherlands" or "holland" or "нидерланды" => "Netherlands",
             "poland" or "polska" or "польша" => "Poland",
+            "latvia" or "латвия" or "riga" or "рига" => "Latvia",
+            "sweden" or "швеция" or "stockholm" or "стокгольм" => "Sweden",
             "india" or "индия" => "India",
             "kazakhstan" or "казахстан" or "kz" => "KZ",
             "turkey" or "türkiye" or "turkiye" or "турция" or "tr" => "TR",
@@ -2967,6 +2980,8 @@ internal sealed class NoraWpfWindow : Window
                 ResolveLocationArtworkKey("RU Kazan · all operators", "Russia") == "RUALL" &&
                 ResolveLocationArtworkKey("EU · all operators", "EU") == "EUALL" &&
                 ResolveLocationArtworkKey("Польша", "Unknown") == "Poland" &&
+                ResolveLocationArtworkKey("EU Latvia", "EU") == "Latvia" &&
+                ResolveLocationArtworkKey("Швеция", "Unknown") == "Sweden" &&
                 ResolveLocationArtworkKey("India", "Unknown") == "India" &&
                 ResolveLocationArtworkKey("Kazakhstan", "Unknown") == "KZ" &&
                 ResolveLocationArtworkKey("Turkey", "Unknown") == "TR" &&
@@ -2978,6 +2993,8 @@ internal sealed class NoraWpfWindow : Window
                 ["Germany"] = 5,
                 ["Netherlands"] = 5,
                 ["Poland"] = 3,
+                ["Latvia"] = 3,
+                ["Sweden"] = 3,
                 ["India"] = 3,
                 ["KZ"] = 3,
                 ["TR"] = 3,
@@ -3747,6 +3764,7 @@ internal sealed class NoraWpfWindow : Window
 
     private UIElement ServersPage()
     {
+        _serverRowElements.Clear();
         var root = new StackPanel();
         var radar = new NoraIcon { Kind = NoraIconKind.Radar, Width = 24, Height = 24, Stroke = NoraWpfTheme.OrangeBrush };
         if (_isPinging && NoraWpfTheme.MotionEnabled)
@@ -3775,7 +3793,10 @@ internal sealed class NoraWpfWindow : Window
         use.Opacity = _isArrangingServers ? 0.42 : 1;
         use.Click += (_, _) => RenderPage(PageKind.Home);
         root.Children.Add(use);
-        return ScrollPage(root);
+        var scroll = ScrollPage(root);
+        _serversScrollViewer = scroll;
+        RestorePendingServerViewportAnchor(scroll);
+        return scroll;
     }
 
     private UIElement ServersPageTitle(NoraIcon radar)
@@ -4097,7 +4118,8 @@ internal sealed class NoraWpfWindow : Window
             });
             var index = 0;
             foreach (var server in sub.Servers)
-                listHost.Children.Add(ServerRow(
+            {
+                var row = ServerRow(
                     server.Name,
                     $"{server.Host}:{server.Port}",
                     ShortProtocol(server.Protocol, server.Flow),
@@ -4110,7 +4132,11 @@ internal sealed class NoraWpfWindow : Window
                     _isArrangingServers && sub.Servers.Count > 1,
                     async direction => await MoveSubscriptionServerAsync(sub, server, direction),
                     index > 1,
-                    index < sub.Servers.Count));
+                    index < sub.Servers.Count);
+                if (row is FrameworkElement element)
+                    _serverRowElements[ServerViewportKey(sub.Id, server.Id)] = element;
+                listHost.Children.Add(row);
+            }
             panel.Children.Add(listHost);
         }
 
@@ -4417,7 +4443,7 @@ internal sealed class NoraWpfWindow : Window
                               string.Equals(_activeSubscriptionServer.LocalPath, server.LocalPath, StringComparison.OrdinalIgnoreCase);
         if (alreadySelected)
         {
-            RenderPage(PageKind.Servers);
+            RenderPage(PageKind.Home);
             return;
         }
 
@@ -4430,7 +4456,7 @@ internal sealed class NoraWpfWindow : Window
         }
 
         SetActiveSubscriptionServer(server);
-        RenderPage(PageKind.Servers);
+        RenderPage(PageKind.Home);
 
         if (shouldReconnect)
             await ConnectAsync();
@@ -4450,7 +4476,7 @@ internal sealed class NoraWpfWindow : Window
                               _activeSubscriptionServer is null;
         if (alreadySelected)
         {
-            RenderPage(PageKind.Servers);
+            RenderPage(PageKind.Home);
             return;
         }
 
@@ -4464,7 +4490,7 @@ internal sealed class NoraWpfWindow : Window
         }
 
         SetActiveProfile(path);
-        RenderPage(PageKind.Servers);
+        RenderPage(PageKind.Home);
 
         if (shouldReconnect)
             await ConnectAsync();
@@ -4895,12 +4921,46 @@ internal sealed class NoraWpfWindow : Window
 
     private async Task MoveSubscriptionServerAsync(NoraSubscriptionInfo subscription, NoraSubscriptionServer server, int direction)
     {
+        var viewportAnchor = CaptureServerViewportAnchor(subscription.Id, server.Id);
         if (await _subscriptionRefreshCoordinator.RunExclusiveSyncAsync(
                 () => NoraSubscriptionStore.MoveServer(subscription.Id, server.Id, direction)))
         {
             AppendLog($"Saved server order for {server.Name}.");
+            _pendingServerViewportAnchor = viewportAnchor;
             RenderPage(PageKind.Servers);
         }
+    }
+
+    private sealed record ServerViewportAnchor(string Key, double ViewportY);
+
+    private static string ServerViewportKey(string subscriptionId, string serverId) => subscriptionId + "\u001f" + serverId;
+
+    private ServerViewportAnchor? CaptureServerViewportAnchor(string subscriptionId, string serverId)
+    {
+        var key = ServerViewportKey(subscriptionId, serverId);
+        if (_serversScrollViewer is null || !_serverRowElements.TryGetValue(key, out var row) || !row.IsLoaded)
+            return null;
+
+        return new ServerViewportAnchor(key, row.TranslatePoint(new Point(0, 0), _serversScrollViewer).Y);
+    }
+
+    private void RestorePendingServerViewportAnchor(ScrollViewer scroll)
+    {
+        var anchor = _pendingServerViewportAnchor;
+        _pendingServerViewportAnchor = null;
+        if (anchor is null)
+            return;
+
+        scroll.Loaded += (_, _) => Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
+        {
+            if (_serversScrollViewer != scroll || !_serverRowElements.TryGetValue(anchor.Key, out var row))
+                return;
+
+            scroll.UpdateLayout();
+            var currentY = row.TranslatePoint(new Point(0, 0), scroll).Y;
+            var targetOffset = Math.Clamp(scroll.VerticalOffset + currentY - anchor.ViewportY, 0, scroll.ScrollableHeight);
+            scroll.ScrollToVerticalOffset(targetOffset);
+        }));
     }
 
     private UIElement PingBadge(PingStatus ping)
@@ -7024,6 +7084,8 @@ internal sealed class NoraWpfWindow : Window
         "location-eu-germany" => new ServerInfo("EU Germany · all operators", "de-group.demo.test", 443, "EU", true, "VLESS · Reality"),
         "location-ru-moscow" => new ServerInfo("RU Moscow", "moscow.demo.test", 443, "Russia", true, "VLESS · Reality"),
         "location-poland" => new ServerInfo("Poland · Warsaw", "warsaw.demo.test", 443, "Poland", true, "VLESS · Reality"),
+        "location-latvia" => new ServerInfo("Latvia · Riga", "riga.demo.test", 443, "Latvia", true, "VLESS · Reality"),
+        "location-sweden" => new ServerInfo("Sweden · Stockholm", "stockholm.demo.test", 443, "Sweden", true, "VLESS · Reality"),
         "location-india" => new ServerInfo("India · Mumbai", "mumbai.demo.test", 443, "India", true, "VLESS · Reality"),
         "location-kz" => new ServerInfo("Kazakhstan", "almaty.demo.test", 443, "Kazakhstan", true, "VLESS · Reality"),
         "location-tr" => new ServerInfo("Turkey", "istanbul.demo.test", 443, "Turkey", true, "VLESS · Reality"),
@@ -10051,7 +10113,8 @@ internal sealed class NoraTrayNoticeWindow : Window
         _dontShowAgain = previewChecked;
         Title = "NORA VPN";
         Width = 470;
-        Height = 330;
+        MinHeight = 350;
+        SizeToContent = System.Windows.SizeToContent.Height;
         ResizeMode = ResizeMode.NoResize;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
         ShowInTaskbar = false;

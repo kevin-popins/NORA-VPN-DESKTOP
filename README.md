@@ -136,13 +136,17 @@ live home screen, a map, tidy traffic stats, and an easy-to-read server list.
 
 - **Location artwork.** I added a country or city photo to the active-server card
   instead of a generic background. Artwork is currently available for China,
-  Estonia, Finland, France, Germany, Ireland, Italy, Lithuania, the Netherlands,
-  Poland, India, Kazakhstan, Turkey, Ukraine, Portugal, Russia, Spain, the United
-  Kingdom, and the United States. Generic RU/EU routes use dedicated group
+  Estonia, Finland, France, Germany, Ireland, Italy, Latvia, Lithuania, the
+  Netherlands, Poland, Sweden, India, Kazakhstan, Turkey, Ukraine, Portugal,
+  Russia, Spain, the United Kingdom, and the United States. Generic RU/EU routes use dedicated group
   artwork, while a concrete country or Moscow in the server name takes priority.
 - **Tray behavior.** The first window close explains that NORA keeps running in
   the system tray. The optional "Don't show this again" choice persists between
-  launches.
+  launches, and the notice sizes itself to keep its confirmation button visible
+  with normal Windows title bars and display scaling.
+- **Faster server selection.** Choosing a subscription or direct server opens
+  Home immediately. Arrange mode keeps the moved row under the pointer instead
+  of jumping a long server list back to the top.
 - **Equalizer.** I added a visual equalizer that reacts to music and other
   sound playing on your computer.
 - **Smooth Live Traffic.** The traffic graph moves continuously and shows

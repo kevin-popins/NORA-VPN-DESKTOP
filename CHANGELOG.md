@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Fixed the close-to-tray notice so its `Got it` button is not clipped by the
+  native Windows frame or display scaling.
+- Server selection now returns directly to Home, and moving nodes in a long
+  subscription preserves the moved row's viewport position across rerenders.
+- Added three Latvia and three Sweden active-server backgrounds with the same
+  free first-frame and Premium slideshow behavior as existing locations.
 - Added a first-close explanation that NORA keeps running in the system tray;
   the optional "Don't show this again" choice is persisted independently of
   the active VPN profile.
