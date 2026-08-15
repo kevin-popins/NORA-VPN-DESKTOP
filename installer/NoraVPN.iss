@@ -5,10 +5,10 @@
   #define OutputDir "..\dist"
 #endif
 #ifndef AppVersion
-  #define AppVersion "0.1.0-pre.4"
+  #define AppVersion "0.1.0-pre.5"
 #endif
 #ifndef InstallerVersion
-  #define InstallerVersion "0.1.0.4"
+  #define InstallerVersion "0.1.0.5"
 #endif
 #ifndef BuildId
   #define BuildId "local"
@@ -26,12 +26,14 @@
   #define UninstallRegistryRoot "HKCU"
   #define ProductRegistryRoot "HKCU"
   #define UserDataDirName "NORA VPN Installer Data QA"
+  #define SingleInstanceMutexName "Local\NORA.VPN.Desktop.InstallerQA.v1"
 #else
   #define ProductAppId "7CBB6718-2B47-4EFC-9DE7-726C494E611A"
   #define SetupPrivileges "admin"
   #define UninstallRegistryRoot "HKLM64"
   #define ProductRegistryRoot "HKLM64"
   #define UserDataDirName "NORA VPN"
+  #define SingleInstanceMutexName "Local\NORA.VPN.Desktop.SingleInstance.v1"
 #endif
 #define UninstallKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\{" + ProductAppId + "}_is1"
 
@@ -158,7 +160,7 @@ Root: {#ProductRegistryRoot}; Subkey: "Software\NORA VPN"; ValueType: string; Va
 Root: {#ProductRegistryRoot}; Subkey: "Software\NORA VPN"; ValueType: string; ValueName: "BuildId"; ValueData: "{#BuildId}"; Flags: uninsdeletekey
 
 [Run]
-Filename: "{app}\NoraVPN.exe"; Description: "{cm:LaunchProgram,NORA VPN}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent runasoriginaluser
+Filename: "{app}\NoraVPN.exe"; Description: "{cm:LaunchProgram,NORA VPN}"; WorkingDir: "{app}"; Verb: "runas"; Flags: postinstall skipifsilent shellexec runasoriginaluser
 
 [Code]
 var
@@ -296,9 +298,25 @@ var
 begin
   MarkerPath := ExpandConstant('{localappdata}\{#UserDataDirName}\runtime\desktop-instance.json');
 #ifdef VisualQaMode
+#ifdef VisualQaScreenshotMode
   Result := FileExists(MarkerPath);
 #else
-  Result := CheckForMutexes('Local\NORA.VPN.Desktop.SingleInstance.v1') or FileExists(MarkerPath);
+  Result := CheckForMutexes('{#SingleInstanceMutexName}');
+  if (not Result) and FileExists(MarkerPath) then
+  begin
+    Log('Removing stale NORA instance marker: ' + MarkerPath);
+    if not DeleteFile(MarkerPath) then
+      Log('Could not remove stale NORA instance marker; continuing because no live mutex exists.');
+  end;
+#endif
+#else
+  Result := CheckForMutexes('{#SingleInstanceMutexName}');
+  if (not Result) and FileExists(MarkerPath) then
+  begin
+    Log('Removing stale NORA instance marker: ' + MarkerPath);
+    if not DeleteFile(MarkerPath) then
+      Log('Could not remove stale NORA instance marker; continuing because no live mutex exists.');
+  end;
 #endif
   Log('NORA running check: result=' + IntToStr(Ord(Result)) +
     ' marker=' + MarkerPath + ' marker_exists=' + IntToStr(Ord(FileExists(MarkerPath))));

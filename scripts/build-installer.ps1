@@ -1,6 +1,6 @@
 param(
-    [string]$AppVersion = "0.1.0-pre.4",
-    [string]$InstallerVersion = "0.1.0.4",
+    [string]$AppVersion = "0.1.0-pre.5",
+    [string]$InstallerVersion = "0.1.0.5",
     [string]$BuildId = "",
     [string]$OutputDirectory = "",
     [switch]$NoRestore

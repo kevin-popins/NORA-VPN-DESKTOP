@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-pre.5 — 2026-08-15
+
+- Prevented a transient Windows TUN adapter collision when switching VLESS servers, including while Discord Mode is active.
+
+- Fixed the Setup completion action so launching NORA requests elevation through
+  Windows instead of showing error 740.
+- Setup now ignores and removes a stale instance marker when no NORA process
+  owns the single-instance mutex. A genuinely tray-running Portable copy is
+  still protected from being overwritten.
 
 - Added a branded bilingual Windows Setup with a stable product identity,
   Program Files installation, Start/Desktop shortcuts, license and network-use

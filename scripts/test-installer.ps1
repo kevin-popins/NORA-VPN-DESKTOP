@@ -100,10 +100,14 @@ Assert-Sentinels $expected "clean install"
 $legacyProfile = Join-Path $installDir "client-profile.json"
 [System.IO.File]::WriteAllText($legacyProfile, '{"sentinel":"legacy-portable-profile"}')
 $legacyHash = (Get-FileHash -LiteralPath $legacyProfile -Algorithm SHA256).Hash
+$staleMarker = Join-Path $dataRoot "runtime\desktop-instance.json"
+[System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($staleMarker)) | Out-Null
+[System.IO.File]::WriteAllText($staleMarker, '{"ProcessId":2147483647,"WindowHandle":1,"ProcessName":"NoraVPN"}')
 
 Run-Setup $upgradeInstaller $installArgs
 Assert-Installed "upgrade"
 Assert-Sentinels $expected "upgrade"
+if (Test-Path -LiteralPath $staleMarker) { throw "Setup did not remove the stale NORA instance marker." }
 if ((Get-FileHash -LiteralPath $legacyProfile -Algorithm SHA256).Hash -ne $legacyHash) { throw "Legacy client-profile.json changed during upgrade." }
 
 Run-Setup $upgradeInstaller $installArgs
@@ -136,6 +140,7 @@ $result = [ordered]@{
     defaultUninstallKeptData = $true
     explicitPurgeDeletedData = $true
     legacyPortableProfilePreserved = $true
+    staleInstanceMarkerIgnored = $true
 }
 [System.IO.File]::WriteAllText($ResultPath, ($result | ConvertTo-Json -Depth 4))
-Write-Host "INSTALLER LIFECYCLE QA PASS: clean install, upgrade, repair, Premium/subscription/settings preservation, keep-data uninstall, explicit purge"
+Write-Host "INSTALLER LIFECYCLE QA PASS: clean install, stale-marker recovery, upgrade, repair, Premium/subscription/settings preservation, keep-data uninstall, explicit purge"

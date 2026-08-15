@@ -783,7 +783,10 @@ internal static class NoraSubscriptionStore
         dnsRules.Add(rule);
     }
 
-    public static string BuildXrayTunFrontendConfig(int socksPort, NoraSubscriptionServer? server = null)
+    public static string BuildXrayTunFrontendConfig(
+        int socksPort,
+        NoraSubscriptionServer? server = null,
+        string tunInterfaceName = "NORA-Xray")
     {
         var policy = server is null ? null : ParseXrayRoutingPolicy(server.RawConfigJson);
 
@@ -833,7 +836,7 @@ internal static class NoraSubscriptionStore
                 {
                     ["type"] = "tun",
                     ["tag"] = "tun-in",
-                    ["interface_name"] = "NORA-Xray",
+                    ["interface_name"] = tunInterfaceName,
                     ["address"] = new JsonArray("172.20.0.1/30"),
                     ["mtu"] = 1400,
                     ["stack"] = "mixed",
@@ -1547,6 +1550,7 @@ internal static class NoraSubscriptionStore
             };
             using var config = JsonDocument.Parse(BuildXrayConfig(primary));
             using var pooledConfig = JsonDocument.Parse(BuildXrayConfig(pooled, endpointAddresses: endpointPool));
+            using var tunConfig = JsonDocument.Parse(BuildXrayTunFrontendConfig(20808, primary, "NORA-Xray-X-selftest"));
             var proxy = config.RootElement.GetProperty("outbounds")[0];
             var stream = proxy.GetProperty("streamSettings");
             var xhttp = stream.GetProperty("xhttpSettings");
@@ -1572,6 +1576,7 @@ internal static class NoraSubscriptionStore
                          xhttp.GetProperty("mode").GetString() == "stream-one" &&
                          pinnedPool.SequenceEqual(["198.51.100.44", "198.51.100.45"], StringComparer.Ordinal) &&
                          pinnedStrategy == "ForceIPv4" &&
+                         tunConfig.RootElement.GetProperty("inbounds")[0].GetProperty("interface_name").GetString() == "NORA-Xray-X-selftest" &&
                          failover.Count == 2 && failover[0].Id == primary.Id && failover[1].Id == backup.Id &&
                          persistedFixture.Title == unicodeTitle &&
                           persistedFixture.Servers.Count == 6 &&
@@ -2762,9 +2767,13 @@ internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<stri
         var xrayConfigPath = Path.Combine(dir, "xray-" + server.Id + ".json");
         _tunConfigPath = Path.Combine(dir, "xray-tun-" + server.Id + ".json");
         File.WriteAllText(xrayConfigPath, NoraSubscriptionStore.BuildXrayConfig(server, _socksPort, endpointAddresses: endpointAddresses));
+        // A per-session adapter name avoids Wintun's transient "already exists /
+        // element not found" state when a user switches servers immediately.
+        // Keep the NORA-Xray prefix so UI traffic sampling still resolves it.
+        var tunInterfaceName = "NORA-Xray-X-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture)[..8];
         var tunConfig = discordMode
             ? await NoraDiscordRouting.BuildForSocksAsync(_socksPort, cancellationToken).ConfigureAwait(false)
-            : NoraSubscriptionStore.BuildXrayTunFrontendConfig(_socksPort, server);
+            : NoraSubscriptionStore.BuildXrayTunFrontendConfig(_socksPort, server, tunInterfaceName);
         File.WriteAllText(_tunConfigPath, tunConfig);
         if (!IPAddress.TryParse(server.Host, out _))
             log($"[xray] endpoint DNS pool pinned: {endpointAddresses.Count} IPv4 address(es) for this session");
@@ -2910,15 +2919,11 @@ internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<stri
 
     public async Task StopAsync(TimeSpan timeout)
     {
-        foreach (var process in new[] { _tunFrontend, _xray })
-        {
-            if (process is null || process.HasExited)
-                continue;
-            try { process.Kill(entireProcessTree: true); } catch { }
-        }
+        var stopwatch = Stopwatch.StartNew();
+        await StopProcessAndWaitAsync(_tunFrontend, Remaining(timeout, stopwatch.Elapsed));
+        await StopProcessAndWaitAsync(_xray, Remaining(timeout, stopwatch.Elapsed));
         await XrayEndpointBypass.RemoveAsync(_endpointRoutes, log);
         _endpointRoutes.Clear();
-        await Task.WhenAny(_exited.Task, Task.Delay(timeout));
         _exited.TrySetResult();
     }
 
@@ -2964,6 +2969,41 @@ internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<stri
         finally
         {
             listener.Stop();
+        }
+    }
+
+    private static TimeSpan Remaining(TimeSpan timeout, TimeSpan elapsed)
+        => timeout > elapsed ? timeout - elapsed : TimeSpan.Zero;
+
+    private static async Task StopProcessAndWaitAsync(Process? process, TimeSpan timeout)
+    {
+        if (process is null)
+            return;
+        try
+        {
+            if (process.HasExited)
+                return;
+            process.Kill(entireProcessTree: true);
+        }
+        catch
+        {
+            // The process may have exited between HasExited and Kill.
+        }
+
+        try
+        {
+            if (process.HasExited)
+                return;
+            using var timeoutCts = new CancellationTokenSource(timeout);
+            await process.WaitForExitAsync(timeoutCts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // StopAsync remains bounded by the caller-provided timeout.
+        }
+        catch
+        {
+            // Cleanup is best effort; endpoint routes are still removed below.
         }
     }
 }

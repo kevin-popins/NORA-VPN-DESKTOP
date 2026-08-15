@@ -352,7 +352,7 @@ internal static class NoraDiscordRouting
             ["server_port"] = socksPort
         };
         var physical = await FindPhysicalInterfaceNameAsync(cancellationToken).ConfigureAwait(false);
-        return Build(vpn, physical);
+        return Build(vpn, physical, CreateSessionTunInterfaceName());
     }
 
     public static async Task<string> BuildForInterfaceAsync(
@@ -368,10 +368,10 @@ internal static class NoraDiscordRouting
             ["bind_interface"] = interfaceName
         };
         var physical = await FindPhysicalInterfaceNameAsync(cancellationToken).ConfigureAwait(false);
-        return Build(vpn, physical);
+        return Build(vpn, physical, CreateSessionTunInterfaceName());
     }
 
-    private static string Build(JsonObject vpnOutbound, string physical)
+    private static string Build(JsonObject vpnOutbound, string physical, string tunInterfaceName)
     {
         var processNames = new JsonArray();
         foreach (var name in ProcessNames)
@@ -386,7 +386,7 @@ internal static class NoraDiscordRouting
                 {
                     ["type"] = "tun",
                     ["tag"] = "discord-in",
-                    ["interface_name"] = "NORA-Discord",
+                    ["interface_name"] = tunInterfaceName,
                     ["address"] = new JsonArray("172.21.0.1/30"),
                     ["mtu"] = 1400,
                     ["stack"] = "mixed",
@@ -422,6 +422,9 @@ internal static class NoraDiscordRouting
         };
         return root.ToJsonString(JsonOptions);
     }
+
+    private static string CreateSessionTunInterfaceName()
+        => "NORA-Xray-D-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture)[..8];
 
     public static async Task CheckConfigAsync(string configPath, TimeSpan timeout, CancellationToken cancellationToken)
     {
@@ -470,11 +473,13 @@ internal static class NoraDiscordRouting
         try
         {
             var socks = BuildForSocksAsync(20808).GetAwaiter().GetResult();
+            var secondSocks = BuildForSocksAsync(20809).GetAwaiter().GetResult();
             var bound = BuildForInterfaceAsync("NORA-KRot-Test").GetAwaiter().GetResult();
             File.WriteAllText(socksPath, socks);
             File.WriteAllText(interfacePath, bound);
 
             using var socksJson = JsonDocument.Parse(socks);
+            using var secondSocksJson = JsonDocument.Parse(secondSocks);
             using var boundJson = JsonDocument.Parse(bound);
             NoraDiscordModeSettings.SetEnabledOrThrow(true);
             var persistedOn = NoraDiscordModeSettings.Enabled;
@@ -484,6 +489,8 @@ internal static class NoraDiscordRouting
             var socksRoot = socksJson.RootElement;
             var boundRoot = boundJson.RootElement;
             var rule = socksRoot.GetProperty("route").GetProperty("rules")[0];
+            var tunInterfaceName = socksRoot.GetProperty("inbounds")[0].GetProperty("interface_name").GetString();
+            var secondTunInterfaceName = secondSocksJson.RootElement.GetProperty("inbounds")[0].GetProperty("interface_name").GetString();
             var names = rule.GetProperty("process_name").EnumerateArray().Select(x => x.GetString()).ToArray();
             var passed = persistedOn && persistedOff && transitionPassed &&
                          ProcessNames.All(name => names.Contains(name, StringComparer.OrdinalIgnoreCase)) &&
@@ -491,6 +498,8 @@ internal static class NoraDiscordRouting
                          socksRoot.GetProperty("route").GetProperty("final").GetString() == "direct" &&
                          socksRoot.GetProperty("outbounds")[0].GetProperty("type").GetString() == "socks" &&
                          boundRoot.GetProperty("outbounds")[0].GetProperty("bind_interface").GetString() == "NORA-KRot-Test" &&
+                         tunInterfaceName is not null && tunInterfaceName.StartsWith("NORA-Xray-D-", StringComparison.Ordinal) &&
+                         !string.Equals(tunInterfaceName, secondTunInterfaceName, StringComparison.Ordinal) &&
                          !socks.Contains("steam", StringComparison.OrdinalIgnoreCase) &&
                          !socks.Contains("amnezia", StringComparison.OrdinalIgnoreCase);
             if (!passed)
