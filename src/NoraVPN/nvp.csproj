@@ -28,6 +28,9 @@
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <PublishTrimmed>false</PublishTrimmed>
+    <!-- Brand invariant: executable, HWND/taskbar, title bar and tray all use
+         the canonical NORA asset. scripts/test-portable.ps1 verifies both its
+         SHA-256 and the live window ICON_BIG resource. -->
     <ApplicationIcon>..\..\assets\logo.ico</ApplicationIcon>
     <DebugType>None</DebugType>
     <DebugSymbols>false</DebugSymbols>
@@ -56,12 +59,6 @@
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
       <TargetPath>assets\logo.ico</TargetPath>
-    </Content>
-    <Content Include="..\..\assets\logo-taskbar.ico">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
-      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
-      <TargetPath>assets\logo-taskbar.ico</TargetPath>
     </Content>
     <Content Include="..\..\assets\logo.svg">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

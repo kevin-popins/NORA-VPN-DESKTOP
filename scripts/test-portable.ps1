@@ -9,7 +9,6 @@ $required = @(
     "NoraVPN.exe",
     "assets\logo.png",
     "assets\logo.ico",
-    "assets\logo-taskbar.ico",
     "assets\logo.svg",
     "assets\flags\eu.png",
     "assets\emoji\1f680.png",
@@ -73,15 +72,19 @@ function Get-IcoFrameSizes([string]$path) {
     return [PSCustomObject]@{ Count = $frameCount; Sizes = $frameSizes }
 }
 
-$brandIcon = Get-IcoFrameSizes (Join-Path $root "assets\logo.ico")
-$taskbarIcon = Get-IcoFrameSizes (Join-Path $root "assets\logo-taskbar.ico")
+$brandIconPath = Join-Path $root "assets\logo.ico"
+$brandIcon = Get-IcoFrameSizes $brandIconPath
+$expectedBrandIconHash = "4097349A024503524D06D932F4FCBDAE1593BE16643369B337655704262B7CBD"
+$actualBrandIconHash = (Get-FileHash -LiteralPath $brandIconPath -Algorithm SHA256).Hash
+if ($actualBrandIconHash -ne $expectedBrandIconHash) {
+    throw "Portable logo.ico is not the canonical NORA Windows icon: $actualBrandIconHash"
+}
+if (@(Get-ChildItem -LiteralPath (Join-Path $root "assets") -Filter "logo*.ico" -File | Where-Object Name -ne "logo.ico").Count -gt 0) {
+    throw "Only the canonical assets\logo.ico may be packaged for Windows surfaces."
+}
 $missingBrandFrames = @(16, 24, 32, 48, 256) | Where-Object { $_ -notin $brandIcon.Sizes }
 if ($missingBrandFrames.Count -gt 0) {
     throw "Portable title/tray logo.ico is missing expected frames: $($missingBrandFrames -join ', ')"
-}
-$missingTaskbarFrames = @(16, 20, 24, 32, 48, 256) | Where-Object { $_ -notin $taskbarIcon.Sizes }
-if ($missingTaskbarFrames.Count -gt 0) {
-    throw "Portable taskbar icon is missing expected frames: $($missingTaskbarFrames -join ', ')"
 }
 
 $flagCount = (Get-ChildItem -LiteralPath (Join-Path $root "assets\flags") -Filter *.png -ErrorAction Stop).Count
@@ -107,7 +110,7 @@ if ($LASTEXITCODE -ne 0) {
 $isAdministrator = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($isAdministrator) {
-    foreach ($selfTestName in @("subscription-transport-selftest", "subscription-order-selftest", "subscription-refresh-selftest", "country-flag-selftest", "location-artwork-selftest", "ui-preferences-selftest", "discord-routing-selftest")) {
+    foreach ($selfTestName in @("subscription-transport-selftest", "subscription-order-selftest", "subscription-refresh-selftest", "country-flag-selftest", "location-artwork-selftest", "ui-preferences-selftest", "ui-icon-selftest", "discord-routing-selftest")) {
         $selfTest = Start-Process -FilePath (Join-Path $root "NoraVPN.exe") -ArgumentList @($selfTestName) -WorkingDirectory $root -WindowStyle Hidden -Wait -PassThru
         if ($selfTest.ExitCode -ne 0) {
             throw "$selfTestName failed with exit code $($selfTest.ExitCode)"
@@ -119,7 +122,7 @@ else {
     if (-not (Test-Path -LiteralPath $buildDll)) {
         throw "Non-elevated portable verification requires the Release build output: $buildDll"
     }
-    foreach ($selfTestName in @("subscription-transport-selftest", "subscription-order-selftest", "subscription-refresh-selftest", "country-flag-selftest", "location-artwork-selftest", "ui-preferences-selftest", "discord-routing-selftest")) {
+    foreach ($selfTestName in @("subscription-transport-selftest", "subscription-order-selftest", "subscription-refresh-selftest", "country-flag-selftest", "location-artwork-selftest", "ui-preferences-selftest", "ui-icon-selftest", "discord-routing-selftest")) {
         dotnet $buildDll $selfTestName
         if ($LASTEXITCODE -ne 0) {
             throw "$selfTestName failed from Release build output with exit code $LASTEXITCODE"
@@ -128,4 +131,4 @@ else {
     Write-Warning "Portable NoraVPN.exe requires elevation; subscription and routing logic were verified from the matching Release build without opening a UAC prompt."
 }
 
-Write-Host "PORTABLE CORE CHECK PASS: all required assets, $($brandIcon.Count) title/tray frames, $($taskbarIcon.Count) taskbar frames, $flagCount country flags, $emojiCount color emoji, VPN cores, subscription refresh, and Discord Mode routing are present and executable."
+Write-Host "PORTABLE CORE CHECK PASS: canonical NORA icon on every Windows surface, $($brandIcon.Count) icon frames, $flagCount country flags, $emojiCount color emoji, VPN cores, subscription refresh, and Discord Mode routing are present and executable."

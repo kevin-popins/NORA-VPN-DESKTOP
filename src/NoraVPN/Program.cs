@@ -264,6 +264,16 @@ internal static class Program
 #endif
         }
 
+        if (args.Length == 1 && args[0].Equals("ui-icon-selftest", StringComparison.OrdinalIgnoreCase))
+        {
+#if WINDOWS
+            return NoraWpfShell.RunIconSelfTest(Console.Out);
+#else
+            Console.Error.WriteLine("Window icon self-test is only available in the Windows client build.");
+            return 2;
+#endif
+        }
+
         if (args.Length == 1 && args[0].Equals("network-interface-cache-selftest", StringComparison.OrdinalIgnoreCase))
         {
 #if WINDOWS
@@ -360,6 +370,7 @@ internal static class Program
             Console.WriteLine("  nvp country-flag-selftest");
             Console.WriteLine("  nvp location-artwork-selftest");
             Console.WriteLine("  nvp ui-preferences-selftest");
+            Console.WriteLine("  nvp ui-icon-selftest");
             Console.WriteLine("  nvp direct-latency-selftest");
             Console.WriteLine("  nvp audio-capture-smoke");
             Console.WriteLine("  nvp audio-session-meter-selftest");

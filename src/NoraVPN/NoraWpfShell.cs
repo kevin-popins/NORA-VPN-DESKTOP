@@ -345,6 +345,58 @@ internal static class NoraWpfShell
         return passed ? 0 : 1;
     }
 
+    public static int RunIconSelfTest(TextWriter output)
+    {
+        var previousDataRoot = Environment.GetEnvironmentVariable("NORA_DATA_ROOT");
+        var previousVisualReady = Environment.GetEnvironmentVariable("NORA_GUI_VISUAL_READY");
+        var previousSnapshotState = Environment.GetEnvironmentVariable("NORA_GUI_SNAPSHOT_STATE");
+        var temporaryRoot = Path.Combine(Path.GetTempPath(), "nora-icon-selftest-" + Guid.NewGuid().ToString("N"));
+        NoraWpfWindow? window = null;
+        WpfApplication? app = null;
+        try
+        {
+            Directory.CreateDirectory(temporaryRoot);
+            Environment.SetEnvironmentVariable("NORA_DATA_ROOT", temporaryRoot);
+            Environment.SetEnvironmentVariable("NORA_GUI_VISUAL_READY", "1");
+            Environment.SetEnvironmentVariable("NORA_GUI_SNAPSHOT_STATE", "ready");
+
+            app = new WpfApplication { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+            window = new NoraWpfWindow(enableTray: false)
+            {
+                WindowStartupLocation = WindowStartupLocation.Manual,
+                Left = -10000,
+                Top = -10000,
+                ShowInTaskbar = false
+            };
+            window.Show();
+            window.UpdateLayout();
+
+            var passed = window.TaskbarIconMatchesBrandForSmoke(out var mismatchRatio);
+            output.WriteLine(passed
+                ? $"WINDOW ICON SELF-TEST PASS: HWND ICON_BIG matches assets/logo.ico; mismatch={mismatchRatio:P3}"
+                : $"WINDOW ICON SELF-TEST FAIL: HWND ICON_BIG differs from assets/logo.ico; mismatch={mismatchRatio:P3}");
+            return passed ? 0 : 1;
+        }
+        catch (Exception exception)
+        {
+            output.WriteLine("WINDOW ICON SELF-TEST FAIL: " + exception.GetType().Name + ": " + exception.Message);
+            return 1;
+        }
+        finally
+        {
+            if (window is not null)
+            {
+                window.RequestSystemExit();
+                window.Close();
+            }
+            app?.Shutdown();
+            Environment.SetEnvironmentVariable("NORA_DATA_ROOT", previousDataRoot);
+            Environment.SetEnvironmentVariable("NORA_GUI_VISUAL_READY", previousVisualReady);
+            Environment.SetEnvironmentVariable("NORA_GUI_SNAPSHOT_STATE", previousSnapshotState);
+            try { Directory.Delete(temporaryRoot, recursive: true); } catch { }
+        }
+    }
+
     public static int RunConnectCancelSmoke(string outputPath)
     {
         var app = new WpfApplication { ShutdownMode = ShutdownMode.OnExplicitShutdown };
@@ -858,6 +910,48 @@ internal sealed class NoraWpfWindow : Window
 
     internal bool TrayVisibleForSmoke => _trayIcon?.Visible == true;
 
+    internal bool TaskbarIconMatchesBrandForSmoke(out double mismatchRatio)
+    {
+        mismatchRatio = 1;
+        var hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        var handle = SendMessage(hwnd, 0x007F /* WM_GETICON */, new IntPtr(1) /* ICON_BIG */, IntPtr.Zero);
+        var brandPath = BrandIconPaths().FirstOrDefault(File.Exists);
+        if (handle == IntPtr.Zero || brandPath is null)
+            return false;
+
+        using var shared = DrawingIcon.FromHandle(handle);
+        using var actualIcon = (DrawingIcon)shared.Clone();
+        using var actual = actualIcon.ToBitmap();
+        using var expectedSourceIcon = new DrawingIcon(brandPath, new System.Drawing.Size(actualIcon.Width, actualIcon.Height));
+        using var expectedSourceBitmap = expectedSourceIcon.ToBitmap();
+        var expectedHandle = expectedSourceBitmap.GetHicon();
+        try
+        {
+            using var expectedShared = DrawingIcon.FromHandle(expectedHandle);
+            using var expectedIcon = (DrawingIcon)expectedShared.Clone();
+            using var expected = expectedIcon.ToBitmap();
+            var mismatched = 0;
+            var pixels = actual.Width * actual.Height;
+            for (var y = 0; y < actual.Height; y++)
+            for (var x = 0; x < actual.Width; x++)
+            {
+                var left = actual.GetPixel(x, y);
+                var right = expected.GetPixel(x, y);
+                var colorDelta = Math.Abs(left.A - right.A) + Math.Abs(left.R - right.R) +
+                                 Math.Abs(left.G - right.G) + Math.Abs(left.B - right.B);
+                if (colorDelta > 8)
+                    mismatched++;
+            }
+
+            mismatchRatio = pixels == 0 ? 1 : (double)mismatched / pixels;
+            return mismatchRatio <= 0.005;
+        }
+        finally
+        {
+            DestroyIcon(expectedHandle);
+        }
+    }
+
     internal void RestoreFromTrayForSmoke() => ShowFromTray();
 
     internal Task ExitForSmokeAsync() => ExitApplicationAsync();
@@ -1369,12 +1463,11 @@ internal sealed class NoraWpfWindow : Window
 
     private void ApplyTaskbarIcon(IntPtr hwnd)
     {
-        // Keep the established r16 logo in the title bar and tray. Windows taskbar
-        // reads the large window icon, so only that slot gets the simplified,
-        // optically dense taskbar mark.
+        // Every Windows surface uses the established ring logo. Keeping one
+        // canonical source keeps the product identity consistent at runtime.
         if (_taskbarIconHandle == IntPtr.Zero)
         {
-            foreach (var path in BrandTaskbarIconPaths())
+            foreach (var path in BrandIconPaths())
             {
                 if (!File.Exists(path))
                     continue;
@@ -3664,13 +3757,6 @@ internal sealed class NoraWpfWindow : Window
         {
             Path.Combine(AppContext.BaseDirectory, "assets", "logo.ico"),
             Path.Combine(Directory.GetCurrentDirectory(), "assets", "logo.ico")
-        }.Distinct(StringComparer.OrdinalIgnoreCase);
-
-    private static IEnumerable<string> BrandTaskbarIconPaths()
-        => new[]
-        {
-            Path.Combine(AppContext.BaseDirectory, "assets", "logo-taskbar.ico"),
-            Path.Combine(Directory.GetCurrentDirectory(), "assets", "logo-taskbar.ico")
         }.Distinct(StringComparer.OrdinalIgnoreCase);
 
     private static IEnumerable<string> BrandPngPaths()
