@@ -62,7 +62,11 @@ NORA есть живой главный экран, карта, аккуратн
 - **Фото локаций.** Я добавил на карточку активного сервера фотографию страны
   или города вместо безликого фона. Сейчас есть изображения для
   Китая, Эстонии, Финляндии, Франции, Германии, Ирландии, Италии, Литвы,
-  Нидерландов, Португалии, России, Испании, Великобритании и США.
+  Нидерландов, Польши, Индии, Казахстана, Турции, Украины, Португалии, России,
+  Испании, Великобритании и США. Групповые маршруты RU/EU имеют отдельные фоны;
+  конкретная страна или Москва в имени сервера всегда имеет приоритет.
+- **Работа в трее.** При первом закрытии окна NORA объясняет, что VPN продолжает
+  работать в системном трее. Галочка «больше не показывать» сохраняется между запусками.
 - **Эквалайзер.** Я добавил визуальный эквалайзер, который реагирует на
   музыку и звук на компьютере.
 - **Плавный Live Traffic.** График трафика движется непрерывно и мягко
@@ -133,7 +137,12 @@ live home screen, a map, tidy traffic stats, and an easy-to-read server list.
 - **Location artwork.** I added a country or city photo to the active-server card
   instead of a generic background. Artwork is currently available for China,
   Estonia, Finland, France, Germany, Ireland, Italy, Lithuania, the Netherlands,
-  Portugal, Russia, Spain, the United Kingdom, and the United States.
+  Poland, India, Kazakhstan, Turkey, Ukraine, Portugal, Russia, Spain, the United
+  Kingdom, and the United States. Generic RU/EU routes use dedicated group
+  artwork, while a concrete country or Moscow in the server name takes priority.
+- **Tray behavior.** The first window close explains that NORA keeps running in
+  the system tray. The optional "Don't show this again" choice persists between
+  launches.
 - **Equalizer.** I added a visual equalizer that reacts to music and other
   sound playing on your computer.
 - **Smooth Live Traffic.** The traffic graph moves continuously and shows

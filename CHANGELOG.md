@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Added a first-close explanation that NORA keeps running in the system tray;
+  the optional "Don't show this again" choice is persisted independently of
+  the active VPN profile.
+- Added active-server artwork for Poland, India, Kazakhstan, Turkey and Ukraine,
+  two additional Germany and Netherlands Premium frames, and dedicated RU/EU
+  route-group backgrounds with specific-country and Moscow priority.
 - Restored provider ordering and distinct named VLESS routing variants while
   keeping repeated quota and instruction rows to one occurrence each.
 - Preserved double-encoded Unicode titles and server names and added a graceful

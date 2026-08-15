@@ -200,6 +200,9 @@ internal static class NoraWpfShell
                 "krot://eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkRlbW8gS2V5IiwiaWF0IjoxNTE2MjM5MDIyfQ.demo-key-material-abcdef1234567890-abcdef1234567890"),
             "dialog-progress" => new NoraProgressWindow("Creating user", "Creating `marina` and restarting KRot on demo-vps.example..."),
             "dialog-discord-error" => CreateDiscordErrorPreview(),
+            "dialog-tray-notice" => new NoraTrayNoticeWindow(),
+            "dialog-tray-notice-checked" => new NoraTrayNoticeWindow(previewChecked: true),
+            "dialog-tray-notice-error" => new NoraTrayNoticeWindow(previewSaveError: true),
             _ => new NoraWpfWindow(enableTray: false)
         };
         window.WindowStartupLocation = WindowStartupLocation.Manual;
@@ -264,6 +267,10 @@ internal static class NoraWpfShell
 
     public static int RunTraySmoke(string outputPath)
     {
+        var previousVisualReady = Environment.GetEnvironmentVariable("NORA_GUI_VISUAL_READY");
+        var previousNoticeSmoke = Environment.GetEnvironmentVariable("NORA_TRAY_NOTICE_SMOKE");
+        Environment.SetEnvironmentVariable("NORA_GUI_VISUAL_READY", "1");
+        Environment.SetEnvironmentVariable("NORA_TRAY_NOTICE_SMOKE", "1");
         var app = new WpfApplication { ShutdownMode = ShutdownMode.OnExplicitShutdown };
         var window = new NoraWpfWindow(enableTray: true)
         {
@@ -324,7 +331,15 @@ internal static class NoraWpfShell
             }));
         }
 
-        app.Run(window);
+        try
+        {
+            app.Run(window);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("NORA_GUI_VISUAL_READY", previousVisualReady);
+            Environment.SetEnvironmentVariable("NORA_TRAY_NOTICE_SMOKE", previousNoticeSmoke);
+        }
         if (failure is not null)
             Console.Error.WriteLine(failure);
         return passed ? 0 : 1;
@@ -632,6 +647,7 @@ internal sealed class NoraWpfWindow : Window
     private IntPtr _taskbarIconHandle;
     private bool _exitRequested;
     private bool _exitInProgress;
+    private ServerInfo? _snapshotServerInfo;
 
     public NoraWpfWindow(bool enableTray = true)
     {
@@ -675,6 +691,7 @@ internal sealed class NoraWpfWindow : Window
         AppendLog("NORA VPN started");
         AppendLog(NoraPremiumService.GetEqualizerDiagnostic());
         var snapshotState = Environment.GetEnvironmentVariable("NORA_GUI_SNAPSHOT_STATE")?.Trim().ToLowerInvariant() ?? "";
+        _snapshotServerInfo = BuildLocationSnapshotServer(snapshotState);
         if (snapshotState == "arrange")
             _isArrangingServers = true;
         if (snapshotState == "endpoint-revealed")
@@ -976,6 +993,12 @@ internal sealed class NoraWpfWindow : Window
         if (!_trayEnabled || _exitRequested)
             return;
         e.Cancel = true;
+        if (!NoraUiPreferences.CloseToTrayNoticeDismissed &&
+            !string.Equals(Environment.GetEnvironmentVariable("NORA_TRAY_NOTICE_SMOKE"), "1", StringComparison.Ordinal))
+        {
+            var notice = new NoraTrayNoticeWindow { Owner = this };
+            notice.ShowDialog();
+        }
         Hide();
     }
 
@@ -2509,8 +2532,11 @@ internal sealed class NoraWpfWindow : Window
     private UIElement ActiveServerCard()
     {
         var server = CurrentServerInfo();
-        var slideshowEnabled = NoraPremiumService.ServerSlideshowEffective;
-        var images = LoadLocationImages(server.Country, slideshowEnabled);
+        var slideshowEnabled = NoraPremiumService.ServerSlideshowEffective ||
+                               (string.Equals(Environment.GetEnvironmentVariable("NORA_GUI_VISUAL_READY"), "1", StringComparison.Ordinal) &&
+                                string.Equals(Environment.GetEnvironmentVariable("NORA_LOCATION_PREVIEW_ALL"), "1", StringComparison.Ordinal));
+        var artworkKey = ResolveLocationArtworkKey(server.Name, server.Country);
+        var images = LoadLocationImages(artworkKey, slideshowEnabled);
         var cardBorder = new SolidColorBrush(Color.FromArgb(118, 255, 156, 38));
         var imageZoom = new ScaleTransform(1, 1, 0.5, 0.5);
         var card = new Border
@@ -2797,28 +2823,98 @@ internal sealed class NoraWpfWindow : Window
         BorderThickness = new Thickness(1)
     };
 
-    private static IReadOnlyList<ImageSource> LoadLocationImages(string country, bool loadAll)
+    internal static string ResolveLocationArtworkKey(string? serverName, string? country)
     {
-        var normalized = (country ?? "").Trim().ToLowerInvariant();
-        var name = normalized switch
+        var name = NormalizeLocationSearchText(serverName);
+        var namedLocation = NamedLocationArtworkKey(name);
+        if (namedLocation.Length > 0)
+            return namedLocation;
+
+        // Provider route groups must win over a generic Country value inferred
+        // from their flag. A concrete country or Moscow in the name was already
+        // resolved above, so RU/EU now means the group artwork.
+        if (ContainsLocationToken(name, "RU") || ContainsLocationToken(name, "РУ") || ContainsLocationToken(name, "РФ"))
+            return "RUALL";
+        if (ContainsLocationToken(name, "EU") || ContainsLocationToken(name, "ЕС"))
+            return "EUALL";
+
+        return NormalizeCountryArtworkKey(country);
+    }
+
+    private static string NamedLocationArtworkKey(string normalizedName)
+    {
+        foreach (var candidate in new (string Key, string[] Names)[]
+                 {
+                     ("RUSSIA", ["russia", "russian federation", "россия", "российская федерация", "moscow", "москва"]),
+                     ("Germany", ["germany", "deutschland", "германия", "berlin", "берлин", "frankfurt", "франкфурт"]),
+                     ("Netherlands", ["netherlands", "holland", "нидерланды", "голландия", "amsterdam", "амстердам"]),
+                     ("Poland", ["poland", "polska", "польша", "warsaw", "варшава"]),
+                     ("India", ["india", "индия"]),
+                     ("KZ", ["kazakhstan", "казахстан"]),
+                     ("TR", ["turkey", "türkiye", "turkiye", "турция"]),
+                     ("Ukraine", ["ukraine", "украина"]),
+                     ("Lithuania", ["lithuania", "литва", "vilnius", "вильнюс"]),
+                     ("Finland", ["finland", "финляндия", "helsinki", "хельсинки"]),
+                     ("France", ["france", "франция", "paris", "париж"]),
+                     ("Estonia", ["estonia", "эстония", "tallinn", "таллин"]),
+                     ("Ireland", ["ireland", "ирландия", "dublin", "дублин"]),
+                     ("Italy", ["italy", "италия", "rome", "рим"]),
+                     ("Portugal", ["portugal", "португалия", "lisbon", "лиссабон"]),
+                     ("Spain", ["spain", "испания", "madrid", "мадрид"]),
+                     ("China", ["china", "китай"]),
+                     ("UK", ["united kingdom", "great britain", "england", "великобритания", "англия", "UK"]),
+                     ("USA", ["united states", "united states of america", "сша", "USA"])
+                 })
         {
-            "russia" or "russian federation" => "RUSSIA",
-            "united kingdom" or "great britain" or "england" => "UK",
-            "united states" or "united states of america" or "usa" => "USA",
-            "china" => "China",
-            "estonia" => "Estonia",
-            "finland" => "Finland",
-            "france" => "France",
-            "germany" => "Germany",
-            "ireland" => "Ireland",
-            "italy" => "Italy",
-            "lithuania" => "Lithuania",
-            "netherlands" or "holland" => "Netherlands",
-            "portugal" => "Portugal",
-            "spain" => "Spain",
-            "universal" => "Universal",
+            if (candidate.Names.Any(alias => ContainsLocationToken(normalizedName, alias)))
+                return candidate.Key;
+        }
+        return "";
+    }
+
+    private static string NormalizeCountryArtworkKey(string? country)
+    {
+        var normalized = NormalizeLocationSearchText(country);
+        return normalized switch
+        {
+            "russia" or "russian federation" or "россия" or "moscow" or "москва" => "RUSSIA",
+            "united kingdom" or "great britain" or "england" or "uk" => "UK",
+            "united states" or "united states of america" or "usa" or "сша" => "USA",
+            "china" or "китай" => "China",
+            "estonia" or "эстония" => "Estonia",
+            "finland" or "финляндия" => "Finland",
+            "france" or "франция" => "France",
+            "germany" or "deutschland" or "германия" => "Germany",
+            "ireland" or "ирландия" => "Ireland",
+            "italy" or "италия" => "Italy",
+            "lithuania" or "литва" => "Lithuania",
+            "netherlands" or "holland" or "нидерланды" => "Netherlands",
+            "poland" or "polska" or "польша" => "Poland",
+            "india" or "индия" => "India",
+            "kazakhstan" or "казахстан" or "kz" => "KZ",
+            "turkey" or "türkiye" or "turkiye" or "турция" or "tr" => "TR",
+            "ukraine" or "украина" => "Ukraine",
+            "portugal" or "португалия" => "Portugal",
+            "spain" or "испания" => "Spain",
+            "eu" or "european union" => "EUALL",
+            "ru" => "RUALL",
+            "universal" or "" => "Universal",
             _ => (country ?? "").Trim()
         };
+    }
+
+    private static string NormalizeLocationSearchText(string? value)
+        => Regex.Replace((value ?? "").Normalize(NormalizationForm.FormC).ToLowerInvariant(), @"\s+", " ").Trim();
+
+    private static bool ContainsLocationToken(string source, string token)
+        => Regex.IsMatch(
+            source,
+            @"(?<![\p{L}\p{N}])" + Regex.Escape(token.ToLowerInvariant()) + @"(?![\p{L}\p{N}])",
+            RegexOptions.CultureInvariant);
+
+    private static IReadOnlyList<ImageSource> LoadLocationImages(string locationKey, bool loadAll)
+    {
+        var name = NormalizeCountryArtworkKey(locationKey);
         var cacheKey = (name.Length == 0 ? "Universal" : name) + (loadAll ? ":all" : ":first");
         lock (ImageCacheSync)
         {
@@ -2858,6 +2954,51 @@ internal sealed class NoraWpfWindow : Window
         lock (ImageCacheSync)
             LocationImageCache[cacheKey] = loaded;
         return loaded;
+    }
+
+    internal static int RunLocationArtworkSelfTest(TextWriter output)
+    {
+        try
+        {
+            var mappingsPassed =
+                ResolveLocationArtworkKey("EU Germany · all operators", "EU") == "Germany" &&
+                ResolveLocationArtworkKey("EU Netherlands", "EU") == "Netherlands" &&
+                ResolveLocationArtworkKey("RU Moscow", "Russia") == "RUSSIA" &&
+                ResolveLocationArtworkKey("RU Kazan · all operators", "Russia") == "RUALL" &&
+                ResolveLocationArtworkKey("EU · all operators", "EU") == "EUALL" &&
+                ResolveLocationArtworkKey("Польша", "Unknown") == "Poland" &&
+                ResolveLocationArtworkKey("India", "Unknown") == "India" &&
+                ResolveLocationArtworkKey("Kazakhstan", "Unknown") == "KZ" &&
+                ResolveLocationArtworkKey("Turkey", "Unknown") == "TR" &&
+                ResolveLocationArtworkKey("Ukraine", "Unknown") == "Ukraine";
+
+            var root = Path.Combine(AppContext.BaseDirectory, "assets", "locations");
+            var expectedCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Germany"] = 5,
+                ["Netherlands"] = 5,
+                ["Poland"] = 3,
+                ["India"] = 3,
+                ["KZ"] = 3,
+                ["TR"] = 3,
+                ["Ukraine"] = 1,
+                ["RUALL"] = 1,
+                ["EUALL"] = 1
+            };
+            var assetsPassed = expectedCounts.All(pair => FindLocationPaths(root, pair.Key).Count == pair.Value);
+            var freeTierPassed = expectedCounts.Keys.All(key => LoadLocationImages(key, loadAll: false).Count == 1);
+            var premiumTierPassed = expectedCounts.All(pair => LoadLocationImages(pair.Key, loadAll: true).Count == pair.Value);
+            var passed = mappingsPassed && assetsPassed && freeTierPassed && premiumTierPassed;
+            output.WriteLine(passed
+                ? "LOCATION ARTWORK SELF-TEST PASS: specific-country priority; RU/EU groups; free-first; premium-slideshow assets complete"
+                : $"LOCATION ARTWORK SELF-TEST FAIL: mappings={mappingsPassed}; assets={assetsPassed}; free={freeTierPassed}; premium={premiumTierPassed}");
+            return passed ? 0 : 1;
+        }
+        catch (Exception exception)
+        {
+            output.WriteLine("LOCATION ARTWORK SELF-TEST FAIL: " + exception.GetType().Name + ": " + exception.Message);
+            return 1;
+        }
     }
 
     private static List<string> FindLocationPaths(string root, string countryName)
@@ -6854,6 +6995,8 @@ internal sealed class NoraWpfWindow : Window
 
     private ServerInfo CurrentServerInfo()
     {
+        if (_snapshotServerInfo is not null)
+            return _snapshotServerInfo;
         if (_activeSubscriptionServer is not null)
         {
             var subOnline = _state is TunnelState.Connected or TunnelState.Connecting || (_ping.TryGetValue(_activeSubscriptionServer.LocalPath, out var sp) && sp.Online);
@@ -6873,6 +7016,22 @@ internal sealed class NoraWpfWindow : Window
         var online = _state is TunnelState.Connected or TunnelState.Connecting || (_ping.TryGetValue(_activeProfilePath, out var p) && p.Online);
         return new ServerInfo("Amsterdam VPS", server.Address, server.Port, CountryFor(server.Address), online, "KRot-T  •  Full tunnel");
     }
+
+    private static ServerInfo? BuildLocationSnapshotServer(string state) => state switch
+    {
+        "location-ruall" => new ServerInfo("RU Kazan · all operators", "ru-group.demo.test", 443, "Russia", true, "VLESS · XHTTP"),
+        "location-euall" => new ServerInfo("EU · all operators", "eu-group.demo.test", 443, "EU", true, "VLESS · Reality"),
+        "location-eu-germany" => new ServerInfo("EU Germany · all operators", "de-group.demo.test", 443, "EU", true, "VLESS · Reality"),
+        "location-ru-moscow" => new ServerInfo("RU Moscow", "moscow.demo.test", 443, "Russia", true, "VLESS · Reality"),
+        "location-poland" => new ServerInfo("Poland · Warsaw", "warsaw.demo.test", 443, "Poland", true, "VLESS · Reality"),
+        "location-india" => new ServerInfo("India · Mumbai", "mumbai.demo.test", 443, "India", true, "VLESS · Reality"),
+        "location-kz" => new ServerInfo("Kazakhstan", "almaty.demo.test", 443, "Kazakhstan", true, "VLESS · Reality"),
+        "location-tr" => new ServerInfo("Turkey", "istanbul.demo.test", 443, "Turkey", true, "VLESS · Reality"),
+        "location-ukraine" => new ServerInfo("Ukraine", "kyiv.demo.test", 443, "Ukraine", true, "VLESS · Reality"),
+        "location-germany" => new ServerInfo("Germany · Frankfurt", "frankfurt.demo.test", 443, "Germany", true, "VLESS · Reality"),
+        "location-netherlands" => new ServerInfo("Netherlands · Amsterdam", "amsterdam.demo.test", 443, "Netherlands", true, "VLESS · Reality"),
+        _ => null
+    };
 
     private IEnumerable<ProfileListItem> DiscoverProfiles()
     {
@@ -9880,6 +10039,204 @@ internal static class NoraFormUi
                 Margin = new Thickness(2, 4, 0, 0)
             });
         }
+    }
+}
+
+internal sealed class NoraTrayNoticeWindow : Window
+{
+    private bool _dontShowAgain;
+
+    public NoraTrayNoticeWindow(bool previewChecked = false, bool previewSaveError = false)
+    {
+        _dontShowAgain = previewChecked;
+        Title = "NORA VPN";
+        Width = 470;
+        Height = 330;
+        ResizeMode = ResizeMode.NoResize;
+        WindowStartupLocation = WindowStartupLocation.CenterOwner;
+        ShowInTaskbar = false;
+        Background = NoraWpfTheme.BgBrush;
+        Foreground = NoraWpfTheme.TextBrush;
+        FontFamily = NoraWpfTheme.UiFont;
+
+        var card = new Border
+        {
+            Margin = new Thickness(18),
+            Padding = new Thickness(22, 20, 22, 20),
+            CornerRadius = new CornerRadius(20),
+            Background = NoraWpfTheme.Brush(Color.FromArgb(244, 17, 22, 30)),
+            BorderBrush = NoraWpfTheme.Brush(Color.FromArgb(105, 255, 156, 38)),
+            BorderThickness = new Thickness(1)
+        };
+        Content = card;
+
+        var root = new Grid();
+        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        card.Child = root;
+
+        var header = new Grid();
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        var iconHost = new Border
+        {
+            Width = 46,
+            Height = 46,
+            CornerRadius = new CornerRadius(15),
+            Background = NoraWpfTheme.Brush(Color.FromArgb(36, 255, 156, 38)),
+            BorderBrush = NoraWpfTheme.Brush(Color.FromArgb(100, 255, 156, 38)),
+            BorderThickness = new Thickness(1),
+            Child = new NoraIcon
+            {
+                Kind = NoraIconKind.Power,
+                Width = 22,
+                Height = 22,
+                Stroke = NoraWpfTheme.OrangeBrush,
+                Weight = 2
+            }
+        };
+        header.Children.Add(iconHost);
+        var heading = new StackPanel { Margin = new Thickness(14, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center };
+        heading.Children.Add(new TextBlock
+        {
+            Text = "NORA VPN is still running",
+            FontSize = 21,
+            FontWeight = FontWeights.Bold,
+            Foreground = NoraWpfTheme.TextBrush
+        });
+        heading.Children.Add(new TextBlock
+        {
+            Text = "The window will be hidden in the system tray.",
+            FontSize = 12.5,
+            Foreground = NoraWpfTheme.MutedBrush,
+            Margin = new Thickness(0, 4, 0, 0)
+        });
+        Grid.SetColumn(heading, 1);
+        header.Children.Add(heading);
+        root.Children.Add(header);
+
+        var explanation = new TextBlock
+        {
+            Text = "Your VPN connection and NORA services keep working. To quit completely, right-click the tray icon and choose Exit.",
+            FontSize = 13.5,
+            LineHeight = 20,
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = NoraWpfTheme.Brush(Color.FromRgb(199, 208, 222)),
+            Margin = new Thickness(0, 17, 0, 14)
+        };
+        Grid.SetRow(explanation, 1);
+        root.Children.Add(explanation);
+
+        var checkMark = new NoraIcon
+        {
+            Kind = NoraIconKind.Check,
+            Width = 14,
+            Height = 14,
+            Stroke = NoraWpfTheme.BgBrush,
+            Weight = 2.4,
+            Visibility = _dontShowAgain ? Visibility.Visible : Visibility.Collapsed
+        };
+        var checkBox = new Border
+        {
+            Width = 21,
+            Height = 21,
+            CornerRadius = new CornerRadius(6),
+            BorderThickness = new Thickness(1),
+            BorderBrush = _dontShowAgain ? NoraWpfTheme.OrangeBrush : NoraWpfTheme.Brush(Color.FromArgb(150, 146, 157, 176)),
+            Background = _dontShowAgain ? NoraWpfTheme.OrangeBrush : NoraWpfTheme.Brush(Color.FromRgb(12, 16, 23)),
+            Child = checkMark,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        var toggleContent = new StackPanel { Orientation = Orientation.Horizontal };
+        toggleContent.Children.Add(checkBox);
+        toggleContent.Children.Add(new TextBlock
+        {
+            Text = "Don't show this again",
+            FontSize = 13.5,
+            FontWeight = FontWeights.SemiBold,
+            Foreground = NoraWpfTheme.TextBrush,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(10, 0, 0, 0)
+        });
+        var toggle = new NoraFxButton(
+            Color.FromArgb(128, 12, 16, 23),
+            Color.FromArgb(220, 25, 31, 41),
+            13,
+            accent: false,
+            stroke: NoraWpfTheme.Brush(Color.FromArgb(95, 146, 157, 176)))
+        {
+            Height = 45,
+            HorizontalContentAlignment = HorizontalAlignment.Left,
+            Padding = new Thickness(13, 0, 13, 0),
+            Content = toggleContent
+        };
+        System.Windows.Automation.AutomationProperties.SetName(toggle, "Don't show this again");
+        var error = new TextBlock
+        {
+            Text = previewSaveError ? "The preference could not be saved. Check access to the NORA data folder." : "",
+            FontSize = 11.5,
+            Foreground = NoraWpfTheme.RedBrush,
+            VerticalAlignment = VerticalAlignment.Center,
+            TextWrapping = TextWrapping.Wrap,
+            Visibility = previewSaveError ? Visibility.Visible : Visibility.Collapsed,
+            Margin = new Thickness(0, 0, 12, 0)
+        };
+        toggle.Click += (_, _) =>
+        {
+            var nextValue = !_dontShowAgain;
+            try
+            {
+                NoraUiPreferences.SetCloseToTrayNoticeDismissed(nextValue);
+            }
+            catch
+            {
+                error.Text = "The preference could not be saved. Check access to the NORA data folder.";
+                error.Visibility = Visibility.Visible;
+                return;
+            }
+
+            _dontShowAgain = nextValue;
+            error.Visibility = Visibility.Collapsed;
+            checkMark.Visibility = _dontShowAgain ? Visibility.Visible : Visibility.Collapsed;
+            checkBox.Background = _dontShowAgain ? NoraWpfTheme.OrangeBrush : NoraWpfTheme.Brush(Color.FromRgb(12, 16, 23));
+            checkBox.BorderBrush = _dontShowAgain ? NoraWpfTheme.OrangeBrush : NoraWpfTheme.Brush(Color.FromArgb(150, 146, 157, 176));
+        };
+        Grid.SetRow(toggle, 2);
+        root.Children.Add(toggle);
+
+        var actionRow = new Grid { Margin = new Thickness(0, 15, 0, 0) };
+        actionRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        actionRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        actionRow.Children.Add(error);
+        var confirm = new NoraFxButton(NoraWpfTheme.Orange, NoraWpfTheme.Orange2, 14, accent: true)
+        {
+            Width = 118,
+            Height = 42,
+            IsDefault = true,
+            Content = new TextBlock
+            {
+                Text = "Got it",
+                FontSize = 13.5,
+                FontWeight = FontWeights.Bold,
+                Foreground = NoraWpfTheme.BgBrush
+            }
+        };
+        confirm.Click += (_, _) =>
+        {
+            DialogResult = true;
+        };
+        Grid.SetColumn(confirm, 1);
+        actionRow.Children.Add(confirm);
+        Grid.SetRow(actionRow, 3);
+        root.Children.Add(actionRow);
+
+        KeyDown += (_, eventArgs) =>
+        {
+            if (eventArgs.Key == Key.Escape)
+                Close();
+        };
     }
 }
 

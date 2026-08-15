@@ -23,7 +23,26 @@ $required = @(
     "assets\locations\Discord1.png",
     "assets\locations\Discord2.png",
     "assets\locations\Discord3.png",
-    "assets\locations\Discord4.png"
+    "assets\locations\Discord4.png",
+    "assets\locations\Germany4.png",
+    "assets\locations\Germany5.png",
+    "assets\locations\Netherlands4.png",
+    "assets\locations\Netherlands5.png",
+    "assets\locations\Poland1.png",
+    "assets\locations\Poland2.png",
+    "assets\locations\Poland3.png",
+    "assets\locations\India1.png",
+    "assets\locations\India2.png",
+    "assets\locations\India3.png",
+    "assets\locations\KZ1.png",
+    "assets\locations\KZ2.png",
+    "assets\locations\KZ3.png",
+    "assets\locations\TR1.png",
+    "assets\locations\TR2.png",
+    "assets\locations\TR3.png",
+    "assets\locations\Ukraine1.png",
+    "assets\locations\RUALL.png",
+    "assets\locations\EUALL.png"
 )
 
 $missing = $required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $root $_)) }
@@ -82,7 +101,7 @@ if ($LASTEXITCODE -ne 0) {
 $isAdministrator = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($isAdministrator) {
-    foreach ($selfTestName in @("subscription-transport-selftest", "subscription-order-selftest", "subscription-refresh-selftest", "country-flag-selftest", "discord-routing-selftest")) {
+    foreach ($selfTestName in @("subscription-transport-selftest", "subscription-order-selftest", "subscription-refresh-selftest", "country-flag-selftest", "location-artwork-selftest", "ui-preferences-selftest", "discord-routing-selftest")) {
         $selfTest = Start-Process -FilePath (Join-Path $root "NoraVPN.exe") -ArgumentList @($selfTestName) -WorkingDirectory $root -WindowStyle Hidden -Wait -PassThru
         if ($selfTest.ExitCode -ne 0) {
             throw "$selfTestName failed with exit code $($selfTest.ExitCode)"
@@ -94,7 +113,7 @@ else {
     if (-not (Test-Path -LiteralPath $buildDll)) {
         throw "Non-elevated portable verification requires the Release build output: $buildDll"
     }
-    foreach ($selfTestName in @("subscription-transport-selftest", "subscription-order-selftest", "subscription-refresh-selftest", "country-flag-selftest", "discord-routing-selftest")) {
+    foreach ($selfTestName in @("subscription-transport-selftest", "subscription-order-selftest", "subscription-refresh-selftest", "country-flag-selftest", "location-artwork-selftest", "ui-preferences-selftest", "discord-routing-selftest")) {
         dotnet $buildDll $selfTestName
         if ($LASTEXITCODE -ne 0) {
             throw "$selfTestName failed from Release build output with exit code $LASTEXITCODE"
