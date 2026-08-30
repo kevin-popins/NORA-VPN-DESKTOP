@@ -2,13 +2,13 @@ NORA VPN — license and use notices
 
 NORA VPN is an open-source VPN client distributed under the Apache License 2.0. The complete license is shown by Setup and installed with the application.
 
-NORA VPN does not sell VPN subscriptions, issue access keys, or provide public VPN servers. You need connection data from your provider or access to your own server.
+NORA VPN is a client and does not include a VPN connection by itself. You need compatible connection data from your provider, access to your own server, or official NORA VPN access purchased through the Telegram bot linked by the application.
 
 The application supports experimental components, including KRot, and beta functionality such as Discord Mode. The software is provided on an “AS IS” basis, without warranties or conditions, as described by the Apache License 2.0 and applicable law.
 
-Imported subscriptions, profiles, preferences and Premium activation are stored locally under your Windows account. Installation, repair and updates do not replace that data. Uninstall also keeps it by default.
+Imported subscriptions, profiles and preferences are stored locally under your Windows account. Installation, repair and updates do not replace that data. Uninstall also keeps it by default.
 
-Premium activation communicates with the NORA Premium service to validate the activation code and installation. Subscription refresh contacts the subscription provider. Connection checks and country detection may contact external network services. Technical logs remain local unless you choose to share them.
+Opening the official purchase link uses Telegram. Subscription refresh contacts the subscription provider. A non-blocking update check reads the public NORA VPN release metadata from GitHub after startup. Connection checks and country detection may contact external network services. Technical logs remain local unless you choose to share them.
 
 NORA VPN includes independently licensed components and artwork. Their notices are installed in the “legal” folder. The NORA VPN name, logo and visual identity are governed separately by TRADEMARKS.md.
 

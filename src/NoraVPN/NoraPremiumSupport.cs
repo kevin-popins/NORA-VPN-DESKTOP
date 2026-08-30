@@ -67,10 +67,10 @@ internal static class NoraPremiumService
     }
 
     public static bool EqualizerEffective
-        => IsPremium && EqualizerEnabled && HasEntitlement("appearance.equalizer");
+        => EqualizerEnabled;
 
     public static bool ServerSlideshowEffective
-        => IsPremium && ServerSlideshowEnabled && HasEntitlement("appearance.server_slideshow");
+        => ServerSlideshowEnabled;
 
     // This stays in the local technical log rather than the Appearance page.
     // It makes a failed visualizer diagnosis actionable without exposing
@@ -78,8 +78,7 @@ internal static class NoraPremiumService
     internal static string GetEqualizerDiagnostic()
     {
         EnsureLoaded();
-        var entitled = HasEntitlement("appearance.equalizer");
-        return $"Audio visualizer: Premium={_status}; setting={(EqualizerEnabled ? "on" : "off")}; entitlement={(entitled ? "present" : "missing")}; renderer={(EqualizerEffective ? "enabled" : "disabled")}.";
+        return $"Audio visualizer: available=everyone; setting={(EqualizerEnabled ? "on" : "off")}; renderer={(EqualizerEffective ? "enabled" : "disabled")}.";
     }
 
     public static DateTimeOffset? ValidUntil
@@ -383,8 +382,49 @@ internal static class NoraPremiumService
 
     private sealed class AppearanceSettings
     {
-        public bool EqualizerEnabled { get; set; }
-        public bool ServerSlideshowEnabled { get; set; }
+        public bool EqualizerEnabled { get; set; } = true;
+        public bool ServerSlideshowEnabled { get; set; } = true;
+    }
+
+    internal static int RunAvailabilitySelfTest(TextWriter output)
+    {
+        var root = Path.Combine(Path.GetTempPath(), "nora-appearance-selftest-" + Guid.NewGuid().ToString("N"));
+        var previousRoot = Environment.GetEnvironmentVariable("NORA_PREMIUM_DATA_ROOT");
+        var sentinel = SHA256.HashData(Encoding.UTF8.GetBytes("legacy-premium-state"));
+        try
+        {
+            Directory.CreateDirectory(root);
+            File.WriteAllBytes(Path.Combine(root, "premium.dat"), sentinel);
+            Environment.SetEnvironmentVariable("NORA_PREMIUM_DATA_ROOT", root);
+            ResetLoadedStateForSelfTest();
+
+            var defaultOn = EqualizerEffective && ServerSlideshowEffective;
+            SetEqualizerEnabled(false);
+            ResetLoadedStateForSelfTest();
+            var explicitChoicePreserved = !EqualizerEffective && ServerSlideshowEffective;
+            var legacyPremiumPreserved = File.ReadAllBytes(Path.Combine(root, "premium.dat")).SequenceEqual(sentinel);
+            var passed = defaultOn && explicitChoicePreserved && legacyPremiumPreserved;
+            output.WriteLine(
+                $"APPEARANCE AVAILABILITY SELF-TEST: default_on={defaultOn}; explicit_choice_preserved={explicitChoicePreserved}; legacy_premium_preserved={legacyPremiumPreserved}");
+            return passed ? 0 : 1;
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("NORA_PREMIUM_DATA_ROOT", previousRoot);
+            ResetLoadedStateForSelfTest();
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    private static void ResetLoadedStateForSelfTest()
+    {
+        lock (Sync)
+        {
+            _state = null;
+            _appearance = null;
+            _payload = null;
+            _status = NoraPremiumStatus.Free;
+        }
     }
 
     private sealed record ActivationRequest(

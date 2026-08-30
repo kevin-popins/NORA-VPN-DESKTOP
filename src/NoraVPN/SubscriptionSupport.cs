@@ -23,6 +23,9 @@ internal sealed class NoraSubscriptionInfo
     // subscription refresh cannot undo an order chosen in the NORA UI.
     public int DisplayOrder { get; set; }
     public string Title { get; set; } = "";
+    // Optional user-facing name supplied by an authenticated dashboard deep
+    // link. It survives provider refreshes without changing the source URL.
+    public string DisplayNameOverride { get; set; } = "";
     public string SourceUrl { get; set; } = "";
     public string WebPageUrl { get; set; } = "";
     public string Announce { get; set; } = "";
@@ -139,7 +142,7 @@ internal static class NoraSubscriptionStore
         }
     }
 
-    public static async Task<NoraSubscriptionInfo> ImportAsync(string input, Action<string> log)
+    public static async Task<NoraSubscriptionInfo> ImportAsync(string input, Action<string> log, string? preferredTitle = null)
     {
         input = input.Trim();
         if (HappCrypt5Decoder.IsCrypt5Link(input))
@@ -147,13 +150,16 @@ internal static class NoraSubscriptionStore
             var decrypted = HappCrypt5Decoder.Decrypt(input);
             log("Encrypted HAPP subscription unlocked.");
             if (Uri.TryCreate(decrypted, UriKind.Absolute, out var decryptedUri) && decryptedUri.Scheme is "http" or "https")
-                return await ImportUrlAsync(decryptedUri, log, input);
+                return await ImportUrlAsync(decryptedUri, log, input, preferredTitle: preferredTitle);
             var parsed = ParsePayload(decrypted, input, new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase), log);
+            ApplyPreferredTitle(parsed, preferredTitle);
             return Store(parsed, input);
         }
         if (Uri.TryCreate(input, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https")
-            return await ImportUrlAsync(uri, log);
-        return Store(ParsePayload(input, "", new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase), log), input);
+            return await ImportUrlAsync(uri, log, preferredTitle: preferredTitle);
+        var direct = ParsePayload(input, "", new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase), log);
+        ApplyPreferredTitle(direct, preferredTitle);
+        return Store(direct, input);
     }
 
     public static async Task<NoraSubscriptionInfo> RefreshAsync(
@@ -166,13 +172,15 @@ internal static class NoraSubscriptionStore
         {
             var decrypted = HappCrypt5Decoder.Decrypt(source);
             if (Uri.TryCreate(decrypted, UriKind.Absolute, out var decryptedUri) && decryptedUri.Scheme is "http" or "https")
-                return await ImportUrlAsync(decryptedUri, log, source, cancellationToken: cancellationToken);
+                return await ImportUrlAsync(decryptedUri, log, source, cancellationToken: cancellationToken, preferredTitle: subscription.DisplayNameOverride);
             cancellationToken.ThrowIfCancellationRequested();
-            return Store(ParsePayload(decrypted, source, new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase), log), source);
+            var parsed = ParsePayload(decrypted, source, new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase), log);
+            ApplyPreferredTitle(parsed, subscription.DisplayNameOverride);
+            return Store(parsed, source);
         }
         if (!Uri.TryCreate(source, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https"))
             throw new NoraAppException("NORA-SUB-4002", "This subscription was imported without a refresh URL.");
-        return await ImportUrlAsync(uri, log, cancellationToken: cancellationToken);
+        return await ImportUrlAsync(uri, log, cancellationToken: cancellationToken, preferredTitle: subscription.DisplayNameOverride);
     }
 
     public static IReadOnlyList<NoraSubscriptionInfo> LoadAll()
@@ -379,7 +387,7 @@ internal static class NoraSubscriptionStore
         bool nativeTun = false,
         IReadOnlyCollection<IPAddress>? endpointAddresses = null)
     {
-        var proxyOutbound = ExtractVlessOutbound(server.RawConfigJson) ?? BuildXrayVlessOutbound(server);
+        var proxyOutbound = ExtractSupportedXrayOutbound(server.RawConfigJson, server.Protocol) ?? BuildXrayVlessOutbound(server);
         proxyOutbound["tag"] = "proxy";
         RemoveLocalInterfaceBindings(proxyOutbound);
         var dns = new JsonObject
@@ -466,7 +474,7 @@ internal static class NoraSubscriptionStore
 
     private static void RemoveLocalInterfaceBindings(JsonObject outbound)
     {
-        if (!string.Equals(outbound["protocol"]?.GetValue<string>(), "vless", StringComparison.OrdinalIgnoreCase))
+        if (!IsSupportedXrayProtocolName(outbound["protocol"]?.GetValue<string>()))
             return;
         if (outbound["streamSettings"] is not JsonObject stream)
             return;
@@ -508,9 +516,11 @@ internal static class NoraSubscriptionStore
             text.Contains("[Peer]", StringComparison.OrdinalIgnoreCase))
             return TryParseAwgProfile(text, profilePath, protocolHint, out info);
 
-        if (text.StartsWith("vless://", StringComparison.OrdinalIgnoreCase))
+        if (text.StartsWith("vless://", StringComparison.OrdinalIgnoreCase) ||
+            text.StartsWith("vmess://", StringComparison.OrdinalIgnoreCase) ||
+            text.StartsWith("trojan://", StringComparison.OrdinalIgnoreCase))
         {
-            if (!TryParseVlessUri(text, "Direct profiles", out var server))
+            if (!TryParseShareUri(text, "Direct profiles", out var server))
                 return false;
             info = new NoraExternalProfileInfo
             {
@@ -578,16 +588,21 @@ internal static class NoraSubscriptionStore
         return info.Protocol + " profile";
     }
 
-    private static JsonObject? ExtractVlessOutbound(string rawConfigJson)
+    private static JsonObject? ExtractSupportedXrayOutbound(string rawConfigJson, string protocolHint = "")
     {
         if (string.IsNullOrWhiteSpace(rawConfigJson))
             return null;
         try
         {
             var source = JsonNode.Parse(rawConfigJson)?.AsObject();
-            var outbound = source?["outbounds"]?.AsArray()
-                .OfType<JsonObject>()
-                .FirstOrDefault(x => string.Equals(x["protocol"]?.GetValue<string>(), "vless", StringComparison.OrdinalIgnoreCase));
+            var expected = protocolHint.Contains("vmess", StringComparison.OrdinalIgnoreCase) ? "vmess" :
+                protocolHint.Contains("trojan", StringComparison.OrdinalIgnoreCase) ? "trojan" :
+                protocolHint.Contains("vless", StringComparison.OrdinalIgnoreCase) ? "vless" : "";
+            var candidates = source?["outbounds"]?.AsArray().OfType<JsonObject>()
+                .Where(x => IsSupportedXrayProtocolName(x["protocol"]?.GetValue<string>()))
+                .ToList();
+            var outbound = candidates?.FirstOrDefault(x => string.Equals(x["protocol"]?.GetValue<string>(), expected, StringComparison.OrdinalIgnoreCase))
+                           ?? candidates?.FirstOrDefault();
             return outbound?.DeepClone().AsObject();
         }
         catch
@@ -656,7 +671,8 @@ internal static class NoraSubscriptionStore
             return NoraRouteBucket.Direct;
         if (t.Contains("block") || t.Contains("reject") || t.Contains("blackhole") || t.Contains("ad"))
             return NoraRouteBucket.Block;
-        if (t.Contains("proxy") || t.Contains("vless") || t.Contains("vpn") || t.Contains("select"))
+        if (t.Contains("proxy") || t.Contains("vless") || t.Contains("vmess") || t.Contains("trojan") ||
+            t.Contains("vpn") || t.Contains("select"))
             return NoraRouteBucket.Proxy;
         return null;
     }
@@ -1121,7 +1137,8 @@ internal static class NoraSubscriptionStore
         Action<string> log,
         string? sourceReference = null,
         int redirectDepth = 0,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? preferredTitle = null)
     {
         if (redirectDepth > 3)
             throw new NoraAppException("NORA-SUB-4002", "The encrypted subscription contains too many nested links.");
@@ -1140,7 +1157,8 @@ internal static class NoraSubscriptionStore
             var body = await response.Content.ReadAsStringAsync(cancellationToken);
             if (!response.IsSuccessStatusCode)
             {
-                lastError = $"{(int)response.StatusCode}: {TrimForError(body)}";
+                var contentType = response.Content.Headers.ContentType?.MediaType ?? "unknown content type";
+                lastError = $"HTTP {(int)response.StatusCode}; {contentType}; response_chars={body.Length}";
                 log($"Subscription fetch as {userAgent} returned {(int)response.StatusCode}; trying next client identity.");
                 continue;
             }
@@ -1156,7 +1174,7 @@ internal static class NoraSubscriptionStore
                 body = HappCrypt5Decoder.Decrypt(body);
                 log("Encrypted HAPP response unlocked.");
                 if (Uri.TryCreate(body, UriKind.Absolute, out var nestedUri) && nestedUri.Scheme is "http" or "https")
-                    return await ImportUrlAsync(nestedUri, log, sourceReference ?? uri.ToString(), redirectDepth + 1, cancellationToken);
+                    return await ImportUrlAsync(nestedUri, log, sourceReference ?? uri.ToString(), redirectDepth + 1, cancellationToken, preferredTitle);
             }
 
             var storedSource = sourceReference ?? uri.ToString();
@@ -1181,10 +1199,19 @@ internal static class NoraSubscriptionStore
         if (parsed is null)
             throw new NoraAppException("NORA-SUB-4002", $"Subscription server did not return a usable payload ({lastError})");
 
+        ApplyPreferredTitle(parsed, preferredTitle);
         await ResolveMissingCountriesAsync(parsed, log, cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
         return Store(parsed, sourceReference ?? uri.ToString());
     }
+
+    internal static bool IsSupportedXrayProtocol(string? protocol)
+        => protocol?.Contains("VLESS", StringComparison.OrdinalIgnoreCase) == true ||
+           protocol?.Contains("VMESS", StringComparison.OrdinalIgnoreCase) == true ||
+           protocol?.Contains("TROJAN", StringComparison.OrdinalIgnoreCase) == true;
+
+    private static bool IsSupportedXrayProtocolName(string? protocol)
+        => protocol is not null && protocol.ToLowerInvariant() is "vless" or "vmess" or "trojan";
 
     private static async Task ResolveMissingCountriesAsync(
         NoraSubscriptionInfo sub,
@@ -1266,6 +1293,9 @@ internal static class NoraSubscriptionStore
                 previous = JsonSerializer.Deserialize<NoraSubscriptionInfo>(File.ReadAllText(subscriptionPath), JsonOptions);
         }
         catch { }
+
+        if (string.IsNullOrWhiteSpace(sub.DisplayNameOverride) && !string.IsNullOrWhiteSpace(previous?.DisplayNameOverride))
+            ApplyPreferredTitle(sub, previous.DisplayNameOverride);
 
         // Follow the provider order by default. Preserve a local order only after
         // the user explicitly moved a node in Arrange mode.
@@ -1459,7 +1489,8 @@ internal static class NoraSubscriptionStore
         var fallback = candidates
             .Where(IsAutomaticServer)
             .Where(server => !string.Equals(server.Id, primary.Id, StringComparison.OrdinalIgnoreCase))
-            .Where(server => server.Protocol.Contains("VLESS", StringComparison.OrdinalIgnoreCase))
+            .Where(server => IsSupportedXrayProtocol(server.Protocol))
+            .Where(server => string.Equals(XrayProtocolFamily(server.Protocol), XrayProtocolFamily(primary.Protocol), StringComparison.OrdinalIgnoreCase))
             .OrderByDescending(server => string.Equals(NormalizeXrayNetwork(server.Network), NormalizeXrayNetwork(primary.Network), StringComparison.OrdinalIgnoreCase))
             .ThenByDescending(server => string.Equals(server.Security, primary.Security, StringComparison.OrdinalIgnoreCase))
             .ThenBy(server => server.Name, StringComparer.OrdinalIgnoreCase)
@@ -1467,18 +1498,24 @@ internal static class NoraSubscriptionStore
         return [primary, .. fallback];
     }
 
+    private static string XrayProtocolFamily(string protocol)
+        => protocol.Contains("VMESS", StringComparison.OrdinalIgnoreCase) ? "vmess" :
+           protocol.Contains("TROJAN", StringComparison.OrdinalIgnoreCase) ? "trojan" : "vless";
+
     public static string DescribeSubscriptionProtocol(NoraSubscriptionServer server)
     {
         var transport = NormalizeXrayNetwork(server.Network);
+        var protocol = server.Protocol.Contains("VMESS", StringComparison.OrdinalIgnoreCase) ? "VMess" :
+            server.Protocol.Contains("TROJAN", StringComparison.OrdinalIgnoreCase) ? "Trojan" : "VLESS";
         return transport switch
         {
-            "xhttp" => "VLESS · XHTTP",
-            "ws" => "VLESS · WebSocket",
-            "grpc" => "VLESS · gRPC",
-            "httpupgrade" => "VLESS · HTTPUpgrade",
-            "h2" or "http" => "VLESS · HTTP/2",
-            "raw" => "VLESS · RAW",
-            _ => "VLESS"
+            "xhttp" => protocol + " · XHTTP",
+            "ws" => protocol + " · WebSocket",
+            "grpc" => protocol + " · gRPC",
+            "httpupgrade" => protocol + " · HTTPUpgrade",
+            "h2" or "http" => protocol + " · HTTP/2",
+            "raw" => protocol + " · RAW",
+            _ => protocol
         };
     }
 
@@ -1499,7 +1536,8 @@ internal static class NoraSubscriptionStore
                 Security = "reality"
             };
             var named = new NoraSubscriptionServer { Id = "named", Name = "Netherlands", Protocol = "VLESS", Network = "xhttp" };
-            var failover = BuildAutomaticFailoverCandidates(primary, [primary, named, backup]);
+            var crossProtocolAuto = new NoraSubscriptionServer { Id = "vmess-auto", Name = "AUTO VMess", Protocol = "VMess", Network = "ws" };
+            var failover = BuildAutomaticFailoverCandidates(primary, [primary, named, backup, crossProtocolAuto]);
 
             const string unicodeTitle = "🍄 За грибами 🇳🇱";
             const string unicodeName = "🇷🇺 ВНИЗУ Обходы (4G/LTE) ⬇️";
@@ -1534,6 +1572,39 @@ internal static class NoraSubscriptionStore
             var persistedFixture = JsonSerializer.Deserialize<NoraSubscriptionInfo>(
                 JsonSerializer.Serialize(parsedFixture, JsonOptions), JsonOptions)
                 ?? throw new InvalidOperationException("The Unicode fixture did not survive JSON persistence.");
+
+            var vmessJson = """
+                {"v":"2","ps":"🇩🇪 VMess fixture","add":"198.51.100.31","port":"443","id":"66666666-6666-4666-8666-666666666666","aid":"0","scy":"auto","net":"ws","type":"none","host":"front.example","path":"/vmess","tls":"tls","sni":"vmess.example","fp":"chrome"}
+                """;
+            var vmessLink = "vmess://" + Convert.ToBase64String(Encoding.UTF8.GetBytes(vmessJson));
+            const string trojanLink = "trojan://fixture-password@198.51.100.32:443?security=tls&type=ws&host=front.example&path=%2Ftrojan&sni=trojan.example#%F0%9F%87%B3%F0%9F%87%B1%20Trojan%20fixture";
+            var alternateProtocols = ParsePayload(
+                vmessLink + "\n" + trojanLink,
+                "direct-protocol-fixture",
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+                _ => { });
+            var vmessConfigText = BuildXrayConfig(alternateProtocols.Servers.Single(server => server.Protocol.Contains("VMess", StringComparison.OrdinalIgnoreCase)));
+            var trojanConfigText = BuildXrayConfig(alternateProtocols.Servers.Single(server => server.Protocol.Contains("Trojan", StringComparison.OrdinalIgnoreCase)));
+            using var vmessConfig = JsonDocument.Parse(vmessConfigText);
+            using var trojanConfig = JsonDocument.Parse(trojanConfigText);
+            var alternateConfigsAccepted = ValidateXrayConfigSyntax(vmessConfigText) && ValidateXrayConfigSyntax(trojanConfigText);
+            const string multiVmessJson = """
+                {"remarks":"Multi VMess","outbounds":[
+                  {"protocol":"vmess","tag":"first","settings":{"vnext":[{"address":"198.51.100.41","port":443,"users":[{"id":"41414141-4141-4141-8141-414141414141","alterId":0,"security":"auto"}]}]},"streamSettings":{"network":"tcp","security":"none"}},
+                  {"protocol":"vmess","tag":"second","settings":{"vnext":[{"address":"198.51.100.42","port":8443,"users":[{"id":"42424242-4242-4242-8242-424242424242","alterId":0,"security":"auto"}]}]},"streamSettings":{"network":"tcp","security":"none"}}
+                ]}
+                """;
+            var multiVmess = ParsePayload(
+                multiVmessJson,
+                "multi-vmess-fixture",
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+                _ => { });
+            var selectedMultiEndpoints = multiVmess.Servers.Select(server =>
+            {
+                using var generated = JsonDocument.Parse(BuildXrayConfig(server));
+                return generated.RootElement.GetProperty("outbounds")[0].GetProperty("settings")
+                    .GetProperty("vnext")[0].GetProperty("address").GetString();
+            }).ToArray();
 
             var endpointPool = new[]
             {
@@ -1577,6 +1648,12 @@ internal static class NoraSubscriptionStore
                          pinnedPool.SequenceEqual(["198.51.100.44", "198.51.100.45"], StringComparer.Ordinal) &&
                          pinnedStrategy == "ForceIPv4" &&
                          tunConfig.RootElement.GetProperty("inbounds")[0].GetProperty("interface_name").GetString() == "NORA-Xray-X-selftest" &&
+                         alternateProtocols.Servers.Count == 2 &&
+                         alternateConfigsAccepted &&
+                         multiVmess.Servers.Count == 2 &&
+                         selectedMultiEndpoints.SequenceEqual(["198.51.100.41", "198.51.100.42"], StringComparer.Ordinal) &&
+                         vmessConfig.RootElement.GetProperty("outbounds")[0].GetProperty("protocol").GetString() == "vmess" &&
+                         trojanConfig.RootElement.GetProperty("outbounds")[0].GetProperty("protocol").GetString() == "trojan" &&
                          failover.Count == 2 && failover[0].Id == primary.Id && failover[1].Id == backup.Id &&
                          persistedFixture.Title == unicodeTitle &&
                           persistedFixture.Servers.Count == 6 &&
@@ -1588,7 +1665,7 @@ internal static class NoraSubscriptionStore
                           persistedFixture.Servers[4].Name == "🇬🇮 Gibraltar" &&
                           persistedFixture.Servers[5].Name == "🇬🇧 GB London";
             output.WriteLine(passed
-                ? "SUBSCRIPTION TRANSPORT SELF-TEST PASS: xhttp=preserved; provider-order=preserved; info-placeholders=deduped; named-routes=preserved; unicode=preserved"
+                ? "SUBSCRIPTION TRANSPORT SELF-TEST PASS: VLESS/VMess/Trojan configs valid; xhttp/provider-order/named-routes/unicode preserved"
                 : "SUBSCRIPTION TRANSPORT SELF-TEST FAIL");
             return passed ? 0 : 1;
         }
@@ -1749,8 +1826,7 @@ internal static class NoraSubscriptionStore
 
     private static void NormalizeServerPresentation(NoraSubscriptionServer server)
     {
-        if (!server.Protocol.Contains("VLESS", StringComparison.OrdinalIgnoreCase) &&
-            !server.Protocol.Equals("VLESS", StringComparison.OrdinalIgnoreCase))
+        if (!IsSupportedXrayProtocol(server.Protocol))
             return;
         server.Protocol = DescribeSubscriptionProtocol(server);
     }
@@ -1799,11 +1875,56 @@ internal static class NoraSubscriptionStore
         var parsedServerCount = sub.Servers.Count;
         sub.Servers = DeduplicateServers(sub.Servers).ToList();
         if (sub.Servers.Count == 0)
-            throw new NoraAppException("NORA-SUB-4003", "Subscription contains no supported VLESS servers.");
+            throw new NoraAppException("NORA-SUB-4003", "Subscription contains no supported VLESS, VMess or Trojan servers.");
         if (parsedServerCount != sub.Servers.Count)
             log($"Ignored {parsedServerCount - sub.Servers.Count} duplicate subscription server(s).");
         log($"Imported subscription `{sub.Title}` with {sub.Servers.Count} supported servers.");
         return sub;
+    }
+
+    private static bool ValidateXrayConfigSyntax(string json)
+    {
+        var executable = XrayPath();
+        if (!File.Exists(executable))
+            return false;
+        var path = Path.Combine(Path.GetTempPath(), "nora-xray-config-selftest-" + Guid.NewGuid().ToString("N") + ".json");
+        try
+        {
+            File.WriteAllText(path, json);
+            var start = new ProcessStartInfo(executable)
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            start.ArgumentList.Add("run");
+            start.ArgumentList.Add("-test");
+            start.ArgumentList.Add("-config");
+            start.ArgumentList.Add(path);
+            using var process = Process.Start(start);
+            if (process is null || !process.WaitForExit(10_000))
+            {
+                try { process?.Kill(entireProcessTree: true); } catch { }
+                return false;
+            }
+            return process.ExitCode == 0;
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    private static void ApplyPreferredTitle(NoraSubscriptionInfo subscription, string? preferredTitle)
+    {
+        if (string.IsNullOrWhiteSpace(preferredTitle))
+            return;
+        var title = preferredTitle.Trim();
+        subscription.Title = title;
+        subscription.DisplayNameOverride = title;
+        foreach (var server in subscription.Servers)
+            server.SubscriptionTitle = title;
     }
 
     private static IReadOnlyList<NoraSubscriptionServer> DeduplicateServers(IEnumerable<NoraSubscriptionServer> servers)
@@ -1843,7 +1964,7 @@ internal static class NoraSubscriptionStore
 
     internal static string RuntimeIdentity(NoraSubscriptionServer server)
     {
-        var outbound = ExtractVlessOutbound(server.RawConfigJson) ?? BuildXrayVlessOutbound(server);
+        var outbound = ExtractSupportedXrayOutbound(server.RawConfigJson, server.Protocol) ?? BuildXrayVlessOutbound(server);
         outbound["tag"] = "proxy";
         RemoveLocalInterfaceBindings(outbound);
         return CanonicalJson(outbound.ToJsonString()) + '\u001f' + RoutePolicyIdentity(server.RawConfigJson);
@@ -1925,7 +2046,15 @@ internal static class NoraSubscriptionStore
                 continue;
             foreach (var outbound in outbounds.EnumerateArray())
             {
-                if (!string.Equals(Str(outbound, "protocol"), "vless", StringComparison.OrdinalIgnoreCase))
+                var outboundProtocol = Str(outbound, "protocol");
+                if (outboundProtocol.Equals("vmess", StringComparison.OrdinalIgnoreCase) ||
+                    outboundProtocol.Equals("trojan", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (ParseXrayNonVlessOutbound(cfg, outbound, outboundProtocol.ToLowerInvariant(), title, index) is { } parsed)
+                        yield return parsed;
+                    continue;
+                }
+                if (!string.Equals(outboundProtocol, "vless", StringComparison.OrdinalIgnoreCase))
                     continue;
                 var settings = outbound.GetProperty("settings");
                 var modern = !settings.TryGetProperty("vnext", out var vnextArray);
@@ -1969,7 +2098,7 @@ internal static class NoraSubscriptionStore
                     InboundCount = CountArray(cfg, "inbounds"),
                     OutboundCount = CountArray(cfg, "outbounds"),
                     RuleCount = cfg.TryGetProperty("routing", out var routing) ? CountArray(routing, "rules") : 0,
-                    RawConfigJson = cfg.GetRawText()
+                    RawConfigJson = SelectedOutboundConfig(cfg, outbound)
                 };
             }
         }
@@ -1979,11 +2108,90 @@ internal static class NoraSubscriptionStore
     {
         foreach (var line in payload.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
-            if (!line.StartsWith("vless://", StringComparison.OrdinalIgnoreCase))
-                continue;
-            if (TryParseVlessUri(line, title, out var server))
+            if (TryParseShareUri(line, title, out var server))
                 yield return server;
         }
+    }
+
+    private static NoraSubscriptionServer? ParseXrayNonVlessOutbound(
+        JsonElement config,
+        JsonElement outbound,
+        string protocol,
+        string title,
+        int index)
+    {
+        try
+        {
+            var settings = outbound.GetProperty("settings");
+            var endpoint = protocol == "vmess"
+                ? settings.GetProperty("vnext")[0]
+                : settings.GetProperty("servers")[0];
+            var user = protocol == "vmess" ? endpoint.GetProperty("users")[0] : default;
+            var host = Str(endpoint, "address");
+            if (string.IsNullOrWhiteSpace(host))
+                return null;
+            var port = Int(endpoint, "port", 443);
+            var stream = outbound.TryGetProperty("streamSettings", out var streamSettings) ? streamSettings : default;
+            var tls = stream.ValueKind == JsonValueKind.Object && stream.TryGetProperty("tlsSettings", out var tlsSettings)
+                ? tlsSettings
+                : default;
+            var network = Str(stream, "network", "tcp");
+            var transport = TransportFields(stream, network);
+            var name = Str(config, "remarks");
+            if (string.IsNullOrWhiteSpace(name))
+                name = $"{title} #{index}";
+            return new NoraSubscriptionServer
+            {
+                Id = StableId(title + "|" + name + "|" + host + "|" + port),
+                Name = name,
+                Protocol = protocol == "vmess" ? "VMess" : "Trojan",
+                Host = host,
+                Port = port,
+                Country = GuessCountry(name, host),
+                Uuid = protocol == "vmess" ? Str(user, "id") : "",
+                Encryption = protocol == "vmess" ? Str(user, "security", "auto") : "none",
+                Network = network,
+                Security = Str(stream, "security", protocol == "trojan" ? "tls" : "none"),
+                Sni = Str(tls, "serverName"),
+                Fingerprint = Str(tls, "fingerprint", "chrome"),
+                HeaderType = transport.HeaderType,
+                HostHeader = transport.Host,
+                Path = transport.Path,
+                ServiceName = transport.ServiceName,
+                Mode = transport.Mode,
+                Authority = transport.Authority,
+                Alpn = JoinJsonArray(tls, "alpn"),
+                AllowInsecure = Bool(tls, "allowInsecure"),
+                XhttpExtraJson = transport.ExtraJson,
+                InboundCount = CountArray(config, "inbounds"),
+                OutboundCount = CountArray(config, "outbounds"),
+                RuleCount = config.TryGetProperty("routing", out var routing) ? CountArray(routing, "rules") : 0,
+                RawConfigJson = SelectedOutboundConfig(config, outbound)
+            };
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string SelectedOutboundConfig(JsonElement config, JsonElement outbound)
+    {
+        var root = JsonNode.Parse(config.GetRawText())?.AsObject() ?? new JsonObject();
+        root["outbounds"] = new JsonArray(JsonNode.Parse(outbound.GetRawText()));
+        return root.ToJsonString(JsonOptions);
+    }
+
+    private static bool TryParseShareUri(string link, string title, out NoraSubscriptionServer server)
+    {
+        if (link.StartsWith("vless://", StringComparison.OrdinalIgnoreCase))
+            return TryParseVlessUri(link, title, out server);
+        if (link.StartsWith("vmess://", StringComparison.OrdinalIgnoreCase))
+            return TryParseVmessUri(link, title, out server);
+        if (link.StartsWith("trojan://", StringComparison.OrdinalIgnoreCase))
+            return TryParseTrojanUri(link, title, out server);
+        server = new NoraSubscriptionServer();
+        return false;
     }
 
     private static IEnumerable<NoraSubscriptionServer> ParseClashYaml(string yaml, string title)
@@ -2110,6 +2318,141 @@ internal static class NoraSubscriptionStore
         }
     }
 
+    private static bool TryParseVmessUri(string link, string title, out NoraSubscriptionServer server)
+    {
+        server = new NoraSubscriptionServer();
+        try
+        {
+            var encoded = link["vmess://".Length..].Trim();
+            var json = TryDecodeBase64Text(encoded);
+            using var document = JsonDocument.Parse(json);
+            var root = document.RootElement;
+            var host = Str(root, "add");
+            var uuid = Str(root, "id");
+            if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(uuid))
+                return false;
+            var port = int.TryParse(Str(root, "port", "443"), out var parsedPort) ? parsedPort : 443;
+            var name = NormalizeUnicodeText(Str(root, "ps", $"{title} VMess"));
+            server = new NoraSubscriptionServer
+            {
+                Id = StableId(title + "|" + name + "|" + host + "|" + port),
+                Name = name,
+                Protocol = "VMess",
+                Host = host,
+                Port = port,
+                Country = GuessCountry(name, host),
+                Uuid = uuid,
+                Encryption = Str(root, "scy", "auto"),
+                Network = Str(root, "net", "tcp"),
+                Security = Str(root, "tls").Equals("tls", StringComparison.OrdinalIgnoreCase) ? "tls" : "none",
+                Sni = First(Str(root, "sni"), Str(root, "host")),
+                Fingerprint = Str(root, "fp", "chrome"),
+                HeaderType = Str(root, "type", "none"),
+                HostHeader = Str(root, "host"),
+                Path = Str(root, "path"),
+                Alpn = Str(root, "alpn"),
+                AllowInsecure = Str(root, "allowInsecure") is "1" or "true",
+                SourceLink = link
+            };
+            var alterId = int.TryParse(Str(root, "aid", "0"), out var parsedAlterId) ? parsedAlterId : 0;
+            server.RawConfigJson = WrapXrayOutbound(new JsonObject
+            {
+                ["protocol"] = "vmess",
+                ["settings"] = new JsonObject
+                {
+                    ["vnext"] = new JsonArray
+                    {
+                        new JsonObject
+                        {
+                            ["address"] = host,
+                            ["port"] = port,
+                            ["users"] = new JsonArray
+                            {
+                                new JsonObject
+                                {
+                                    ["id"] = uuid,
+                                    ["alterId"] = alterId,
+                                    ["security"] = string.IsNullOrWhiteSpace(server.Encryption) ? "auto" : server.Encryption
+                                }
+                            }
+                        }
+                    }
+                },
+                ["streamSettings"] = BuildXrayStreamSettings(server)
+            });
+            return true;
+        }
+        catch
+        {
+            server = new NoraSubscriptionServer();
+            return false;
+        }
+    }
+
+    private static bool TryParseTrojanUri(string link, string title, out NoraSubscriptionServer server)
+    {
+        server = new NoraSubscriptionServer();
+        try
+        {
+            var uri = new Uri(link);
+            var password = Uri.UnescapeDataString(uri.UserInfo);
+            if (string.IsNullOrWhiteSpace(uri.Host) || string.IsNullOrWhiteSpace(password))
+                return false;
+            var query = ParseQuery(uri.Query);
+            var name = DecodeUriText(uri.Fragment.TrimStart('#'));
+            if (string.IsNullOrWhiteSpace(name))
+                name = $"{title} Trojan";
+            var port = uri.Port > 0 ? uri.Port : 443;
+            server = new NoraSubscriptionServer
+            {
+                Id = StableId(title + "|" + name + "|" + uri.Host + "|" + port),
+                Name = name,
+                Protocol = "Trojan",
+                Host = uri.Host,
+                Port = port,
+                Country = GuessCountry(name, uri.Host),
+                Network = Get(query, "type", Get(query, "network", "tcp")),
+                Security = Get(query, "security", "tls"),
+                Sni = First(Get(query, "sni", ""), Get(query, "serverName", ""), uri.Host),
+                Fingerprint = Get(query, "fp", "chrome"),
+                HeaderType = Get(query, "headerType", Get(query, "header", "none")),
+                HostHeader = Get(query, "host", ""),
+                Path = Get(query, "path", ""),
+                ServiceName = First(Get(query, "serviceName", ""), Get(query, "service_name", "")),
+                Authority = Get(query, "authority", ""),
+                Alpn = Get(query, "alpn", ""),
+                AllowInsecure = Get(query, "allowInsecure", "0") is "1" or "true",
+                SourceLink = link
+            };
+            server.RawConfigJson = WrapXrayOutbound(new JsonObject
+            {
+                ["protocol"] = "trojan",
+                ["settings"] = new JsonObject
+                {
+                    ["servers"] = new JsonArray
+                    {
+                        new JsonObject
+                        {
+                            ["address"] = server.Host,
+                            ["port"] = server.Port,
+                            ["password"] = password
+                        }
+                    }
+                },
+                ["streamSettings"] = BuildXrayStreamSettings(server)
+            });
+            return true;
+        }
+        catch
+        {
+            server = new NoraSubscriptionServer();
+            return false;
+        }
+    }
+
+    private static string WrapXrayOutbound(JsonObject outbound)
+        => new JsonObject { ["outbounds"] = new JsonArray(outbound) }.ToJsonString(JsonOptions);
+
     private static bool IsVless(Dictionary<string, string> item)
         => string.Equals(Get(item, "type", ""), "vless", StringComparison.OrdinalIgnoreCase);
 
@@ -2205,9 +2548,6 @@ internal static class NoraSubscriptionStore
 
     private static string StableId(string value)
         => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)))[..16].ToLowerInvariant();
-
-    private static string TrimForError(string value)
-        => value.Trim().Length > 240 ? value.Trim()[..240] + "..." : value.Trim();
 
     private static int ParseInt(string value)
         => int.TryParse(value, out var parsed) ? parsed : 0;
@@ -2726,7 +3066,6 @@ internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<stri
     private int _socksPort;
     private readonly List<XrayEndpointBypass.RouteEntry> _endpointRoutes = [];
     private readonly TaskCompletionSource _xrayReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly TaskCompletionSource _tunReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource _exited = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public Task StartAsync(TimeSpan timeout) => StartAsync(timeout, CancellationToken.None);
@@ -2767,14 +3106,7 @@ internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<stri
         var xrayConfigPath = Path.Combine(dir, "xray-" + server.Id + ".json");
         _tunConfigPath = Path.Combine(dir, "xray-tun-" + server.Id + ".json");
         File.WriteAllText(xrayConfigPath, NoraSubscriptionStore.BuildXrayConfig(server, _socksPort, endpointAddresses: endpointAddresses));
-        // A per-session adapter name avoids Wintun's transient "already exists /
-        // element not found" state when a user switches servers immediately.
-        // Keep the NORA-Xray prefix so UI traffic sampling still resolves it.
-        var tunInterfaceName = "NORA-Xray-X-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture)[..8];
-        var tunConfig = discordMode
-            ? await NoraDiscordRouting.BuildForSocksAsync(_socksPort, cancellationToken).ConfigureAwait(false)
-            : NoraSubscriptionStore.BuildXrayTunFrontendConfig(_socksPort, server, tunInterfaceName);
-        File.WriteAllText(_tunConfigPath, tunConfig);
+        await WriteFreshTunFrontendConfigAsync(cancellationToken).ConfigureAwait(false);
         if (!IPAddress.TryParse(server.Host, out _))
             log($"[xray] endpoint DNS pool pinned: {endpointAddresses.Count} IPv4 address(es) for this session");
 
@@ -2882,6 +3214,28 @@ internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<stri
             throw new NoraAppException("NORA-XRY-3104", "Cannot start the Xray TUN frontend because the local Xray backend is not running.");
         cancellationToken.ThrowIfCancellationRequested();
 
+        await RunTunStartupWithRecoveryAsync(
+            timeout,
+            cancellationToken,
+            StartTunFrontendAttemptAsync,
+            async (_, remaining, token) =>
+            {
+                log("[xray-tun] Windows was still completing a TUN adapter registration; retrying once with a fresh adapter identity.");
+                await StopProcessAndWaitAsync(_tunFrontend, Min(remaining, TimeSpan.FromSeconds(3)));
+                _tunFrontend?.Dispose();
+                _tunFrontend = null;
+                if (remaining > TimeSpan.FromMilliseconds(400))
+                    await Task.Delay(TimeSpan.FromMilliseconds(400), token);
+                await WriteFreshTunFrontendConfigAsync(token).ConfigureAwait(false);
+            });
+    }
+
+    private async Task StartTunFrontendAttemptAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        if (_xray is null || _xray.HasExited || string.IsNullOrWhiteSpace(_tunConfigPath))
+            throw new NoraAppException("NORA-XRY-3104", "Cannot start the Xray TUN frontend because the local Xray backend is not running.");
+        cancellationToken.ThrowIfCancellationRequested();
+
         var singBoxExe = NoraSubscriptionStore.SingBoxPath();
 
         var tunPsi = new ProcessStartInfo(singBoxExe)
@@ -2896,25 +3250,77 @@ internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<stri
         tunPsi.ArgumentList.Add("-c");
         tunPsi.ArgumentList.Add(_tunConfigPath);
 
-        _tunFrontend = new Process { StartInfo = tunPsi, EnableRaisingEvents = true };
-        _tunFrontend.OutputDataReceived += (_, e) => HandleTunLine(e.Data);
-        _tunFrontend.ErrorDataReceived += (_, e) => HandleTunLine(e.Data);
-        _tunFrontend.Exited += (_, _) =>
+        var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stdoutClosed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stderrClosed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var process = new Process { StartInfo = tunPsi, EnableRaisingEvents = true };
+        _tunFrontend = process;
+        process.OutputDataReceived += (_, e) =>
         {
-            if (!_tunReady.Task.IsCompleted)
-                _tunReady.TrySetException(new NoraAppException("NORA-XRY-3104", "sing-box TUN frontend exited before it became ready"));
-            _exited.TrySetResult();
+            if (e.Data is null) stdoutClosed.TrySetResult();
+            else HandleTunLine(e.Data, ready);
         };
-        if (!_tunFrontend.Start())
+        process.ErrorDataReceived += (_, e) =>
+        {
+            if (e.Data is null) stderrClosed.TrySetResult();
+            else HandleTunLine(e.Data, ready);
+        };
+        if (!process.Start())
             throw new NoraAppException("NORA-XRY-3104", "Cannot start sing-box TUN frontend for Xray");
-        _tunFrontend.BeginOutputReadLine();
-        _tunFrontend.BeginErrorReadLine();
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+        _ = ObserveTunProcessExitAsync(process, ready, Task.WhenAll(stdoutClosed.Task, stderrClosed.Task), timeout);
         using var timeoutCts = new CancellationTokenSource(timeout);
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken);
         using var registration = linkedCts.Token.Register(() =>
-            _tunReady.TrySetException(new NoraAppException("NORA-XRY-3104", "Xray TUN frontend did not become ready in time")));
-        await _tunReady.Task;
+            ready.TrySetException(new NoraAppException("NORA-XRY-3104", "Xray TUN frontend did not become ready in time")));
+        await ready.Task;
         cancellationToken.ThrowIfCancellationRequested();
+    }
+
+    private async Task ObserveTunProcessExitAsync(
+        Process process,
+        TaskCompletionSource ready,
+        Task redirectedOutputClosed,
+        TimeSpan startupTimeout)
+    {
+        try
+        {
+            await process.WaitForExitAsync();
+            // DataReceived(null) is the authoritative redirected-stream EOF.
+            // Wait for both streams so the actual FATAL line cannot be masked
+            // by a generic process-exit error, while keeping startup bounded.
+            await CompleteTunExitAfterOutputAsync(ready, redirectedOutputClosed, startupTimeout);
+        }
+        catch
+        {
+            // Start/stop owns process errors; this observer only preserves the
+            // most useful startup diagnostic and unexpected-exit signal.
+        }
+
+        if (ready.Task.Status == TaskStatus.RanToCompletion)
+            _exited.TrySetResult();
+    }
+
+    private static async Task CompleteTunExitAfterOutputAsync(
+        TaskCompletionSource ready,
+        Task redirectedOutputClosed,
+        TimeSpan startupTimeout)
+    {
+        await Task.WhenAny(redirectedOutputClosed, Task.Delay(Min(startupTimeout, TimeSpan.FromSeconds(2))));
+        if (!ready.Task.IsCompleted)
+            ready.TrySetException(new NoraAppException("NORA-XRY-3104", "sing-box TUN frontend exited before it became ready"));
+    }
+
+    private async Task WriteFreshTunFrontendConfigAsync(CancellationToken cancellationToken)
+    {
+        // Wintun derives a stable adapter GUID from this name. A fresh name on
+        // every attempt avoids reopening a half-removed device instance.
+        var tunInterfaceName = "NORA-Xray-X-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture)[..8];
+        var tunConfig = discordMode
+            ? await NoraDiscordRouting.BuildForSocksAsync(_socksPort, cancellationToken).ConfigureAwait(false)
+            : NoraSubscriptionStore.BuildXrayTunFrontendConfig(_socksPort, server, tunInterfaceName);
+        File.WriteAllText(_tunConfigPath, tunConfig);
     }
 
     public async Task StopAsync(TimeSpan timeout)
@@ -2945,7 +3351,7 @@ internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<stri
             _xrayReady.TrySetResult();
     }
 
-    private void HandleTunLine(string? line)
+    private void HandleTunLine(string? line, TaskCompletionSource ready)
     {
         if (string.IsNullOrWhiteSpace(line))
             return;
@@ -2953,9 +3359,9 @@ internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<stri
         if (line.Contains("panic", StringComparison.OrdinalIgnoreCase) ||
             line.Contains("fatal", StringComparison.OrdinalIgnoreCase) ||
             line.Contains("access is denied", StringComparison.OrdinalIgnoreCase))
-            _tunReady.TrySetException(new NoraAppException("NORA-XRY-3104", line));
+            ready.TrySetException(new NoraAppException("NORA-XRY-3104", line));
         else if (line.Contains("started", StringComparison.OrdinalIgnoreCase))
-            _tunReady.TrySetResult();
+            ready.TrySetResult();
     }
 
     private static int GetFreeTcpPort()
@@ -2974,6 +3380,135 @@ internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<stri
 
     private static TimeSpan Remaining(TimeSpan timeout, TimeSpan elapsed)
         => timeout > elapsed ? timeout - elapsed : TimeSpan.Zero;
+
+    private static TimeSpan Min(TimeSpan left, TimeSpan cap)
+        => left < cap ? left : cap;
+
+    internal static bool IsTransientTunAdapterCollision(Exception exception)
+    {
+        var message = exception.GetBaseException().Message;
+        return message.Contains("create adapter", StringComparison.OrdinalIgnoreCase) &&
+               message.Contains("already exists", StringComparison.OrdinalIgnoreCase) &&
+               message.Contains("open existing adapter", StringComparison.OrdinalIgnoreCase) &&
+               message.Contains("element not found", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static async Task RunTunStartupWithRecoveryAsync(
+        TimeSpan timeout,
+        CancellationToken cancellationToken,
+        Func<TimeSpan, CancellationToken, Task> startAttempt,
+        Func<int, TimeSpan, CancellationToken, Task> recover)
+    {
+        const int maxAttempts = 2;
+        var stopwatch = Stopwatch.StartNew();
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                await startAttempt(Remaining(timeout, stopwatch.Elapsed), cancellationToken);
+                return;
+            }
+            catch (Exception exception) when (attempt < maxAttempts &&
+                                              IsTransientTunAdapterCollision(exception) &&
+                                              Remaining(timeout, stopwatch.Elapsed) > TimeSpan.Zero)
+            {
+                await recover(attempt, Remaining(timeout, stopwatch.Elapsed), cancellationToken);
+            }
+        }
+        throw new InvalidOperationException("The bounded Xray TUN startup loop completed without a result.");
+    }
+
+    internal static int RunTunRecoverySelfTest(TextWriter output)
+    {
+        const string collision = "FATAL start inbound/tun[tun-in]: configure tun interface: " +
+                                 "(create adapter: Cannot create a file when that file already exists. | " +
+                                 "open existing adapter: Element not found.)";
+        try
+        {
+            var attempts = 0;
+            var recoveries = 0;
+            RunTunStartupWithRecoveryAsync(
+                TimeSpan.FromSeconds(2),
+                CancellationToken.None,
+                (_, _) => ++attempts == 1
+                    ? Task.FromException(new NoraAppException("NORA-XRY-3104", collision))
+                    : Task.CompletedTask,
+                (_, _, _) =>
+                {
+                    recoveries++;
+                    return Task.CompletedTask;
+                }).GetAwaiter().GetResult();
+
+            var permanentAttempts = 0;
+            var permanentFailed = false;
+            try
+            {
+                RunTunStartupWithRecoveryAsync(
+                    TimeSpan.FromSeconds(2),
+                    CancellationToken.None,
+                    (_, _) =>
+                    {
+                        permanentAttempts++;
+                        return Task.FromException(new NoraAppException("NORA-XRY-3104", "FATAL access is denied"));
+                    },
+                    (_, _, _) => Task.CompletedTask).GetAwaiter().GetResult();
+            }
+            catch (NoraAppException)
+            {
+                permanentFailed = true;
+            }
+
+            var boundedAttempts = 0;
+            var boundedRecoveries = 0;
+            var boundedFailed = false;
+            try
+            {
+                RunTunStartupWithRecoveryAsync(
+                    TimeSpan.FromSeconds(2),
+                    CancellationToken.None,
+                    (_, _) =>
+                    {
+                        boundedAttempts++;
+                        return Task.FromException(new NoraAppException("NORA-XRY-3104", collision));
+                    },
+                    (_, _, _) =>
+                    {
+                        boundedRecoveries++;
+                        return Task.CompletedTask;
+                    }).GetAwaiter().GetResult();
+            }
+            catch (NoraAppException)
+            {
+                boundedFailed = true;
+            }
+
+            var passed = IsTransientTunAdapterCollision(new NoraAppException("NORA-XRY-3104", collision)) &&
+                         attempts == 2 && recoveries == 1 &&
+                         permanentFailed && permanentAttempts == 1 &&
+                         boundedFailed && boundedAttempts == 2 && boundedRecoveries == 1;
+
+            var redirectedReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var redirectedOutput = Task.Run(async () =>
+            {
+                await Task.Delay(30);
+                redirectedReady.TrySetException(new NoraAppException("NORA-XRY-3104", collision));
+            });
+            CompleteTunExitAfterOutputAsync(redirectedReady, redirectedOutput, TimeSpan.FromSeconds(1)).GetAwaiter().GetResult();
+            var redirectedErrorPreserved = redirectedReady.Task.Exception is { } redirectedException &&
+                                           IsTransientTunAdapterCollision(redirectedException);
+            passed &= redirectedErrorPreserved;
+            output.WriteLine(passed
+                ? "XRAY TUN RECOVERY SELF-TEST PASS: exact collision retried once; redirected FATAL preserved; permanent errors not retried; retry count bounded"
+                : "XRAY TUN RECOVERY SELF-TEST FAIL");
+            return passed ? 0 : 1;
+        }
+        catch (Exception exception)
+        {
+            output.WriteLine("XRAY TUN RECOVERY SELF-TEST FAIL: " + exception.GetBaseException().Message);
+            return 1;
+        }
+    }
 
     private static async Task StopProcessAndWaitAsync(Process? process, TimeSpan timeout)
     {

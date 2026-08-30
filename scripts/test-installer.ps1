@@ -32,6 +32,7 @@ if ($VisualQa) {
     $desktopShortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) "NORA VPN.lnk"
     $startShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\NORA VPN\NORA VPN.lnk"
     $uninstallKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{8A238707-9865-442C-8862-A39D3ED80518}_is1"
+    $protocolCommandKey = "HKCU:\Software\Classes\noravpn-installer-qa\shell\open\command"
 }
 else {
     $installDir = "C:\Program Files\NORA VPN"
@@ -39,6 +40,7 @@ else {
     $desktopShortcut = "C:\Users\Public\Desktop\NORA VPN.lnk"
     $startShortcut = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\NORA VPN\NORA VPN.lnk"
     $uninstallKey = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{7CBB6718-2B47-4EFC-9DE7-726C494E611A}_is1"
+    $protocolCommandKey = "HKLM:\Software\Classes\noravpn\shell\open\command"
 }
 
 function Run-Setup([string]$path, [string[]]$arguments) {
@@ -70,11 +72,15 @@ function Assert-Sentinels([System.Collections.IDictionary]$expected, [string]$st
     }
 }
 
-function Assert-Installed([string]$stage) {
+function Assert-Installed([string]$stage, [bool]$expectProtocol = $true) {
     foreach ($path in @((Join-Path $installDir "NoraVPN.exe"), $desktopShortcut, $startShortcut)) {
         if (-not (Test-Path -LiteralPath $path)) { throw "Missing installed artifact during ${stage}: $path" }
     }
     if (-not (Test-Path -LiteralPath $uninstallKey)) { throw "Missing uninstall registry entry during $stage." }
+    if (-not $expectProtocol) { return }
+    if (-not (Test-Path -LiteralPath $protocolCommandKey)) { throw "Missing NORA URL protocol registration during $stage." }
+    $protocolCommand = (Get-Item -LiteralPath $protocolCommandKey).GetValue("")
+    if ($protocolCommand -notlike "*NoraVPN.exe*%1*") { throw "Invalid NORA URL protocol command during ${stage}: $protocolCommand" }
 }
 
 if (Test-Path -LiteralPath $dataRoot) { throw "Sandbox data root is not clean: $dataRoot" }
@@ -82,7 +88,7 @@ if (Test-Path -LiteralPath $uninstallKey) { throw "Sandbox already contains a NO
 
 [System.IO.Directory]::CreateDirectory($dataRoot) | Out-Null
 Add-Sentinel "premium.dat" ([Security.Cryptography.RandomNumberGenerator]::GetBytes(521))
-Add-Sentinel "appearance.json" ([Text.Encoding]::UTF8.GetBytes('{"slideshow":true,"sentinel":"premium-appearance"}'))
+Add-Sentinel "appearance.json" ([Text.Encoding]::UTF8.GetBytes('{"slideshow":true,"sentinel":"appearance-preference"}'))
 Add-Sentinel "subscriptions\provider\subscription.json" ([Text.Encoding]::UTF8.GetBytes('{"sentinel":"subscription-order-and-servers"}'))
 Add-Sentinel "profiles\krot\client-profile.json" ([Text.Encoding]::UTF8.GetBytes('{"sentinel":"krot-profile"}'))
 Add-Sentinel "external-profiles\fixture.json" ([Text.Encoding]::UTF8.GetBytes('{"sentinel":"external-profile"}'))
@@ -94,7 +100,7 @@ $expected = Snapshot-Sentinels
 
 $installArgs = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/TASKS="desktopicon"', "/DIR=`"$installDir`"")
 Run-Setup $baseInstaller $installArgs
-Assert-Installed "clean install"
+Assert-Installed "clean install" $false
 Assert-Sentinels $expected "clean install"
 
 $legacyProfile = Join-Path $installDir "client-profile.json"
@@ -119,6 +125,7 @@ if (-not $uninstaller) { throw "Uninstaller was not created." }
 Run-Setup $uninstaller.FullName @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
 Assert-Sentinels $expected "default uninstall"
 if (-not (Test-Path -LiteralPath $legacyProfile)) { throw "Default uninstall removed the user-owned legacy profile." }
+if (Test-Path -LiteralPath $protocolCommandKey) { throw "Default uninstall left the NORA URL protocol registered." }
 
 Run-Setup $upgradeInstaller $installArgs
 Assert-Installed "reinstall"
@@ -133,7 +140,7 @@ $result = [ordered]@{
     cleanInstall = $true
     upgrade = $true
     repair = $true
-    premiumPreserved = $true
+    legacyActivationStatePreserved = $true
     subscriptionsPreserved = $true
     selectedServerPreserved = $true
     preferencesPreserved = $true
@@ -141,6 +148,7 @@ $result = [ordered]@{
     explicitPurgeDeletedData = $true
     legacyPortableProfilePreserved = $true
     staleInstanceMarkerIgnored = $true
+    deepLinkProtocolLifecycle = $true
 }
 [System.IO.File]::WriteAllText($ResultPath, ($result | ConvertTo-Json -Depth 4))
-Write-Host "INSTALLER LIFECYCLE QA PASS: clean install, stale-marker recovery, upgrade, repair, Premium/subscription/settings preservation, keep-data uninstall, explicit purge"
+Write-Host "INSTALLER LIFECYCLE QA PASS: clean install, stale-marker recovery, upgrade, repair, legacy activation/subscription/settings preservation, keep-data uninstall, explicit purge"

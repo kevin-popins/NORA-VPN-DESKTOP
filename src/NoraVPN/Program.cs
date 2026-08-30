@@ -35,6 +35,15 @@ internal static class Program
         if (args.Length == 1 && args[0].Equals("discord-routing-selftest", StringComparison.OrdinalIgnoreCase))
             return NoraDiscordRouting.RunSelfTest(Console.Out);
 
+        if (args.Length == 1 && args[0].Equals("deep-link-selftest", StringComparison.OrdinalIgnoreCase))
+            return NoraDeepLinkParser.RunSelfTest(Console.Out);
+
+        if (args.Length == 1 && args[0].Equals("update-selftest", StringComparison.OrdinalIgnoreCase))
+            return NoraUpdateService.RunSelfTest(Console.Out);
+
+        if (args.Length == 1 && args[0].Equals("xray-tun-recovery-selftest", StringComparison.OrdinalIgnoreCase))
+            return XrayCoreProcess.RunTunRecoverySelfTest(Console.Out);
+
         if (args.Length == 1 && args[0].Equals("shutdown-for-update", StringComparison.OrdinalIgnoreCase))
         {
             if (!NvpClient.IsAdministrator())
@@ -43,6 +52,39 @@ internal static class Program
                 return 5;
             }
             return NoraSingleInstance.TryShutdownExisting(TimeSpan.FromSeconds(35), Console.Error) ? 0 : 6;
+        }
+#endif
+
+#if WINDOWS
+        if (args.Length == 1 && NoraDeepLinkParser.LooksLikeDeepLink(args[0]))
+        {
+            try
+            {
+                // Persist only the validated, DPAPI-protected import request.
+                // This avoids exposing profile material in logs or forwarding it
+                // through a cross-integrity window message.
+                NoraDeepLinkQueue.Enqueue(args[0]);
+            }
+            catch (Exception exception)
+            {
+                var incident = NoraErrors.Classify(NoraOperation.ImportProfile, exception);
+                try
+                {
+                    System.Windows.Forms.MessageBox.Show(
+                        $"{incident.Message}\n\nWhat to do: Check the NORA import link and try again.\n\nError code: {incident.Code}",
+                        "NORA link could not be opened",
+                        System.Windows.Forms.MessageBoxButtons.OK,
+                        System.Windows.Forms.MessageBoxIcon.Warning);
+                }
+                catch { }
+                return 1;
+            }
+
+            if (NoraSingleInstance.TryActivateExisting(TimeSpan.FromSeconds(2)))
+                return 0;
+            if (!NvpClient.IsAdministrator())
+                return RelaunchElevatedGui();
+            return RunGuiSingleInstance();
         }
 #endif
 
@@ -274,6 +316,16 @@ internal static class Program
 #endif
         }
 
+        if (args.Length == 1 && args[0].Equals("appearance-availability-selftest", StringComparison.OrdinalIgnoreCase))
+        {
+#if WINDOWS
+            return NoraPremiumService.RunAvailabilitySelfTest(Console.Out);
+#else
+            Console.Error.WriteLine("Appearance availability self-test is only available in the Windows client build.");
+            return 2;
+#endif
+        }
+
         if (args.Length == 1 && args[0].Equals("ui-icon-selftest", StringComparison.OrdinalIgnoreCase))
         {
 #if WINDOWS
@@ -377,9 +429,13 @@ internal static class Program
             Console.WriteLine("  nvp subscription-transport-selftest");
             Console.WriteLine("  nvp subscription-order-selftest");
             Console.WriteLine("  nvp subscription-refresh-selftest");
+            Console.WriteLine("  nvp deep-link-selftest");
+            Console.WriteLine("  nvp update-selftest");
+            Console.WriteLine("  nvp xray-tun-recovery-selftest");
             Console.WriteLine("  nvp country-flag-selftest");
             Console.WriteLine("  nvp location-artwork-selftest");
             Console.WriteLine("  nvp ui-preferences-selftest");
+            Console.WriteLine("  nvp appearance-availability-selftest");
             Console.WriteLine("  nvp ui-icon-selftest");
             Console.WriteLine("  nvp direct-latency-selftest");
             Console.WriteLine("  nvp audio-capture-smoke");

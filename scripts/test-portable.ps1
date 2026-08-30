@@ -36,6 +36,9 @@ $required = @(
     "assets\locations\Sweden1.png",
     "assets\locations\Sweden2.png",
     "assets\locations\Sweden3.png",
+    "assets\locations\Bulgaria1.png",
+    "assets\locations\Bulgaria2.png",
+    "assets\locations\Bulgaria3.png",
     "assets\locations\India1.png",
     "assets\locations\India2.png",
     "assets\locations\India3.png",
@@ -110,7 +113,7 @@ if ($LASTEXITCODE -ne 0) {
 $isAdministrator = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($isAdministrator) {
-    foreach ($selfTestName in @("subscription-transport-selftest", "subscription-order-selftest", "subscription-refresh-selftest", "country-flag-selftest", "location-artwork-selftest", "ui-preferences-selftest", "ui-icon-selftest", "discord-routing-selftest")) {
+    foreach ($selfTestName in @("subscription-transport-selftest", "subscription-order-selftest", "subscription-refresh-selftest", "deep-link-selftest", "update-selftest", "country-flag-selftest", "location-artwork-selftest", "ui-preferences-selftest", "appearance-availability-selftest", "ui-icon-selftest", "discord-routing-selftest", "xray-tun-recovery-selftest")) {
         $selfTest = Start-Process -FilePath (Join-Path $root "NoraVPN.exe") -ArgumentList @($selfTestName) -WorkingDirectory $root -WindowStyle Hidden -Wait -PassThru
         if ($selfTest.ExitCode -ne 0) {
             throw "$selfTestName failed with exit code $($selfTest.ExitCode)"
@@ -122,7 +125,7 @@ else {
     if (-not (Test-Path -LiteralPath $buildDll)) {
         throw "Non-elevated portable verification requires the Release build output: $buildDll"
     }
-    foreach ($selfTestName in @("subscription-transport-selftest", "subscription-order-selftest", "subscription-refresh-selftest", "country-flag-selftest", "location-artwork-selftest", "ui-preferences-selftest", "ui-icon-selftest", "discord-routing-selftest")) {
+    foreach ($selfTestName in @("subscription-transport-selftest", "subscription-order-selftest", "subscription-refresh-selftest", "deep-link-selftest", "update-selftest", "country-flag-selftest", "location-artwork-selftest", "ui-preferences-selftest", "appearance-availability-selftest", "ui-icon-selftest", "discord-routing-selftest", "xray-tun-recovery-selftest")) {
         dotnet $buildDll $selfTestName
         if ($LASTEXITCODE -ne 0) {
             throw "$selfTestName failed from Release build output with exit code $LASTEXITCODE"

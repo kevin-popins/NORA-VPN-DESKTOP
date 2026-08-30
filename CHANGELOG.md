@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.0-pre.6 — 2026-08-30
+
+- Added Windows deep links for importing subscriptions and profiles.
+- Made all appearance features available to every user and added direct access to the official NORA VPN bot.
+- Added Bulgaria active-server backgrounds and clarified update mode in Setup.
+- Added a non-blocking application update check and improved Windows TUN startup recovery.
+
 ## 0.1.0-pre.5 — 2026-08-15
 
 - Prevented a transient Windows TUN adapter collision when switching VLESS servers, including while Discord Mode is active.

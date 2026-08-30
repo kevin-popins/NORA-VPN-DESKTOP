@@ -63,7 +63,11 @@ internal sealed record NoraErrorIncident(
             sanitized,
             @"(?i)\b(password|privatekey|presharedkey|credential_key|credentialkey|authorization)\s*[:=]\s*[^\s,;]+",
             "$1=<redacted>");
-        sanitized = Regex.Replace(sanitized, @"(?i)\b(?:nora1\.[A-Za-z0-9_-]+|vless://\S+)", "<redacted-key>");
+        sanitized = Regex.Replace(sanitized, @"(?i)\b(?:nora1\.[A-Za-z0-9_-]+|(?:vless|vmess|trojan|ss|happ)://\S+)", "<redacted-key>");
+        sanitized = Regex.Replace(
+            sanitized,
+            @"(?i)([?&](?:token|key|secret|auth|authorization|access_token|code)=)[^&\s]+",
+            "$1<redacted>");
         return sanitized.Length <= 1200 ? sanitized : sanitized[..1200] + "...";
     }
 }

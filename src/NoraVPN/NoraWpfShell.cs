@@ -203,6 +203,11 @@ internal static class NoraWpfShell
             "dialog-tray-notice" => new NoraTrayNoticeWindow(),
             "dialog-tray-notice-checked" => new NoraTrayNoticeWindow(previewChecked: true),
             "dialog-tray-notice-error" => new NoraTrayNoticeWindow(previewSaveError: true),
+            "dialog-update" => CreateUpdateAvailablePreview(),
+            "dialog-deep-link" => new NoraDeepLinkConfirmWindow(new NoraDeepLinkRequest(
+                NoraDeepLinkKind.Subscription,
+                "https://subscriptions.example.test/nora",
+                "My NORA subscription")),
             _ => new NoraWpfWindow(enableTray: false)
         };
         window.WindowStartupLocation = WindowStartupLocation.Manual;
@@ -264,6 +269,15 @@ internal static class NoraWpfShell
             "A required routing component is missing. Restore the complete NORA portable folder and try again.");
         return window;
     }
+
+    private static Window CreateUpdateAvailablePreview()
+        => new NoraUpdateAvailableWindow(new NoraUpdateInfo(
+            "0.1.0-pre.7",
+            new Uri("https://github.com/kevin-popins/NORA-VPN-DESKTOP/releases/tag/0.1.0-pre.7"),
+            new Uri("https://github.com/kevin-popins/NORA-VPN-DESKTOP/releases/download/0.1.0-pre.7/NORA-VPN-Setup-v0.1.0-pre.7-win-x64.exe"),
+            "NORA-VPN-Setup-v0.1.0-pre.7-win-x64.exe",
+            240_000_000,
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
 
     public static int RunTraySmoke(string outputPath)
     {
@@ -597,6 +611,7 @@ internal static class NoraWindowScalePolicy
 
 internal sealed class NoraWpfWindow : Window
 {
+    private const string OfficialVpnBotUrl = "https://t.me/noravpnrobertsonbot";
     private enum PageKind { Home, Servers, Add, Users, Logs, Settings, VoiceMode }
     private enum TunnelState { Ready, Connecting, Connected, Disconnecting, Failed }
     private static readonly Color DiscordModeAccent = Color.FromRgb(0x58, 0x65, 0xF2);
@@ -693,16 +708,17 @@ internal sealed class NoraWpfWindow : Window
     private string _expandedSubscriptionId = "";
     private readonly HashSet<string> _refreshingManagedServers = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTimeOffset> _lastManagedRefresh = new(StringComparer.OrdinalIgnoreCase);
+    private readonly SemaphoreSlim _deepLinkImportGate = new(1, 1);
     private int _toastSequence;
     private string _lastToastText = "";
     private DateTimeOffset _lastToastAt;
-    private string _pendingPremiumFeature = "";
     private readonly bool _trayEnabled;
     private FormsNotifyIcon? _trayIcon;
     private IntPtr _taskbarIconHandle;
     private bool _exitRequested;
     private bool _exitInProgress;
     private ServerInfo? _snapshotServerInfo;
+    private NoraUpdateAvailableWindow? _updateWindow;
 
     public NoraWpfWindow(bool enableTray = true)
     {
@@ -737,7 +753,11 @@ internal sealed class NoraWpfWindow : Window
             NoraSingleInstance.PublishWindow(hwnd);
             ApplyWindowScale();
         };
-        Loaded += (_, _) => ApplyWindowScale();
+        Loaded += async (_, _) =>
+        {
+            ApplyWindowScale();
+            await ProcessPendingDeepLinksAsync();
+        };
         LocationChanged += (_, _) => QueueScaleRefresh();
 
         _shellCanvas = BuildShell();
@@ -852,21 +872,6 @@ internal sealed class NoraWpfWindow : Window
                     graph.SetTraffic(_trafficUpRate, _trafficDownRate, (long)_trafficUpBytes, (long)_trafficDownBytes, _connectedFor.Elapsed);
             }
         };
-        Loaded += async (_, _) =>
-        {
-            // Snapshot rendering must stay deterministic: an online refresh can
-            // otherwise rebuild the page in the middle of RenderTargetBitmap.
-            if (string.Equals(Environment.GetEnvironmentVariable("NORA_GUI_VISUAL_READY"), "1", StringComparison.Ordinal))
-                return;
-            var wasPremium = NoraPremiumService.IsPremium;
-            var hadEqualizer = NoraPremiumService.EqualizerEffective;
-            var hadSlideshow = NoraPremiumService.ServerSlideshowEffective;
-            await NoraPremiumService.RefreshAsync();
-            if (wasPremium != NoraPremiumService.IsPremium ||
-                hadEqualizer != NoraPremiumService.EqualizerEffective ||
-                hadSlideshow != NoraPremiumService.ServerSlideshowEffective)
-                RenderPage(_page);
-        };
         Loaded += (_, _) =>
         {
             // Preview/snapshot modes must stay offline and deterministic. A real
@@ -874,6 +879,14 @@ internal sealed class NoraWpfWindow : Window
             if (_trayEnabled &&
                 !string.Equals(Environment.GetEnvironmentVariable("NORA_GUI_VISUAL_READY"), "1", StringComparison.Ordinal))
                 _subscriptionRefreshScheduler.Start();
+        };
+        Loaded += (_, _) =>
+        {
+            // The release lookup is fire-and-forget and starts only after the
+            // usable window is already visible. Network failure remains silent.
+            if (_trayEnabled &&
+                !string.Equals(Environment.GetEnvironmentVariable("NORA_GUI_VISUAL_READY"), "1", StringComparison.Ordinal))
+                _ = CheckForApplicationUpdateAsync();
         };
         _clock.Start();
         _ = NoraNetworkInterfaceCache.WarmAsync();
@@ -1195,7 +1208,11 @@ internal sealed class NoraWpfWindow : Window
         if (message == NoraSingleInstance.ActivationMessage)
         {
             handled = true;
-            Dispatcher.BeginInvoke(DispatcherPriority.Send, new Action(ShowFromTray));
+            Dispatcher.BeginInvoke(DispatcherPriority.Send, new Action(async () =>
+            {
+                ShowFromTray();
+                await ProcessPendingDeepLinksAsync();
+            }));
             return IntPtr.Zero;
         }
         if (message == NoraSingleInstance.ShutdownMessage)
@@ -1819,7 +1836,7 @@ internal sealed class NoraWpfWindow : Window
             Height = 44,
             HorizontalAlignment = HorizontalAlignment.Right,
             VerticalAlignment = VerticalAlignment.Top,
-            Content = new NoraIcon { Kind = NoraIconKind.Sliders, Width = 22, Height = 22, Stroke = NoraWpfTheme.Brush(Color.FromRgb(181, 190, 204)) },
+            Content = new NoraIcon { Kind = NoraIconKind.Settings, Width = 22, Height = 22, Stroke = NoraWpfTheme.Brush(Color.FromRgb(181, 190, 204)) },
             ToolTip = "Appearance settings"
         };
         settingsButton.Click += (_, _) => RenderPage(PageKind.Settings);
@@ -2486,7 +2503,7 @@ internal sealed class NoraWpfWindow : Window
         var sheet = new Border
         {
             CornerRadius = new CornerRadius(24),
-            Background = NoraWpfTheme.Brush(Color.FromArgb(248, 12, 16, 23)),
+            Background = NoraWpfTheme.Brush(Color.FromRgb(12, 16, 23)),
             BorderBrush = NoraWpfTheme.Brush(Color.FromArgb(126, 255, 156, 38)),
             BorderThickness = new Thickness(1),
             Padding = new Thickness(22),
@@ -2507,7 +2524,7 @@ internal sealed class NoraWpfWindow : Window
         });
         body.Children.Add(new TextBlock
         {
-            Text = "We do not sell VPN subscriptions, issue access keys, or host public VPN servers. To start using NORA, you need valid connection data: a subscription link, a configuration file, an access key, or access to your own server. Once you have it, add it to the app and connect securely.",
+            Text = "NORA is the client that connects using valid connection data: a subscription link, configuration file, access key, or your own server. You can import access you already have or get the official NORA VPN from our Telegram bot.",
             FontSize = 14,
             LineHeight = 21,
             TextWrapping = TextWrapping.Wrap,
@@ -2515,13 +2532,14 @@ internal sealed class NoraWpfWindow : Window
             Margin = new Thickness(0, 12, 0, 18)
         });
 
-        var gotIt = new NoraFxButton(NoraWpfTheme.Orange, NoraWpfTheme.Orange2, 16, accent: true)
+        var buy = new NoraFxButton(NoraWpfTheme.Orange, NoraWpfTheme.Orange2, 16, accent: true)
         {
             Height = 48,
-            Content = new TextBlock { Text = "Got it", FontSize = 15, FontWeight = FontWeights.Bold, Foreground = NoraWpfTheme.BgBrush, HorizontalAlignment = HorizontalAlignment.Center }
+            Content = new TextBlock { Text = "Buy official VPN", FontSize = 15, FontWeight = FontWeights.Bold, Foreground = NoraWpfTheme.BgBrush, HorizontalAlignment = HorizontalAlignment.Center },
+            ToolTip = "Open @noravpnrobertsonbot in Telegram"
         };
-        gotIt.Click += (_, _) => overlayHost.Children.Remove(overlay);
-        body.Children.Add(gotIt);
+        buy.Click += (_, _) => OpenOfficialVpnBot();
+        body.Children.Add(buy);
 
         var import = new NoraFxButton(Colors.Transparent, Color.FromArgb(24, 255, 156, 38), 16, accent: false, stroke: Brushes.Transparent)
         {
@@ -2536,6 +2554,15 @@ internal sealed class NoraWpfWindow : Window
         };
         body.Children.Add(import);
 
+        var gotIt = new NoraFxButton(Colors.Transparent, Color.FromArgb(20, 255, 255, 255), 16, accent: false, stroke: Brushes.Transparent)
+        {
+            Height = 38,
+            Margin = new Thickness(0, 2, 0, 0),
+            Content = new TextBlock { Text = "Not now", FontSize = 13, FontWeight = FontWeights.SemiBold, Foreground = NoraWpfTheme.MutedBrush, HorizontalAlignment = HorizontalAlignment.Center }
+        };
+        gotIt.Click += (_, _) => overlayHost.Children.Remove(overlay);
+        body.Children.Add(gotIt);
+
         overlayHost.Children.Add(overlay);
         if (!NoraWpfTheme.MotionEnabled)
             return;
@@ -2549,6 +2576,46 @@ internal sealed class NoraWpfWindow : Window
         scale.BeginAnimation(ScaleTransform.ScaleXProperty, DoubleTo(1, 220));
         scale.BeginAnimation(ScaleTransform.ScaleYProperty, DoubleTo(1, 220));
         shift.BeginAnimation(TranslateTransform.YProperty, DoubleTo(0, 220));
+    }
+
+    private void OpenOfficialVpnBot()
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo(OfficialVpnBotUrl) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            AppendLog("Could not open the official VPN bot: " + ex.Message);
+            ShowToast("Could not open Telegram", "Open @noravpnrobertsonbot in Telegram.", ToastKind.Error);
+        }
+    }
+
+    private async Task CheckForApplicationUpdateAsync()
+    {
+        try
+        {
+            await Task.Delay(700);
+            var update = await NoraUpdateService.CheckAsync();
+            if (update is null ||
+                string.Equals(NoraUiPreferences.SkippedUpdateVersion, update.Version, StringComparison.OrdinalIgnoreCase) ||
+                !IsLoaded || Dispatcher.HasShutdownStarted)
+                return;
+            ShowAvailableUpdate(update);
+        }
+        catch (Exception exception)
+        {
+            AppendLog("Update check unavailable: " + exception.GetBaseException().Message);
+        }
+    }
+
+    private void ShowAvailableUpdate(NoraUpdateInfo update)
+    {
+        if (_updateWindow is not null)
+            return;
+        _updateWindow = new NoraUpdateAvailableWindow(update) { Owner = this };
+        _updateWindow.Closed += (_, _) => _updateWindow = null;
+        _updateWindow.Show();
     }
 
     private void ConfigureHomeAtmosphere()
@@ -2959,6 +3026,7 @@ internal sealed class NoraWpfWindow : Window
                      ("Poland", ["poland", "polska", "польша", "warsaw", "варшава"]),
                      ("Latvia", ["latvia", "латвия", "riga", "рига"]),
                      ("Sweden", ["sweden", "швеция", "stockholm", "стокгольм"]),
+                     ("Bulgaria", ["bulgaria", "българия", "болгария", "sofia", "софия"]),
                      ("India", ["india", "индия"]),
                      ("KZ", ["kazakhstan", "казахстан"]),
                      ("TR", ["turkey", "türkiye", "turkiye", "турция"]),
@@ -3002,6 +3070,7 @@ internal sealed class NoraWpfWindow : Window
             "poland" or "polska" or "польша" => "Poland",
             "latvia" or "латвия" or "riga" or "рига" => "Latvia",
             "sweden" or "швеция" or "stockholm" or "стокгольм" => "Sweden",
+            "bulgaria" or "българия" or "болгария" or "sofia" or "софия" or "bg" => "Bulgaria",
             "india" or "индия" => "India",
             "kazakhstan" or "казахстан" or "kz" => "KZ",
             "turkey" or "türkiye" or "turkiye" or "турция" or "tr" => "TR",
@@ -3081,6 +3150,8 @@ internal sealed class NoraWpfWindow : Window
                 ResolveLocationArtworkKey("Польша", "Unknown") == "Poland" &&
                 ResolveLocationArtworkKey("EU Latvia", "EU") == "Latvia" &&
                 ResolveLocationArtworkKey("Швеция", "Unknown") == "Sweden" &&
+                ResolveLocationArtworkKey("EU Bulgaria · Sofia", "EU") == "Bulgaria" &&
+                ResolveLocationArtworkKey("Болгария", "Unknown") == "Bulgaria" &&
                 ResolveLocationArtworkKey("India", "Unknown") == "India" &&
                 ResolveLocationArtworkKey("Kazakhstan", "Unknown") == "KZ" &&
                 ResolveLocationArtworkKey("Turkey", "Unknown") == "TR" &&
@@ -3094,6 +3165,7 @@ internal sealed class NoraWpfWindow : Window
                 ["Poland"] = 3,
                 ["Latvia"] = 3,
                 ["Sweden"] = 3,
+                ["Bulgaria"] = 3,
                 ["India"] = 3,
                 ["KZ"] = 3,
                 ["TR"] = 3,
@@ -3103,11 +3175,11 @@ internal sealed class NoraWpfWindow : Window
             };
             var assetsPassed = expectedCounts.All(pair => FindLocationPaths(root, pair.Key).Count == pair.Value);
             var freeTierPassed = expectedCounts.Keys.All(key => LoadLocationImages(key, loadAll: false).Count == 1);
-            var premiumTierPassed = expectedCounts.All(pair => LoadLocationImages(pair.Key, loadAll: true).Count == pair.Value);
-            var passed = mappingsPassed && assetsPassed && freeTierPassed && premiumTierPassed;
+            var allFramesPassed = expectedCounts.All(pair => LoadLocationImages(pair.Key, loadAll: true).Count == pair.Value);
+            var passed = mappingsPassed && assetsPassed && freeTierPassed && allFramesPassed;
             output.WriteLine(passed
-                ? "LOCATION ARTWORK SELF-TEST PASS: specific-country priority; RU/EU groups; free-first; premium-slideshow assets complete"
-                : $"LOCATION ARTWORK SELF-TEST FAIL: mappings={mappingsPassed}; assets={assetsPassed}; free={freeTierPassed}; premium={premiumTierPassed}");
+                ? "LOCATION ARTWORK SELF-TEST PASS: specific-country priority; RU/EU groups; default-first and slideshow assets complete"
+                : $"LOCATION ARTWORK SELF-TEST FAIL: mappings={mappingsPassed}; assets={assetsPassed}; first={freeTierPassed}; all={allFramesPassed}");
             return passed ? 0 : 1;
         }
         catch (Exception exception)
@@ -3445,7 +3517,6 @@ internal sealed class NoraWpfWindow : Window
     private UIElement SettingsPage()
     {
         var root = new StackPanel { Margin = new Thickness(0, 0, 0, 8) };
-        var isPremium = NoraPremiumService.IsPremium;
 
         var header = new Grid { Margin = new Thickness(0, 0, 0, 20) };
         header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -3480,69 +3551,36 @@ internal sealed class NoraWpfWindow : Window
         header.Children.Add(home);
         root.Children.Add(header);
 
-        var statusCard = Card(20, isPremium);
+        var statusCard = Card(20, true);
         statusCard.Padding = new Thickness(18, 16, 18, 16);
         statusCard.Margin = new Thickness(0, 0, 0, 15);
-        var statusGrid = new Grid();
-        statusGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        statusGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         var statusText = new StackPanel();
         statusText.Children.Add(new TextBlock
         {
-            Text = isPremium ? "Premium appearance is active" : "NORA Free",
+            Text = "All appearance options are included",
             FontSize = 18,
             FontWeight = FontWeights.Bold,
             Foreground = NoraWpfTheme.TextBrush
         });
-        var statusDetail = isPremium
-            ? NoraPremiumService.Status == NoraPremiumStatus.OfflineGrace
-                ? "Protected offline access · reconnect later to verify"
-                : "Verified for this device."
-            : "Core VPN functionality is complete and unrestricted.";
         statusText.Children.Add(new TextBlock
         {
-            Text = statusDetail,
+            Text = "No code or activation is required. Choose the visuals you prefer.",
             FontSize = 12,
             Foreground = NoraWpfTheme.MutedBrush,
-            Margin = new Thickness(0, 5, 0, 0)
+            Margin = new Thickness(0, 5, 0, 0),
+            TextWrapping = TextWrapping.Wrap
         });
-        statusGrid.Children.Add(statusText);
-        var edition = new Border
-        {
-            CornerRadius = new CornerRadius(13),
-            Padding = new Thickness(10, 5, 10, 5),
-            Background = NoraWpfTheme.Brush(isPremium ? Color.FromArgb(34, 255, 156, 38) : Color.FromArgb(34, 146, 157, 176)),
-            BorderBrush = NoraWpfTheme.Brush(isPremium ? Color.FromArgb(110, 255, 156, 38) : Color.FromArgb(70, 146, 157, 176)),
-            BorderThickness = new Thickness(1),
-            VerticalAlignment = VerticalAlignment.Top,
-            Child = new TextBlock
-            {
-                Text = isPremium ? "PREMIUM" : "FREE",
-                FontSize = 10,
-                FontWeight = FontWeights.Bold,
-                Foreground = isPremium ? NoraWpfTheme.OrangeBrush : NoraWpfTheme.MutedBrush
-            }
-        };
-        Grid.SetColumn(edition, 1);
-        statusGrid.Children.Add(edition);
-        statusCard.Child = statusGrid;
+        statusCard.Child = statusText;
         root.Children.Add(statusCard);
 
         root.Children.Add(new TextBlock
         {
-            Text = "PREMIUM APPEARANCE",
+            Text = "VISUAL OPTIONS",
             FontSize = 11,
             FontWeight = FontWeights.Bold,
             Foreground = NoraWpfTheme.OrangeBrush,
             Margin = new Thickness(2, 3, 0, 9)
         });
-
-        var codeField = Field("");
-        codeField.Height = 46;
-        codeField.FontFamily = NoraWpfTheme.MonoFont;
-        codeField.FontSize = 13;
-        codeField.CharacterCasing = System.Windows.Controls.CharacterCasing.Upper;
-        codeField.ToolTip = "NORA-PRM-XXXX-XXXX-XXXX-XXXX-XXXX";
 
         UIElement FeatureRow(string key, string title, string description, bool enabled)
         {
@@ -3554,8 +3592,7 @@ internal sealed class NoraWpfWindow : Window
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
             var copy = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
-            var titleRow = new StackPanel { Orientation = Orientation.Horizontal };
-            titleRow.Children.Add(new TextBlock
+            copy.Children.Add(new TextBlock
             {
                 Text = title,
                 FontSize = 16,
@@ -3563,18 +3600,6 @@ internal sealed class NoraWpfWindow : Window
                 Foreground = NoraWpfTheme.TextBrush,
                 VerticalAlignment = VerticalAlignment.Center
             });
-            if (!isPremium)
-            {
-                titleRow.Children.Add(new Border
-                {
-                    CornerRadius = new CornerRadius(10),
-                    Padding = new Thickness(7, 3, 7, 3),
-                    Margin = new Thickness(9, 0, 0, 0),
-                    Background = NoraWpfTheme.Brush(Color.FromArgb(30, 255, 156, 38)),
-                    Child = new TextBlock { Text = "PREMIUM", FontSize = 9, FontWeight = FontWeights.Bold, Foreground = NoraWpfTheme.OrangeBrush }
-                });
-            }
-            copy.Children.Add(titleRow);
             copy.Children.Add(new TextBlock
             {
                 Text = description,
@@ -3591,34 +3616,27 @@ internal sealed class NoraWpfWindow : Window
                 Width = 58,
                 Height = 34,
                 VerticalAlignment = VerticalAlignment.Center,
-                ToolTip = isPremium ? (enabled ? "Turn off" : "Turn on") : "Premium feature"
+                ToolTip = enabled ? "Turn off" : "Turn on"
             };
             var track = new Grid { Width = 54, Height = 30 };
             track.Children.Add(new Border
             {
                 CornerRadius = new CornerRadius(15),
-                Background = NoraWpfTheme.Brush(enabled && isPremium ? NoraWpfTheme.Orange : Color.FromRgb(45, 53, 66)),
-                BorderBrush = NoraWpfTheme.Brush(enabled && isPremium ? NoraWpfTheme.Orange2 : Color.FromRgb(72, 83, 101)),
+                Background = NoraWpfTheme.Brush(enabled ? NoraWpfTheme.Orange : Color.FromRgb(45, 53, 66)),
+                BorderBrush = NoraWpfTheme.Brush(enabled ? NoraWpfTheme.Orange2 : Color.FromRgb(72, 83, 101)),
                 BorderThickness = new Thickness(1)
             });
             track.Children.Add(new Ellipse
             {
                 Width = 24,
                 Height = 24,
-                Fill = NoraWpfTheme.Brush(enabled && isPremium ? NoraWpfTheme.Bg : Color.FromRgb(166, 176, 192)),
-                HorizontalAlignment = enabled && isPremium ? HorizontalAlignment.Right : HorizontalAlignment.Left,
+                Fill = NoraWpfTheme.Brush(enabled ? NoraWpfTheme.Bg : Color.FromRgb(166, 176, 192)),
+                HorizontalAlignment = enabled ? HorizontalAlignment.Right : HorizontalAlignment.Left,
                 Margin = new Thickness(3)
             });
             toggle.Content = track;
             toggle.Click += (_, _) =>
             {
-                if (!NoraPremiumService.IsPremium)
-                {
-                    _pendingPremiumFeature = key;
-                    ShowPremiumGate(title, codeField);
-                    return;
-                }
-
                 if (key == "equalizer")
                     NoraPremiumService.SetEqualizerEnabled(!enabled);
                 else
@@ -3642,85 +3660,35 @@ internal sealed class NoraWpfWindow : Window
             "Crossfades the available location photos on the active server card.",
             NoraPremiumService.ServerSlideshowEnabled));
 
-        var activationCard = Card(20, false);
-        activationCard.Padding = new Thickness(18, 16, 18, 16);
-        activationCard.Margin = new Thickness(0, 5, 0, 0);
-        var activation = new StackPanel();
-        activation.Children.Add(new TextBlock
+        var purchaseCard = Card(20, false);
+        purchaseCard.Padding = new Thickness(18, 16, 18, 16);
+        purchaseCard.Margin = new Thickness(0, 5, 0, 0);
+        var purchase = new StackPanel();
+        purchase.Children.Add(new TextBlock
         {
-            Text = isPremium ? "Use another Premium code" : "Activate Premium appearance",
+            Text = "Need a VPN subscription?",
             FontSize = 17,
             FontWeight = FontWeights.Bold,
             Foreground = NoraWpfTheme.TextBrush
         });
-        activation.Children.Add(new TextBlock
+        purchase.Children.Add(new TextBlock
         {
-            Text = "Enter the code exactly as received. Activation is verified securely online.",
+            Text = "Get the official NORA VPN from @noravpnrobertsonbot.",
             FontSize = 12,
             Foreground = NoraWpfTheme.MutedBrush,
             Margin = new Thickness(0, 5, 0, 10)
         });
-        activation.Children.Add(codeField);
-
-        var activate = NoraButton(isPremium ? "Verify new code" : "Activate Premium", accent: true);
-        activate.Height = 46;
-        async Task ActivateCodeAsync()
-        {
-            activate.IsEnabled = false;
-            activate.Content = "Verifying…";
-            var result = await NoraPremiumService.ActivateAsync(codeField.Text);
-            if (!result.Success)
-            {
-                activate.IsEnabled = true;
-                activate.Content = isPremium ? "Verify new code" : "Activate Premium";
-                ShowToast("Premium activation failed", result.Message, ToastKind.Error);
-                return;
-            }
-
-            if (_pendingPremiumFeature == "equalizer")
-                NoraPremiumService.SetEqualizerEnabled(true);
-            else if (_pendingPremiumFeature == "slideshow")
-                NoraPremiumService.SetServerSlideshowEnabled(true);
-            _pendingPremiumFeature = "";
-            ShowToast("Premium appearance active", "The visual options are now available on this device.", ToastKind.Success);
-            RenderPage(PageKind.Settings);
-        }
-        activate.Click += async (_, _) => await ActivateCodeAsync();
-        codeField.KeyDown += async (_, e) =>
-        {
-            if (e.Key != Key.Enter || !activate.IsEnabled)
-                return;
-            e.Handled = true;
-            await ActivateCodeAsync();
-        };
-        activation.Children.Add(activate);
-
-        var contact = new NoraFxButton(Colors.Transparent, Color.FromArgb(24, 255, 156, 38), 12, false, Brushes.Transparent)
-        {
-            Height = 34,
-            Margin = new Thickness(0, 6, 0, 0),
-            HorizontalContentAlignment = HorizontalAlignment.Left,
-            Content = new TextBlock
-            {
-                Text = "Get a code: @RunwayResearch",
-                FontSize = 12,
-                FontWeight = FontWeights.SemiBold,
-                Foreground = NoraWpfTheme.OrangeBrush
-            },
-            ToolTip = "Copy Telegram contact"
-        };
-        contact.Click += (_, _) =>
-        {
-            WpfClipboard.SetText("@RunwayResearch");
-            ShowToast("Telegram copied", "@RunwayResearch", ToastKind.Success);
-        };
-        activation.Children.Add(contact);
-        activationCard.Child = activation;
-        root.Children.Add(activationCard);
+        var buy = NoraButton("Buy official VPN", accent: true);
+        buy.Height = 46;
+        buy.ToolTip = "Open @noravpnrobertsonbot in Telegram";
+        buy.Click += (_, _) => OpenOfficialVpnBot();
+        purchase.Children.Add(buy);
+        purchaseCard.Child = purchase;
+        root.Children.Add(purchaseCard);
 
         root.Children.Add(new TextBlock
         {
-            Text = "Premium changes appearance only. VPN speed, security, protocols, servers and connection reliability remain identical for every user.",
+            Text = "NORA VPN remains a client: you can use your own compatible subscription or configuration at any time.",
             FontSize = 11,
             LineHeight = 17,
             TextWrapping = TextWrapping.Wrap,
@@ -3732,7 +3700,7 @@ internal sealed class NoraWpfWindow : Window
         return ScrollPage(root);
     }
 
-    private static ImageSource? LoadBrandWindowIcon()
+    internal static ImageSource? LoadBrandWindowIcon()
     {
         const string cacheKey = "nora-brand-window-icon";
         lock (ImageCacheSync)
@@ -3782,77 +3750,6 @@ internal sealed class NoraWpfWindow : Window
         TunnelState.Connecting or TunnelState.Disconnecting => NoraWpfTheme.Orange2,
         _ => NoraWpfTheme.Orange
     };
-
-    private void ShowPremiumGate(string featureName, TextBox codeField)
-    {
-        var overlay = new Grid
-        {
-            Background = NoraWpfTheme.Brush(Color.FromArgb(146, 0, 0, 0)),
-            Opacity = NoraWpfTheme.MotionEnabled ? 0 : 1
-        };
-        Grid.SetZIndex(overlay, 80);
-
-        var sheet = new Border
-        {
-            CornerRadius = new CornerRadius(24),
-            Background = NoraWpfTheme.Brush(Color.FromArgb(252, 12, 16, 23)),
-            BorderBrush = NoraWpfTheme.Brush(Color.FromArgb(138, 255, 156, 38)),
-            BorderThickness = new Thickness(1),
-            Padding = new Thickness(22),
-            Margin = new Thickness(8, 0, 8, 12),
-            VerticalAlignment = VerticalAlignment.Bottom,
-            RenderTransformOrigin = new Point(0.5, 1)
-        };
-        overlay.Children.Add(sheet);
-        var body = new StackPanel();
-        sheet.Child = body;
-        body.Children.Add(new TextBlock
-        {
-            Text = featureName + " is a Premium appearance feature",
-            FontSize = 21,
-            FontWeight = FontWeights.Bold,
-            Foreground = NoraWpfTheme.TextBrush,
-            TextWrapping = TextWrapping.Wrap
-        });
-        body.Children.Add(new TextBlock
-        {
-            Text = "Premium unlocks optional visuals only. It does not change VPN speed, security, available protocols, servers or connection quality.",
-            FontSize = 13,
-            LineHeight = 20,
-            Foreground = NoraWpfTheme.MutedBrush,
-            TextWrapping = TextWrapping.Wrap,
-            Margin = new Thickness(0, 11, 0, 17)
-        });
-        var enter = NoraButton("Enter a code", accent: true);
-        enter.Height = 48;
-        enter.Click += (_, _) =>
-        {
-            _contentHost.Children.Remove(overlay);
-            codeField.Focus();
-            codeField.SelectAll();
-        };
-        body.Children.Add(enter);
-        var later = new NoraFxButton(Colors.Transparent, Color.FromArgb(24, 255, 255, 255), 14, false, Brushes.Transparent)
-        {
-            Height = 40,
-            Margin = new Thickness(0, 6, 0, 0),
-            Content = new TextBlock { Text = "Not now", Foreground = NoraWpfTheme.MutedBrush, FontWeight = FontWeights.SemiBold }
-        };
-        later.Click += (_, _) =>
-        {
-            _pendingPremiumFeature = "";
-            _contentHost.Children.Remove(overlay);
-        };
-        body.Children.Add(later);
-        _contentHost.Children.Add(overlay);
-
-        if (!NoraWpfTheme.MotionEnabled)
-            return;
-        var shift = new TranslateTransform(0, 42);
-        sheet.RenderTransform = shift;
-        overlay.BeginAnimation(OpacityProperty, new DoubleAnimation(1, TimeSpan.FromMilliseconds(180)));
-        shift.BeginAnimation(TranslateTransform.YProperty, DoubleTo(0, 240));
-    }
 
     private UIElement ServersPage()
     {
@@ -5148,7 +5045,7 @@ internal sealed class NoraWpfWindow : Window
         };
         var placeholder = new TextBlock
         {
-            Text = "krot://...   vless://...   https://provider/sub   happ://crypt5/...",
+            Text = "krot://...   vless://...   vmess://...   trojan://...   https://provider/sub   happ://crypt5/...",
             FontSize = 12,
             FontFamily = NoraWpfTheme.MonoFont,
             Foreground = NoraWpfTheme.DimBrush,
@@ -6355,11 +6252,17 @@ internal sealed class NoraWpfWindow : Window
             return;
 
         var discordMode = NoraDiscordModeSettings.Enabled;
-        if (discordMode && CurrentServerInfo().Protocol.Contains("AWG", StringComparison.OrdinalIgnoreCase))
+        var discordSelectionSupported = _activeSubscriptionServer is not null
+            ? _activeSubscriptionServer.Protocol.Contains("VLESS", StringComparison.OrdinalIgnoreCase)
+            : _activeConfig is not null && string.IsNullOrWhiteSpace(_activeExternalProtocol);
+        if (discordMode && !discordSelectionSupported)
         {
-            AppendLog("[discord] connection blocked because AWG is selected");
+            var selectedProtocol = CurrentServerInfo().Protocol;
+            AppendLog($"[discord] connection blocked because {selectedProtocol} is selected");
             ShowToast(
-                "AWG is not supported",
+                selectedProtocol.Contains("AWG", StringComparison.OrdinalIgnoreCase)
+                    ? "AWG is not supported"
+                    : "Protocol is not supported",
                 "Discord Mode works with VLESS and KRot servers. Select another server and try again.",
                 ToastKind.Info);
             return;
@@ -6432,7 +6335,7 @@ internal sealed class NoraWpfWindow : Window
             var backend = "KRot";
             if (_activeSubscriptionServer is not null)
             {
-                if (!_activeSubscriptionServer.Protocol.Contains("VLESS", StringComparison.OrdinalIgnoreCase))
+                if (!NoraSubscriptionStore.IsSupportedXrayProtocol(_activeSubscriptionServer.Protocol))
                     throw new InvalidOperationException("No backend is available for subscription protocol " + _activeSubscriptionServer.Protocol);
                 backend = "Xray";
                 _trafficInterfaceHint = "NORA-Xray";
@@ -6825,7 +6728,57 @@ internal sealed class NoraWpfWindow : Window
             graph.AddSample(_trafficUpRate, _trafficDownRate, (long)_trafficUpBytes, (long)_trafficDownBytes, _connectedFor.Elapsed);
     }
 
-    private async Task ImportKeyAsync(string text)
+    private async Task ProcessPendingDeepLinksAsync()
+    {
+        await _deepLinkImportGate.WaitAsync();
+        try
+        {
+            while (true)
+            {
+                var requests = NoraDeepLinkQueue.Drain();
+                if (requests.Count == 0)
+                    return;
+                ShowFromTray();
+                foreach (var request in requests)
+                {
+                    var confirmation = new NoraDeepLinkConfirmWindow(request) { Owner = this };
+                    if (confirmation.ShowDialog() != true)
+                    {
+                        AppendLog("NORA link import declined by the user.");
+                        continue;
+                    }
+                    if (request.Kind == NoraDeepLinkKind.Profile)
+                    {
+                        if (await ImportKeyAsync(request.Payload))
+                            ShowToast("Profile imported", "The profile from the NORA link is ready.", ToastKind.Success);
+                        continue;
+                    }
+
+                    try
+                    {
+                        var subscription = await _subscriptionRefreshCoordinator.RunExclusiveAsync(
+                            () => NoraSubscriptionStore.ImportAsync(request.Payload, AppendLog, request.Name));
+                        _expandedSubscriptionId = subscription.Id;
+                        if (subscription.Servers.FirstOrDefault() is { } first)
+                            SetActiveSubscriptionServer(first);
+                        AppendLog($"Subscription added from NORA link: {subscription.Title}");
+                        RenderPage(PageKind.Servers);
+                        ShowToast("Subscription imported", $"{subscription.Title}: {subscription.Servers.Count} servers loaded.", ToastKind.Success);
+                    }
+                    catch (Exception exception)
+                    {
+                        ReportFailure(NoraOperation.ImportProfile, exception);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            _deepLinkImportGate.Release();
+        }
+    }
+
+    private async Task<bool> ImportKeyAsync(string text)
     {
         try
         {
@@ -6839,18 +6792,21 @@ internal sealed class NoraWpfWindow : Window
                     SetActiveSubscriptionServer(first);
                 AppendLog($"Subscription added: {subscription.Title}");
                 RenderPage(PageKind.Servers);
-                return;
+                return true;
             }
-            if (text.Trim().StartsWith("vless://", StringComparison.OrdinalIgnoreCase))
+            if (text.Trim().StartsWith("vless://", StringComparison.OrdinalIgnoreCase) ||
+                text.Trim().StartsWith("vmess://", StringComparison.OrdinalIgnoreCase) ||
+                text.Trim().StartsWith("trojan://", StringComparison.OrdinalIgnoreCase))
             {
                 var subscription = await _subscriptionRefreshCoordinator.RunExclusiveAsync(
                     () => NoraSubscriptionStore.ImportAsync(text, AppendLog));
                 _expandedSubscriptionId = subscription.Id;
-                if (subscription.Servers.FirstOrDefault() is { } first)
+                var first = subscription.Servers.FirstOrDefault();
+                if (first is not null)
                     SetActiveSubscriptionServer(first);
-                AppendLog("VLESS Reality server added.");
+                AppendLog($"{first?.Protocol ?? "Xray"} server added.");
                 RenderPage(PageKind.Servers);
-                return;
+                return true;
             }
             var probe = text.TrimStart();
             if (probe.StartsWith('{') || probe.StartsWith('[') ||
@@ -6862,23 +6818,25 @@ internal sealed class NoraWpfWindow : Window
                 var subscription = await _subscriptionRefreshCoordinator.RunExclusiveAsync(
                     () => NoraSubscriptionStore.ImportAsync(text, AppendLog));
                 if (subscription.Servers.Count == 0)
-                    throw new NoraAppException("NORA-SUB-4003", "The config file did not contain any supported VLESS servers.");
+                    throw new NoraAppException("NORA-SUB-4003", "The config file did not contain any supported VLESS, VMess or Trojan servers.");
                 _expandedSubscriptionId = subscription.Id;
                 if (subscription.Servers.FirstOrDefault() is { } node)
                     SetActiveSubscriptionServer(node);
                 AppendLog($"Imported {subscription.Servers.Count} server(s) from config file.");
                 RenderPage(PageKind.Servers);
-                return;
+                return true;
             }
             var result = await NoraProfileImporter.ImportAsync(text, AppendLog);
             if (!string.IsNullOrWhiteSpace(result.ClientProfilePath))
                 SetActiveProfile(result.ClientProfilePath);
             AppendLog(result.Message);
             RenderPage(PageKind.Home);
+            return true;
         }
         catch (Exception ex)
         {
             ReportFailure(NoraOperation.ImportProfile, ex);
+            return false;
         }
     }
 
@@ -7178,6 +7136,7 @@ internal sealed class NoraWpfWindow : Window
         "location-poland" => new ServerInfo("Poland · Warsaw", "warsaw.demo.test", 443, "Poland", true, "VLESS · Reality"),
         "location-latvia" => new ServerInfo("Latvia · Riga", "riga.demo.test", 443, "Latvia", true, "VLESS · Reality"),
         "location-sweden" => new ServerInfo("Sweden · Stockholm", "stockholm.demo.test", 443, "Sweden", true, "VLESS · Reality"),
+        "location-bulgaria" => new ServerInfo("Bulgaria · Sofia", "sofia.demo.test", 443, "Bulgaria", true, "VLESS · Reality"),
         "location-india" => new ServerInfo("India · Mumbai", "mumbai.demo.test", 443, "India", true, "VLESS · Reality"),
         "location-kz" => new ServerInfo("Kazakhstan", "almaty.demo.test", 443, "Kazakhstan", true, "VLESS · Reality"),
         "location-tr" => new ServerInfo("Turkey", "istanbul.demo.test", 443, "Turkey", true, "VLESS · Reality"),
@@ -9776,7 +9735,7 @@ internal sealed class NoraWelcomeLine : FrameworkElement
 internal enum NoraIconKind
 {
     Home, Globe, ServerRack, Plus, Users, Terminal, Radar, Copy, Trash, ChevronRight, Shield,
-    Bolt, Key, Import, Sliders, Clock, Deploy, Pin, Refresh, Power, Broom, Subscription,
+    Bolt, Key, Import, Sliders, Settings, Clock, Deploy, Pin, Refresh, Power, Broom, Subscription,
     Pencil, Check, ChevronUp, ChevronDown, Eye
 }
 
@@ -9989,6 +9948,18 @@ internal sealed class NoraIcon : FrameworkElement
                 Circle(14.6, 7.2, 2.1, pen, NoraWpfTheme.BgBrush);
                 Circle(8.6, 12, 2.1, pen, NoraWpfTheme.BgBrush);
                 Circle(16.2, 16.8, 2.1, pen, NoraWpfTheme.BgBrush);
+                break;
+            case NoraIconKind.Settings:
+                Poly(pen, true,
+                    10.2, 1.8, 13.8, 1.8, 14.5, 3.8, 16.2, 4.5,
+                    18.1, 3.6, 20.5, 6.0, 19.5, 7.9, 20.2, 9.7,
+                    22.2, 10.4, 22.2, 13.6, 20.2, 14.3, 19.5, 16.1,
+                    20.5, 18.0, 18.1, 20.4, 16.2, 19.5, 14.5, 20.2,
+                    13.8, 22.2, 10.2, 22.2, 9.5, 20.2, 7.8, 19.5,
+                    5.9, 20.4, 3.5, 18.0, 4.5, 16.1, 3.8, 14.3,
+                    1.8, 13.6, 1.8, 10.4, 3.8, 9.7, 4.5, 7.9,
+                    3.5, 6.0, 5.9, 3.6, 7.8, 4.5, 9.5, 3.8);
+                Circle(12, 12, 3.3);
                 break;
             case NoraIconKind.Clock:
                 Circle(12, 12, 8);

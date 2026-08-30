@@ -36,6 +36,28 @@ internal static class NoraUiPreferences
         }
     }
 
+    public static string SkippedUpdateVersion
+    {
+        get
+        {
+            lock (Sync)
+            {
+                try { return Load().SkippedUpdateVersion?.Trim() ?? ""; }
+                catch { return ""; }
+            }
+        }
+    }
+
+    public static void SetSkippedUpdateVersion(string version)
+    {
+        lock (Sync)
+        {
+            var settings = Load();
+            settings.SkippedUpdateVersion = version.Trim();
+            Save(settings);
+        }
+    }
+
     private static UiPreferencesFile Load()
     {
         var path = PreferencesPath();
@@ -88,10 +110,15 @@ internal static class NoraUiPreferences
             var survivedProfileSave = CloseToTrayNoticeDismissed;
             SetCloseToTrayNoticeDismissed(false);
             var resetPersisted = !CloseToTrayNoticeDismissed;
+            SetSkippedUpdateVersion("0.1.0-pre.6");
+            var skippedUpdatePersisted = SkippedUpdateVersion == "0.1.0-pre.6";
+            NoraAppState.SaveActiveProfilePath(Path.Combine(temporaryRoot, "fixture-profile-2.json"));
+            var skippedUpdateSurvivedProfileSave = SkippedUpdateVersion == "0.1.0-pre.6";
 
-            var passed = shownInitially && dismissedPersisted && survivedProfileSave && resetPersisted;
+            var passed = shownInitially && dismissedPersisted && survivedProfileSave && resetPersisted &&
+                         skippedUpdatePersisted && skippedUpdateSurvivedProfileSave;
             output.WriteLine(passed
-                ? "UI PREFERENCES SELF-TEST PASS: close-to-tray dismissal persists independently of active profile"
+                ? "UI PREFERENCES SELF-TEST PASS: close-to-tray and skipped-update choices persist independently of active profile"
                 : "UI PREFERENCES SELF-TEST FAIL");
             return passed ? 0 : 1;
         }
@@ -115,6 +142,7 @@ internal static class NoraUiPreferences
     private sealed class UiPreferencesFile
     {
         public bool CloseToTrayNoticeDismissed { get; set; }
+        public string? SkippedUpdateVersion { get; set; }
     }
 }
 #endif

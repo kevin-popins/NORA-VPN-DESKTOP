@@ -5,10 +5,10 @@
   #define OutputDir "..\dist"
 #endif
 #ifndef AppVersion
-  #define AppVersion "0.1.0-pre.5"
+  #define AppVersion "0.1.0-pre.6"
 #endif
 #ifndef InstallerVersion
-  #define InstallerVersion "0.1.0.5"
+  #define InstallerVersion "0.1.0.6"
 #endif
 #ifndef BuildId
   #define BuildId "local"
@@ -27,6 +27,7 @@
   #define ProductRegistryRoot "HKCU"
   #define UserDataDirName "NORA VPN Installer Data QA"
   #define SingleInstanceMutexName "Local\NORA.VPN.Desktop.InstallerQA.v1"
+  #define UrlSchemeName "noravpn-installer-qa"
 #else
   #define ProductAppId "7CBB6718-2B47-4EFC-9DE7-726C494E611A"
   #define SetupPrivileges "admin"
@@ -34,6 +35,7 @@
   #define ProductRegistryRoot "HKLM64"
   #define UserDataDirName "NORA VPN"
   #define SingleInstanceMutexName "Local\NORA.VPN.Desktop.SingleInstance.v1"
+  #define UrlSchemeName "noravpn"
 #endif
 #define UninstallKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\{" + ProductAppId + "}_is1"
 
@@ -103,8 +105,17 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"; InfoBeforeFile:
 english.DesktopShortcut=Create a desktop shortcut
 english.WelcomeInstall=Install NORA VPN
 english.WelcomeUpdate=Update NORA VPN
-english.WelcomeInstallBody=Set up the NORA VPN client and its required runtime components.%n%nSubscriptions, selected servers, Premium activation and preferences are stored separately and remain untouched by installation and updates.
-english.WelcomeUpdateBody=Install NORA VPN {#AppVersion} over the existing version.%n%nYour subscriptions, selected server, Premium activation and preferences will remain in place.
+english.WelcomeInstallBody=Set up the NORA VPN client and its required runtime components.%n%nSubscriptions, selected servers and preferences are stored separately and remain untouched by installation and updates.
+english.WelcomeUpdateBody=Your installed NORA VPN will be updated in place.%n%nSubscriptions, selected servers and preferences remain untouched.
+english.UpdateVersions=Installed version: %1%nNew version: %2
+english.UpdateAction=Update NORA VPN
+english.UpdateReady=Ready to update NORA VPN
+english.UpdateProgress=Updating NORA VPN
+english.UpdateStageVerify=Verifying the update package…
+english.UpdateStageCopy=Replacing NORA VPN components…
+english.UpdateStageShortcuts=Refreshing application shortcuts…
+english.UpdateStageFinish=Finishing and verifying the update…
+english.UpdateFinishText=NORA VPN was updated successfully. Your subscriptions, selected server and settings were preserved.
 english.RunningPrompt=NORA VPN is currently running. To update its files, NORA must safely disconnect and exit.%n%nContinue with a graceful shutdown and update now?
 english.RunningSilent=NORA VPN is running. Silent setup will not stop an active VPN connection. Exit NORA from the system tray and run the update again.
 english.ShutdownFailed=NORA could not finish its safe shutdown. No files were replaced. Exit NORA from the system tray and try again.
@@ -115,14 +126,23 @@ english.InstallStageVerify=Verifying the NORA package…
 english.InstallStageCopy=Installing NORA VPN components…
 english.InstallStageShortcuts=Creating application shortcuts…
 english.InstallStageFinish=Finishing and verifying the installation…
-english.PurgePrompt=Also permanently delete this Windows user's subscriptions, profiles, saved server credentials, Premium activation and settings?%n%nChoose No to keep all personal data for a future reinstall.
+english.PurgePrompt=Also permanently delete this Windows user's subscriptions, profiles, saved server credentials and settings?%n%nChoose No to keep all personal data for a future reinstall.
 english.DataKept=Personal data is kept in %%LocalAppData%%\NORA VPN by default.
-english.FinishText=NORA VPN is installed and ready. Your existing subscriptions, selected server, Premium activation and settings were preserved.
+english.FinishText=NORA VPN is installed and ready. Your existing subscriptions, selected server and settings were preserved.
 russian.DesktopShortcut=Создать ярлык на рабочем столе
 russian.WelcomeInstall=Установите NORA VPN
-russian.WelcomeUpdate=Обновите NORA VPN
-russian.WelcomeInstallBody=Установщик подготовит клиент NORA VPN и необходимые компоненты.%n%nПодписки, выбранные серверы, Premium и настройки хранятся отдельно и не изменяются при установке и обновлениях.
-russian.WelcomeUpdateBody=Установка NORA VPN {#AppVersion} поверх существующей версии.%n%nВаши подписки, выбранный сервер, Premium и настройки останутся на месте.
+russian.WelcomeUpdate=Обновление NORA VPN
+russian.WelcomeInstallBody=Установщик подготовит клиент NORA VPN и необходимые компоненты.%n%nПодписки, выбранные серверы и настройки хранятся отдельно и не изменяются при установке и обновлениях.
+russian.WelcomeUpdateBody=Установленная NORA VPN будет обновлена поверх текущей версии.%n%nПодписки, выбранные серверы и настройки останутся на месте.
+russian.UpdateVersions=Установленная версия: %1%nНовая версия: %2
+russian.UpdateAction=Обновить NORA VPN
+russian.UpdateReady=Всё готово к обновлению NORA VPN
+russian.UpdateProgress=Обновляем NORA VPN
+russian.UpdateStageVerify=Проверяем пакет обновления…
+russian.UpdateStageCopy=Обновляем компоненты NORA VPN…
+russian.UpdateStageShortcuts=Обновляем ярлыки приложения…
+russian.UpdateStageFinish=Завершаем и проверяем обновление…
+russian.UpdateFinishText=NORA VPN успешно обновлена. Подписки, выбранный сервер и настройки сохранены.
 russian.RunningPrompt=NORA VPN сейчас работает. Для обновления файлов приложение должно безопасно отключить VPN и завершить работу.%n%nПродолжить безопасное завершение и обновление?
 russian.RunningSilent=NORA VPN запущена. Тихая установка не будет останавливать активное VPN-подключение. Завершите NORA через системный трей и повторите обновление.
 russian.ShutdownFailed=NORA не смогла безопасно завершить работу. Файлы не заменялись. Завершите NORA через системный трей и повторите попытку.
@@ -133,9 +153,9 @@ russian.InstallStageVerify=Проверяем пакет NORA…
 russian.InstallStageCopy=Устанавливаем компоненты NORA VPN…
 russian.InstallStageShortcuts=Настраиваем ярлыки приложения…
 russian.InstallStageFinish=Завершаем и проверяем установку…
-russian.PurgePrompt=Также навсегда удалить подписки, профили, сохранённые реквизиты серверов, Premium и настройки этого пользователя Windows?%n%nВыберите «Нет», чтобы сохранить все личные данные для будущей переустановки.
+russian.PurgePrompt=Также навсегда удалить подписки, профили, сохранённые реквизиты серверов и настройки этого пользователя Windows?%n%nВыберите «Нет», чтобы сохранить все личные данные для будущей переустановки.
 russian.DataKept=По умолчанию личные данные сохраняются в %%LocalAppData%%\NORA VPN.
-russian.FinishText=NORA VPN установлена и готова к работе. Существующие подписки, выбранный сервер, Premium и настройки сохранены.
+russian.FinishText=NORA VPN установлена и готова к работе. Существующие подписки, выбранный сервер и настройки сохранены.
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:DesktopShortcut}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
@@ -158,6 +178,10 @@ Name: "{autodesktop}\NORA VPN"; Filename: "{app}\NoraVPN.exe"; WorkingDir: "{app
 [Registry]
 Root: {#ProductRegistryRoot}; Subkey: "Software\NORA VPN"; ValueType: string; ValueName: "InstallerVersion"; ValueData: "{#InstallerVersion}"; Flags: uninsdeletekey
 Root: {#ProductRegistryRoot}; Subkey: "Software\NORA VPN"; ValueType: string; ValueName: "BuildId"; ValueData: "{#BuildId}"; Flags: uninsdeletekey
+Root: {#ProductRegistryRoot}; Subkey: "Software\Classes\{#UrlSchemeName}"; ValueType: string; ValueName: ""; ValueData: "URL:NORA VPN Import Protocol"; Flags: uninsdeletekey
+Root: {#ProductRegistryRoot}; Subkey: "Software\Classes\{#UrlSchemeName}"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
+Root: {#ProductRegistryRoot}; Subkey: "Software\Classes\{#UrlSchemeName}\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\NoraVPN.exe,0"
+Root: {#ProductRegistryRoot}; Subkey: "Software\Classes\{#UrlSchemeName}\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\NoraVPN.exe"" ""%1"""
 
 [Run]
 Filename: "{app}\NoraVPN.exe"; Description: "{cm:LaunchProgram,NORA VPN}"; WorkingDir: "{app}"; Verb: "runas"; Flags: postinstall skipifsilent shellexec runasoriginaluser
@@ -165,6 +189,7 @@ Filename: "{app}\NoraVPN.exe"; Description: "{cm:LaunchProgram,NORA VPN}"; Worki
 [Code]
 var
   IsUpgradeInstall: Boolean;
+  PriorDisplayVersion: String;
   PurgeUserData: Boolean;
   NoraFinishButton: TNewButton;
 #ifdef VisualQaScreenshotMode
@@ -241,7 +266,8 @@ function InitializeSetup(): Boolean;
 var
   PriorNumericVersion: String;
 begin
-  IsUpgradeInstall := InstalledVersion() <> '';
+  PriorDisplayVersion := InstalledVersion();
+  IsUpgradeInstall := PriorDisplayVersion <> '';
   PriorNumericVersion := InstalledNumericVersion();
   Result := (PriorNumericVersion = '') or
     (CompareNumericVersions(PriorNumericVersion, '{#InstallerVersion}') <= 0);
@@ -256,7 +282,7 @@ begin
   WizardForm.WelcomeLabel1.Font.Style := [fsBold];
   WizardForm.WelcomeLabel2.Font.Size := 11;
   WizardForm.WelcomeLabel2.AutoSize := False;
-  WizardForm.WelcomeLabel2.Height := ScaleY(150);
+  WizardForm.WelcomeLabel2.Height := ScaleY(220);
   WizardForm.NextButton.Caption := SetupMessage(msgButtonNext);
 
   NoraFinishButton := TNewButton.Create(WizardForm);
@@ -270,7 +296,11 @@ begin
   if IsUpgradeInstall then
   begin
     WizardForm.WelcomeLabel1.Caption := CustomMessage('WelcomeUpdate');
-    WizardForm.WelcomeLabel2.Caption := CustomMessage('WelcomeUpdateBody');
+    WizardForm.WelcomeLabel2.Caption := FmtMessage(CustomMessage('UpdateVersions'), [PriorDisplayVersion, '{#AppVersion}']) + #13#10#13#10 + CustomMessage('WelcomeUpdateBody');
+    WizardForm.NextButton.Width := ScaleX(150);
+    WizardForm.NextButton.Left := WizardForm.CancelButton.Left - ScaleX(10) - WizardForm.NextButton.Width;
+    WizardForm.BackButton.Left := WizardForm.NextButton.Left - ScaleX(10) - WizardForm.BackButton.Width;
+    WizardForm.NextButton.Caption := CustomMessage('UpdateAction');
   end
   else
   begin
@@ -416,12 +446,28 @@ end;
 
 procedure CurPageChanged(CurPageID: Integer);
 begin
+  if IsUpgradeInstall and ((CurPageID = wpWelcome) or (CurPageID = wpReady)) then
+  begin
+    WizardForm.NextButton.Width := ScaleX(150);
+    WizardForm.NextButton.Left := WizardForm.CancelButton.Left - ScaleX(10) - WizardForm.NextButton.Width;
+    WizardForm.BackButton.Left := WizardForm.NextButton.Left - ScaleX(10) - WizardForm.BackButton.Width;
+    WizardForm.NextButton.Caption := CustomMessage('UpdateAction');
+    if CurPageID = wpReady then
+      WizardForm.ReadyLabel.Caption := CustomMessage('UpdateReady');
+  end;
   NoraFinishButton.Visible := (CurPageID = wpFinished) and (not WizardSilent);
   if CurPageID = wpInstalling then
+  begin
     WizardForm.FilenameLabel.Visible := False;
+    if IsUpgradeInstall then
+      WizardForm.PageNameLabel.Caption := CustomMessage('UpdateProgress');
+  end;
   if CurPageID = wpFinished then
   begin
-    WizardForm.FinishedLabel.Caption := CustomMessage('FinishText');
+    if IsUpgradeInstall then
+      WizardForm.FinishedLabel.Caption := CustomMessage('UpdateFinishText')
+    else
+      WizardForm.FinishedLabel.Caption := CustomMessage('FinishText');
     if not WizardSilent then
     begin
       WizardForm.NextButton.Caption := SetupMessage(msgButtonFinish);
@@ -455,8 +501,18 @@ begin
   if MaxProgress <= 0 then Percent := 0
   else Percent := Round((CurProgress / MaxProgress) * 100.0);
 
-  if Percent < 8 then WizardForm.StatusLabel.Caption := CustomMessage('InstallStageVerify')
-  else if Percent < 88 then WizardForm.StatusLabel.Caption := CustomMessage('InstallStageCopy')
-  else if Percent < 96 then WizardForm.StatusLabel.Caption := CustomMessage('InstallStageShortcuts')
-  else WizardForm.StatusLabel.Caption := CustomMessage('InstallStageFinish');
+  if IsUpgradeInstall then
+  begin
+    if Percent < 8 then WizardForm.StatusLabel.Caption := CustomMessage('UpdateStageVerify')
+    else if Percent < 88 then WizardForm.StatusLabel.Caption := CustomMessage('UpdateStageCopy')
+    else if Percent < 96 then WizardForm.StatusLabel.Caption := CustomMessage('UpdateStageShortcuts')
+    else WizardForm.StatusLabel.Caption := CustomMessage('UpdateStageFinish');
+  end
+  else
+  begin
+    if Percent < 8 then WizardForm.StatusLabel.Caption := CustomMessage('InstallStageVerify')
+    else if Percent < 88 then WizardForm.StatusLabel.Caption := CustomMessage('InstallStageCopy')
+    else if Percent < 96 then WizardForm.StatusLabel.Caption := CustomMessage('InstallStageShortcuts')
+    else WizardForm.StatusLabel.Caption := CustomMessage('InstallStageFinish');
+  end;
 end;

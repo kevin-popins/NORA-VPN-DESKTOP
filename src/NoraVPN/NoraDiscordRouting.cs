@@ -13,7 +13,7 @@ namespace Nvp;
 
 /// <summary>
 /// Stores the user's Discord-only routing preference. This is a free routing
-/// feature and is intentionally independent from Premium appearance settings.
+/// feature and is intentionally independent from appearance settings.
 /// </summary>
 internal static class NoraDiscordModeSettings
 {
