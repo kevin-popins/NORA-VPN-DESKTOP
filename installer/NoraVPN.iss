@@ -5,7 +5,7 @@
   #define OutputDir "..\dist"
 #endif
 #ifndef AppVersion
-  #define AppVersion "0.1.0-pre.7-rc.2"
+  #define AppVersion "0.1.0-pre.7"
 #endif
 #ifndef InstallerVersion
   #define InstallerVersion "0.1.0.7"
