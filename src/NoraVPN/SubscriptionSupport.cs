@@ -113,6 +113,18 @@ internal sealed class NoraRoutePolicy
         Direct.DomainKeywords.Count + Direct.DomainRegexes.Count + Direct.IpCidrs.Count;
 }
 
+internal enum NoraDnsPolicySource
+{
+    Provider,
+    SecureFallback
+}
+
+internal sealed record NoraDnsPolicyDescription(
+    NoraDnsPolicySource Source,
+    bool UsesProviderDns,
+    bool UsesDirectSplit,
+    string Summary);
+
 internal sealed class NoraExternalProfileInfo
 {
     public string Protocol { get; set; } = "";
@@ -390,10 +402,10 @@ internal static class NoraSubscriptionStore
         var proxyOutbound = ExtractSupportedXrayOutbound(server.RawConfigJson, server.Protocol) ?? BuildXrayVlessOutbound(server);
         proxyOutbound["tag"] = "proxy";
         RemoveLocalInterfaceBindings(proxyOutbound);
-        var dns = new JsonObject
-        {
-            ["servers"] = new JsonArray("1.1.1.1", "8.8.8.8")
-        };
+        // DNS requests from Windows are handled by the sing-box TUN frontend.
+        // Xray only needs a hosts map for the already-resolved VPN endpoint, so
+        // it must not create a second, hard-coded plaintext resolver path.
+        var dns = new JsonObject();
         // The selected VLESS hostname can be a provider load balancer. Resolve it
         // once before TUN routing is enabled and make Xray use that exact same pool.
         // Otherwise Windows can protect the system-DNS answers while Xray receives a
@@ -412,12 +424,11 @@ internal static class NoraSubscriptionStore
             // dns.hosts. Force Xray's built-in IPv4 resolver instead: it will use the
             // pinned hosts pool above and can never fall back to an unprotected DNS
             // answer after the full-tunnel routes are active.
-            if (proxyOutbound["streamSettings"] is JsonObject stream)
-            {
-                var sockopt = stream["sockopt"] as JsonObject ?? new JsonObject();
-                sockopt["domainStrategy"] = "ForceIPv4";
-                stream["sockopt"] = sockopt;
-            }
+            var stream = proxyOutbound["streamSettings"] as JsonObject ?? new JsonObject();
+            var sockopt = stream["sockopt"] as JsonObject ?? new JsonObject();
+            sockopt["domainStrategy"] = "ForceIPv4";
+            stream["sockopt"] = sockopt;
+            proxyOutbound["streamSettings"] = stream;
         }
         var root = new JsonObject
         {
@@ -430,7 +441,7 @@ internal static class NoraSubscriptionStore
             ["dns"] = dns,
             ["routing"] = new JsonObject
             {
-                ["domainStrategy"] = "IPIfNonMatch",
+                ["domainStrategy"] = "AsIs",
                 ["rules"] = new JsonArray()
             }
         };
@@ -447,7 +458,6 @@ internal static class NoraSubscriptionStore
                         ["name"] = "NORA-Xray",
                         ["mtu"] = 1400,
                         ["gateway"] = new JsonArray("172.20.0.1/30"),
-                        ["dns"] = new JsonArray("1.1.1.1", "8.8.8.8"),
                         ["userLevel"] = 0,
                         ["autoSystemRoutingTable"] = new JsonArray("0.0.0.0/1", "128.0.0.0/1")
                     },
@@ -799,6 +809,258 @@ internal static class NoraSubscriptionStore
         dnsRules.Add(rule);
     }
 
+    private sealed class NoraNormalizedDnsServer
+    {
+        public required string Tag { get; init; }
+        public required JsonObject Definition { get; init; }
+        public NoraRouteMatchers Domains { get; } = new();
+        public bool HasDomainScope { get; init; }
+        public bool UseAsDefault => !HasDomainScope;
+        public string Strategy { get; init; } = "";
+    }
+
+    private sealed class NoraNormalizedDnsPolicy
+    {
+        public List<NoraNormalizedDnsServer> Servers { get; } = [];
+        public string Strategy { get; set; } = "";
+
+        public NoraNormalizedDnsServer? DefaultServer => Servers.FirstOrDefault(server => server.UseAsDefault);
+    }
+
+    internal static NoraDnsPolicyDescription DescribeDnsPolicy(NoraSubscriptionServer server)
+    {
+        var provider = ParseProviderDnsPolicy(server.RawConfigJson);
+        var split = ParseXrayRoutingPolicy(server.RawConfigJson)?.Direct is { } direct &&
+                    (direct.Domains.Count > 0 || direct.DomainSuffixes.Count > 0 ||
+                     direct.DomainKeywords.Count > 0 || direct.DomainRegexes.Count > 0);
+        var source = provider.DefaultServer is null
+            ? NoraDnsPolicySource.SecureFallback
+            : NoraDnsPolicySource.Provider;
+        var summary = source == NoraDnsPolicySource.Provider
+            ? "Provider DNS through VPN"
+            : "Secure DNS fallback through VPN";
+        if (split)
+            summary += "; direct-rule domains use local DNS";
+        return new NoraDnsPolicyDescription(source, provider.Servers.Count > 0, split, summary);
+    }
+
+    private static JsonObject BuildTunDns(NoraSubscriptionServer? server, NoraRoutePolicy? routePolicy)
+    {
+        var provider = ParseProviderDnsPolicy(server?.RawConfigJson ?? "");
+        var servers = new JsonArray();
+        foreach (var item in provider.Servers)
+            servers.Add(item.Definition.DeepClone());
+
+        // An IP bootstrap avoids depending on the possibly intercepted Windows
+        // resolver. TLS still authenticates the resolver by hostname, and the
+        // whole DoH connection is carried inside `proxy`.
+        servers.Add(new JsonObject
+        {
+            ["type"] = "https",
+            ["tag"] = "nora-secure-fallback",
+            ["server"] = "9.9.9.9",
+            ["server_port"] = 443,
+            ["path"] = "/dns-query",
+            ["detour"] = "proxy",
+            ["tls"] = new JsonObject
+            {
+                ["enabled"] = true,
+                ["server_name"] = "dns.quad9.net"
+            },
+            ["connect_timeout"] = "8s"
+        });
+        servers.Add(new JsonObject { ["type"] = "local", ["tag"] = "local" });
+
+        var dns = new JsonObject
+        {
+            ["servers"] = servers,
+            ["final"] = provider.DefaultServer?.Tag ?? "nora-secure-fallback",
+            // NORA's Windows TUN currently owns IPv4 routes only. Returning
+            // AAAA records here would create an IPv6 black hole under strict_route.
+            ["strategy"] = "ipv4_only"
+        };
+
+        var rules = new JsonArray();
+        foreach (var item in provider.Servers.Where(item => !item.Domains.IsEmpty))
+        {
+            var rule = new JsonObject();
+            AddMatchers(rule, item.Domains);
+            rule["action"] = "route";
+            rule["server"] = item.Tag;
+            if (!string.IsNullOrWhiteSpace(item.Strategy))
+                rule["strategy"] = item.Strategy;
+            rules.Add(rule);
+        }
+        // Provider routing direct rules stay authoritative. This preserves the
+        // existing regional-answer behavior unless the provider supplied a more
+        // specific DNS server for the same domain.
+        if (routePolicy is not null)
+            AppendPolicyDnsRules(rules, routePolicy);
+        if (rules.Count > 0)
+            dns["rules"] = rules;
+        return dns;
+    }
+
+    private static NoraNormalizedDnsPolicy ParseProviderDnsPolicy(string rawConfigJson)
+    {
+        var result = new NoraNormalizedDnsPolicy();
+        if (string.IsNullOrWhiteSpace(rawConfigJson))
+            return result;
+        try
+        {
+            var root = JsonNode.Parse(rawConfigJson)?.AsObject();
+            if (root?["dns"] is not JsonObject dns || dns["servers"] is not JsonArray servers)
+                return result;
+            result.Strategy = NormalizeDnsStrategy(NodeString(dns["queryStrategy"]));
+            var index = 0;
+            foreach (var node in servers)
+            {
+                index++;
+                var address = node is JsonObject item ? NodeString(item["address"]) : NodeString(node);
+                var port = node is JsonObject withPort ? NodeInt(withPort["port"]) : 0;
+                var tag = "provider-dns-" + index.ToString(CultureInfo.InvariantCulture);
+                var definition = NormalizeProviderDnsServer(address, port, tag);
+                if (definition is null)
+                    continue;
+
+                var normalized = new NoraNormalizedDnsServer
+                {
+                    Tag = tag,
+                    Definition = definition,
+                    HasDomainScope = node is JsonObject scope && scope["domains"] is JsonArray scopedDomains && scopedDomains.Count > 0,
+                    Strategy = node is JsonObject strategy
+                        ? NormalizeDnsStrategy(NodeString(strategy["queryStrategy"]))
+                        : ""
+                };
+                if (node is JsonObject objectNode && objectNode["domains"] is JsonArray domains)
+                {
+                    var ignored = new NoraRoutePolicy();
+                    foreach (var domain in domains)
+                        ClassifyDomainToken(NodeString(domain), normalized.Domains, ignored);
+                }
+                result.Servers.Add(normalized);
+            }
+        }
+        catch
+        {
+            // Malformed/unknown provider DNS never makes the connection unusable;
+            // the protected NORA fallback below remains available.
+        }
+        return result;
+    }
+
+    private static JsonObject? NormalizeProviderDnsServer(string address, int configuredPort, string tag)
+    {
+        address = address.Trim();
+        if (address.Length == 0 ||
+            address.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
+            address.Equals("fakedns", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        var type = "udp";
+        var host = address;
+        var path = "";
+        var port = configuredPort;
+        if (Uri.TryCreate(address, UriKind.Absolute, out var uri))
+        {
+            type = uri.Scheme.ToLowerInvariant() switch
+            {
+                "https" or "https+local" => "https",
+                "tls" => "tls",
+                "tcp" or "tcp+local" => "tcp",
+                "quic" or "quic+local" => "quic",
+                "udp" => "udp",
+                _ => ""
+            };
+            if (type.Length == 0)
+                return null;
+            host = uri.Host;
+            if (port <= 0 && !uri.IsDefaultPort)
+                port = uri.Port;
+            path = uri.AbsolutePath;
+        }
+        else if (TrySplitDnsHostPort(address, out var splitHost, out var splitPort))
+        {
+            host = splitHost;
+            if (port <= 0)
+                port = splitPort;
+        }
+
+        host = host.Trim('[', ']');
+        if (host.Length == 0 || IsUnsupportedDnsAddress(host))
+            return null;
+        if (port <= 0)
+            port = type == "https" ? 443 : type is "tls" or "quic" ? 853 : 53;
+        if (port is < 1 or > 65535)
+            return null;
+
+        var definition = new JsonObject
+        {
+            ["type"] = type,
+            ["tag"] = tag,
+            ["server"] = host,
+            ["server_port"] = port,
+            ["detour"] = "proxy",
+            ["connect_timeout"] = "8s"
+        };
+        if (type == "https" && !string.IsNullOrWhiteSpace(path) && path != "/")
+            definition["path"] = path;
+        if (!IPAddress.TryParse(host, out _))
+            definition["domain_resolver"] = "nora-secure-fallback";
+        return definition;
+    }
+
+    private static bool TrySplitDnsHostPort(string value, out string host, out int port)
+    {
+        host = value;
+        port = 0;
+        if (value.StartsWith("[", StringComparison.Ordinal) &&
+            Uri.TryCreate("udp://" + value, UriKind.Absolute, out var bracketed))
+        {
+            host = bracketed.Host;
+            port = bracketed.IsDefaultPort ? 0 : bracketed.Port;
+            return true;
+        }
+        var colon = value.LastIndexOf(':');
+        if (colon <= 0 || value.IndexOf(':') != colon ||
+            !int.TryParse(value[(colon + 1)..], NumberStyles.None, CultureInfo.InvariantCulture, out port))
+            return false;
+        host = value[..colon];
+        return true;
+    }
+
+    private static bool IsUnsupportedDnsAddress(string host)
+    {
+        if (!IPAddress.TryParse(host, out var address))
+            return false;
+        if (IPAddress.IsLoopback(address) || address.Equals(IPAddress.Any) || address.Equals(IPAddress.IPv6Any) ||
+            address.IsIPv6LinkLocal)
+            return true;
+        if (address.AddressFamily != AddressFamily.InterNetwork)
+            return false;
+        var bytes = address.GetAddressBytes();
+        return bytes[0] == 127 || (bytes[0] == 169 && bytes[1] == 254);
+    }
+
+    private static string NormalizeDnsStrategy(string value)
+        => value.Trim().ToLowerInvariant() switch
+        {
+            "useip" or "usesystem" or "useipv4" or "useipv6" => "ipv4_only",
+            _ => ""
+        };
+
+    private static string NodeString(JsonNode? node)
+    {
+        try { return node?.GetValue<string>()?.Trim() ?? ""; }
+        catch { return ""; }
+    }
+
+    private static int NodeInt(JsonNode? node)
+    {
+        try { return node?.GetValue<int>() ?? 0; }
+        catch { return 0; }
+    }
+
     public static string BuildXrayTunFrontendConfig(
         int socksPort,
         NoraSubscriptionServer? server = null,
@@ -806,29 +1068,7 @@ internal static class NoraSubscriptionStore
     {
         var policy = server is null ? null : ParseXrayRoutingPolicy(server.RawConfigJson);
 
-        var dns = new JsonObject
-        {
-            ["servers"] = new JsonArray
-            {
-                new JsonObject
-                {
-                    ["type"] = "tls",
-                    ["tag"] = "remote",
-                    ["server"] = "1.1.1.1",
-                    ["server_port"] = 853,
-                    ["detour"] = "proxy"
-                },
-                new JsonObject { ["type"] = "local", ["tag"] = "local" }
-            },
-            ["final"] = "remote"
-        };
-        if (policy is not null)
-        {
-            var dnsRules = new JsonArray();
-            AppendPolicyDnsRules(dnsRules, policy);
-            if (dnsRules.Count > 0)
-                dns["rules"] = dnsRules;
-        }
+        var dns = BuildTunDns(server, policy);
 
         // Sniff TLS SNI / HTTP host first so the provider's domain rules can match,
         // then hand DNS to sing-box, then apply the split (direct traffic leaves through
@@ -1032,25 +1272,11 @@ internal static class NoraSubscriptionStore
 
     public static string BuildSingBoxConfig(NoraSubscriptionServer server)
     {
+        var policy = ParseXrayRoutingPolicy(server.RawConfigJson);
         var root = new JsonObject
         {
             ["log"] = new JsonObject { ["level"] = "info", ["timestamp"] = true },
-            ["dns"] = new JsonObject
-            {
-                ["servers"] = new JsonArray
-                {
-                    new JsonObject
-                    {
-                        ["type"] = "tls",
-                        ["tag"] = "remote",
-                        ["server"] = "1.1.1.1",
-                        ["server_port"] = 853,
-                        ["detour"] = "proxy"
-                    },
-                    new JsonObject { ["type"] = "local", ["tag"] = "local" }
-                },
-                ["final"] = "remote"
-            },
+            ["dns"] = BuildTunDns(server, policy),
             ["inbounds"] = new JsonArray
             {
                 new JsonObject
@@ -1606,6 +1832,66 @@ internal static class NoraSubscriptionStore
                     .GetProperty("vnext")[0].GetProperty("address").GetString();
             }).ToArray();
 
+            const string providerDnsJson = """
+                {
+                  "remarks":"Provider DNS fixture",
+                  "dns":{
+                    "queryStrategy":"UseIPv4",
+                    "servers":[
+                      {"address":"https+local://77.88.8.8/dns-query","domains":["domain:provider-only.test"]},
+                      "1.1.1.1"
+                    ]
+                  },
+                  "routing":{"rules":[{"type":"field","domain":["domain:direct-provider.test"],"outboundTag":"direct"}]},
+                  "outbounds":[{
+                    "protocol":"vless","tag":"proxy",
+                    "settings":{"vnext":[{"address":"198.51.100.90","port":443,"users":[{"id":"90909090-9090-4090-8090-909090909090","encryption":"none"}]}]},
+                    "streamSettings":{"network":"tcp","security":"none"}
+                  }]
+                }
+                """;
+            var providerDnsSubscription = ParsePayload(
+                providerDnsJson,
+                "provider-dns-fixture",
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+                _ => { });
+            var providerDnsServer = providerDnsSubscription.Servers.Single();
+            var providerTunText = BuildXrayTunFrontendConfig(20809, providerDnsServer, "NORA-Xray-DNS-provider");
+            var fallbackTunText = BuildXrayTunFrontendConfig(20810, primary, "NORA-Xray-DNS-fallback");
+            var providerXrayText = BuildXrayConfig(providerDnsServer);
+            using var providerTun = JsonDocument.Parse(providerTunText);
+            using var fallbackTun = JsonDocument.Parse(fallbackTunText);
+            var providerDns = providerTun.RootElement.GetProperty("dns");
+            var providerResolvers = providerDns.GetProperty("servers").EnumerateArray().ToArray();
+            var providerRules = providerDns.GetProperty("rules").EnumerateArray().ToArray();
+            var providerDescription = DescribeDnsPolicy(providerDnsServer);
+            var fallbackDescription = DescribeDnsPolicy(primary);
+            var providerDnsValid = ValidateSingBoxConfigSyntax(providerTunText) &&
+                                   ValidateSingBoxConfigSyntax(fallbackTunText) &&
+                                   ValidateXrayConfigSyntax(providerXrayText);
+            var providerDnsSafe = providerDns.GetProperty("final").GetString() == "provider-dns-2" &&
+                                  providerDns.GetProperty("strategy").GetString() == "ipv4_only" &&
+                                  providerResolvers[0].GetProperty("type").GetString() == "https" &&
+                                  providerResolvers[0].GetProperty("server").GetString() == "77.88.8.8" &&
+                                  providerResolvers[0].GetProperty("path").GetString() == "/dns-query" &&
+                                  providerResolvers[1].GetProperty("type").GetString() == "udp" &&
+                                  providerResolvers[1].GetProperty("server").GetString() == "1.1.1.1" &&
+                                  providerResolvers.Where(item => item.GetProperty("tag").GetString() != "local")
+                                      .All(item => item.GetProperty("detour").GetString() == "proxy") &&
+                                  providerRules[0].GetProperty("server").GetString() == "provider-dns-1" &&
+                                  providerRules[1].GetProperty("server").GetString() == "local" &&
+                                  fallbackTun.RootElement.GetProperty("dns").GetProperty("final").GetString() == "nora-secure-fallback" &&
+                                  !fallbackTunText.Contains("1.1.1.1", StringComparison.Ordinal) &&
+                                  !fallbackTunText.Contains("8.8.8.8", StringComparison.Ordinal) &&
+                                  !providerXrayText.Contains("1.1.1.1", StringComparison.Ordinal) &&
+                                  !providerXrayText.Contains("8.8.8.8", StringComparison.Ordinal) &&
+                                  providerDnsServer.RawConfigJson.Contains("77.88.8.8", StringComparison.Ordinal) &&
+                                  NormalizeProviderDnsServer("10.64.0.53", 53, "private-provider-test") is not null &&
+                                  providerDescription.Source == NoraDnsPolicySource.Provider &&
+                                  providerDescription.UsesProviderDns && providerDescription.UsesDirectSplit &&
+                                  fallbackDescription.Source == NoraDnsPolicySource.SecureFallback &&
+                                  !fallbackDescription.UsesProviderDns;
+
             var endpointPool = new[]
             {
                 IPAddress.Parse("198.51.100.44"),
@@ -1650,6 +1936,7 @@ internal static class NoraSubscriptionStore
                          tunConfig.RootElement.GetProperty("inbounds")[0].GetProperty("interface_name").GetString() == "NORA-Xray-X-selftest" &&
                          alternateProtocols.Servers.Count == 2 &&
                          alternateConfigsAccepted &&
+                         providerDnsValid && providerDnsSafe &&
                          multiVmess.Servers.Count == 2 &&
                          selectedMultiEndpoints.SequenceEqual(["198.51.100.41", "198.51.100.42"], StringComparer.Ordinal) &&
                          vmessConfig.RootElement.GetProperty("outbounds")[0].GetProperty("protocol").GetString() == "vmess" &&
@@ -1665,7 +1952,7 @@ internal static class NoraSubscriptionStore
                           persistedFixture.Servers[4].Name == "🇬🇮 Gibraltar" &&
                           persistedFixture.Servers[5].Name == "🇬🇧 GB London";
             output.WriteLine(passed
-                ? "SUBSCRIPTION TRANSPORT SELF-TEST PASS: VLESS/VMess/Trojan configs valid; xhttp/provider-order/named-routes/unicode preserved"
+                ? "SUBSCRIPTION TRANSPORT SELF-TEST PASS: VLESS/VMess/Trojan and provider/fallback DNS configs valid; DNS egress=proxy; xhttp/provider-order/named-routes/unicode preserved"
                 : "SUBSCRIPTION TRANSPORT SELF-TEST FAIL");
             return passed ? 0 : 1;
         }
@@ -1901,6 +2188,40 @@ internal static class NoraSubscriptionStore
             start.ArgumentList.Add("run");
             start.ArgumentList.Add("-test");
             start.ArgumentList.Add("-config");
+            start.ArgumentList.Add(path);
+            using var process = Process.Start(start);
+            if (process is null || !process.WaitForExit(10_000))
+            {
+                try { process?.Kill(entireProcessTree: true); } catch { }
+                return false;
+            }
+            return process.ExitCode == 0;
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    private static bool ValidateSingBoxConfigSyntax(string json)
+    {
+        var executable = SingBoxPath();
+        if (!File.Exists(executable))
+            return false;
+        var path = Path.Combine(Path.GetTempPath(), "nora-sing-box-config-selftest-" + Guid.NewGuid().ToString("N") + ".json");
+        try
+        {
+            File.WriteAllText(path, json);
+            var start = new ProcessStartInfo(executable)
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                WorkingDirectory = AppContext.BaseDirectory
+            };
+            start.ArgumentList.Add("check");
+            start.ArgumentList.Add("-c");
             start.ArgumentList.Add(path);
             using var process = Process.Start(start);
             if (process is null || !process.WaitForExit(10_000))
@@ -3064,6 +3385,8 @@ internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<stri
     private Process? _tunFrontend;
     private string _tunConfigPath = "";
     private int _socksPort;
+    private IReadOnlyList<IPAddress> _resolvedEndpointAddresses = [];
+    private int _endpointRemembered;
     private readonly List<XrayEndpointBypass.RouteEntry> _endpointRoutes = [];
     private readonly TaskCompletionSource _xrayReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource _exited = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -3097,10 +3420,17 @@ internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<stri
 
         var dir = Path.Combine(NoraAppState.DataRoot, "runtime");
         Directory.CreateDirectory(dir);
-        var endpointAddresses = await XrayEndpointBypass.ResolveAsync(server.Host);
+        var endpointResolution = await NoraDnsBootstrap.ResolveIpv4Async(
+            server.Host,
+            server.Port,
+            TimeSpan.FromSeconds(2),
+            cancellationToken).ConfigureAwait(false);
+        var endpointAddresses = endpointResolution.Addresses;
+        _resolvedEndpointAddresses = endpointAddresses;
         cancellationToken.ThrowIfCancellationRequested();
         if (endpointAddresses.Count == 0)
             throw new NoraAppException("NORA-XRY-3105", "Cannot resolve an IPv4 address for the selected VLESS endpoint before TUN routing starts.");
+        log($"[xray] endpoint bootstrap: source={endpointResolution.Source}; ipv4_count={endpointAddresses.Count}");
 
         _socksPort = GetFreeTcpPort();
         var xrayConfigPath = Path.Combine(dir, "xray-" + server.Id + ".json");
@@ -3111,6 +3441,8 @@ internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<stri
             log($"[xray] endpoint DNS pool pinned: {endpointAddresses.Count} IPv4 address(es) for this session");
 
         var routePolicy = NoraSubscriptionStore.ParseXrayRoutingPolicy(server.RawConfigJson);
+        var dnsPolicy = NoraSubscriptionStore.DescribeDnsPolicy(server);
+        log($"DNS routing: source={dnsPolicy.Source.ToString().ToLowerInvariant()}; provider_entries={dnsPolicy.UsesProviderDns}; split={dnsPolicy.UsesDirectSplit}");
         if (discordMode)
         {
             log("Discord-only routing: Discord processes use the selected VLESS server; all other processes stay direct.");
@@ -3186,6 +3518,7 @@ internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<stri
         {
             using var response = await client.GetAsync("https://1.1.1.1/cdn-cgi/trace", HttpCompletionOption.ResponseHeadersRead, timeoutCts.Token);
             response.EnsureSuccessStatusCode();
+            RememberSuccessfulEndpoint();
             return new NoraBackendProbeResult(true, Math.Max(1, stopwatch.ElapsedMilliseconds), "ok", "HTTPS passed through the local Xray SOCKS backend before TUN startup.");
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
@@ -3204,6 +3537,29 @@ internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<stri
         if (!result.Success)
             throw new NoraAppException("NORA-DIS-9103", "The selected VLESS server did not carry Discord Mode traffic: " + result.Detail);
         log($"[discord] VLESS selective route ready through local Xray SOCKS; probe_ms={result.Milliseconds}");
+    }
+
+    internal void RememberSuccessfulEndpoint()
+    {
+        if (Interlocked.Exchange(ref _endpointRemembered, 1) != 0)
+            return;
+        try
+        {
+            NoraDnsBootstrap.RememberSuccessful(server.Host, server.Port, _resolvedEndpointAddresses);
+        }
+        catch
+        {
+            // Endpoint caching is a resilience optimization and must never
+            // interfere with an already authenticated tunnel.
+        }
+    }
+
+    internal void RejectLastKnownGoodEndpoint()
+    {
+        if (IPAddress.TryParse(server.Host, out _))
+            return;
+        try { NoraDnsBootstrap.Forget(server.Host, server.Port); }
+        catch { }
     }
 
     internal async Task StartTunFrontendForDiagnosticsAsync(TimeSpan timeout, CancellationToken cancellationToken)

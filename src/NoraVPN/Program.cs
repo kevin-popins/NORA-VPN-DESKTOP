@@ -44,6 +44,9 @@ internal static class Program
         if (args.Length == 1 && args[0].Equals("xray-tun-recovery-selftest", StringComparison.OrdinalIgnoreCase))
             return XrayCoreProcess.RunTunRecoverySelfTest(Console.Out);
 
+        if (args.Length == 1 && args[0].Equals("dns-bootstrap-selftest", StringComparison.OrdinalIgnoreCase))
+            return NoraDnsBootstrap.RunSelfTest(Console.Out);
+
         if (args.Length == 1 && args[0].Equals("shutdown-for-update", StringComparison.OrdinalIgnoreCase))
         {
             if (!NvpClient.IsAdministrator())
@@ -431,6 +434,7 @@ internal static class Program
             Console.WriteLine("  nvp subscription-refresh-selftest");
             Console.WriteLine("  nvp deep-link-selftest");
             Console.WriteLine("  nvp update-selftest");
+            Console.WriteLine("  nvp dns-bootstrap-selftest");
             Console.WriteLine("  nvp xray-tun-recovery-selftest");
             Console.WriteLine("  nvp country-flag-selftest");
             Console.WriteLine("  nvp location-artwork-selftest");

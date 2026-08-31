@@ -3524,14 +3524,14 @@ internal sealed class NoraWpfWindow : Window
         var heading = new StackPanel();
         heading.Children.Add(new TextBlock
         {
-            Text = "Appearance",
+            Text = "Settings",
             FontSize = 40,
             FontWeight = FontWeights.Bold,
             Foreground = NoraWpfTheme.TextBrush
         });
         heading.Children.Add(new TextBlock
         {
-            Text = "Visual options for your NORA home screen.",
+            Text = "Connection and visual preferences.",
             FontSize = 15,
             Foreground = NoraWpfTheme.MutedBrush,
             Margin = new Thickness(0, 6, 0, 0)
@@ -3551,27 +3551,54 @@ internal sealed class NoraWpfWindow : Window
         header.Children.Add(home);
         root.Children.Add(header);
 
-        var statusCard = Card(20, true);
-        statusCard.Padding = new Thickness(18, 16, 18, 16);
-        statusCard.Margin = new Thickness(0, 0, 0, 15);
-        var statusText = new StackPanel();
-        statusText.Children.Add(new TextBlock
+        root.Children.Add(new TextBlock
         {
-            Text = "All appearance options are included",
-            FontSize = 18,
+            Text = "CONNECTION",
+            FontSize = 11,
+            FontWeight = FontWeights.Bold,
+            Foreground = NoraWpfTheme.OrangeBrush,
+            Margin = new Thickness(2, 3, 0, 9)
+        });
+
+        var dnsStatus = DnsSettingsStatus();
+        var dnsCard = Card(18, false);
+        dnsCard.Padding = new Thickness(17, 14, 16, 14);
+        dnsCard.Margin = new Thickness(0, 0, 0, 16);
+        var dnsGrid = new Grid();
+        dnsGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        dnsGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var dnsCopy = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+        dnsCopy.Children.Add(new TextBlock
+        {
+            Text = "DNS routing",
+            FontSize = 16,
             FontWeight = FontWeights.Bold,
             Foreground = NoraWpfTheme.TextBrush
         });
-        statusText.Children.Add(new TextBlock
+        dnsCopy.Children.Add(new TextBlock
         {
-            Text = "No code or activation is required. Choose the visuals you prefer.",
+            Text = dnsStatus.Detail,
             FontSize = 12,
             Foreground = NoraWpfTheme.MutedBrush,
             Margin = new Thickness(0, 5, 0, 0),
-            TextWrapping = TextWrapping.Wrap
+            TextWrapping = TextWrapping.Wrap,
+            MaxWidth = 300
         });
-        statusCard.Child = statusText;
-        root.Children.Add(statusCard);
+        dnsGrid.Children.Add(dnsCopy);
+        var dnsValue = new TextBlock
+        {
+            Text = dnsStatus.Label,
+            FontSize = 12,
+            FontWeight = FontWeights.Bold,
+            Foreground = dnsStatus.Color,
+            VerticalAlignment = VerticalAlignment.Top,
+            Margin = new Thickness(12, 2, 0, 0),
+            ToolTip = "DNS policy is selected automatically from the active subscription or profile."
+        };
+        Grid.SetColumn(dnsValue, 1);
+        dnsGrid.Children.Add(dnsValue);
+        dnsCard.Child = dnsGrid;
+        root.Children.Add(dnsCard);
 
         root.Children.Add(new TextBlock
         {
@@ -3579,7 +3606,7 @@ internal sealed class NoraWpfWindow : Window
             FontSize = 11,
             FontWeight = FontWeights.Bold,
             Foreground = NoraWpfTheme.OrangeBrush,
-            Margin = new Thickness(2, 3, 0, 9)
+            Margin = new Thickness(2, 1, 0, 9)
         });
 
         UIElement FeatureRow(string key, string title, string description, bool enabled)
@@ -3698,6 +3725,53 @@ internal sealed class NoraWpfWindow : Window
         });
 
         return ScrollPage(root);
+    }
+
+    private (string Label, string Detail, Brush Color) DnsSettingsStatus()
+    {
+        if (_state is TunnelState.Connecting or TunnelState.Disconnecting)
+            return ("Preparing…", "DNS routing is being prepared for this connection.", NoraWpfTheme.OrangeBrush);
+
+        if (NoraDiscordModeSettings.Enabled)
+            return _state == TunnelState.Connected
+                ? ("Windows DNS", "Discord Mode keeps Windows DNS unchanged while routing Discord traffic.", NoraWpfTheme.MutedBrush)
+                : ("Windows DNS", "Discord Mode is enabled; a supported VLESS or KRot connection will keep Windows DNS unchanged.", NoraWpfTheme.MutedBrush);
+
+        if (_activeSubscriptionServer is not null)
+        {
+            var policy = NoraSubscriptionStore.DescribeDnsPolicy(_activeSubscriptionServer);
+            if (policy.UsesDirectSplit)
+            {
+                var vpnSource = policy.Source == NoraDnsPolicySource.Provider
+                    ? "Subscription DNS is used through the VPN"
+                    : "Secure fallback DNS is used through the VPN";
+                return ("Split DNS", vpnSource + "; direct-rule domains use Windows DNS.", NoraWpfTheme.OrangeBrush);
+            }
+            return policy.Source == NoraDnsPolicySource.Provider
+                ? ("From subscription", "NORA will use this subscription's DNS through the VPN.", NoraWpfTheme.GreenBrush)
+                : ("Secure fallback", "No compatible DNS is defined; secure DNS will run through the VPN.", NoraWpfTheme.OrangeBrush);
+        }
+
+        if (!string.IsNullOrWhiteSpace(_activeExternalProtocol))
+        {
+            var profileDefinesDns = false;
+            try
+            {
+                profileDefinesDns = File.Exists(_activeProfilePath) &&
+                    Regex.IsMatch(File.ReadAllText(_activeProfilePath), @"(?im)^\s*DNS\s*=\s*\S+");
+            }
+            catch { }
+            return profileDefinesDns
+                ? ("From profile", "DNS is controlled by the selected AWG or WireGuard profile.", NoraWpfTheme.GreenBrush)
+                : ("Windows DNS", "The selected external profile does not define DNS.", NoraWpfTheme.MutedBrush);
+        }
+
+        if (_activeConfig is not null)
+            return _activeConfig.Tunnel.Dns.Count > 0
+                ? ("From profile", "DNS is controlled by the selected KRot profile and travels inside the tunnel.", NoraWpfTheme.GreenBrush)
+                : ("Windows DNS", "The selected KRot profile does not define DNS.", NoraWpfTheme.MutedBrush);
+
+        return ("Automatic", "DNS will be selected from the subscription or profile you connect to.", NoraWpfTheme.MutedBrush);
     }
 
     internal static ImageSource? LoadBrandWindowIcon()
@@ -6389,6 +6463,8 @@ internal sealed class NoraWpfWindow : Window
         catch (Exception ex)
         {
             ReportFailure(NoraOperation.Connect, ex);
+            if (startedCore is XrayCoreProcess failedXray)
+                failedXray.RejectLastKnownGoodEndpoint();
             if (startedCore is not null && ReferenceEquals(_core, startedCore))
             {
                 try { await startedCore.StopAsync(TimeSpan.FromSeconds(5)); } catch { }
@@ -6457,6 +6533,7 @@ internal sealed class NoraWpfWindow : Window
                     throw new OperationCanceledException(cancellationToken);
                 }
                 lastFailure = ex;
+                core.RejectLastKnownGoodEndpoint();
                 AppendLog($"AUTO endpoint {index + 1}/{candidates.Count} did not pass the traffic check.");
                 if (ReferenceEquals(_core, core))
                 {
@@ -6495,6 +6572,8 @@ internal sealed class NoraWpfWindow : Window
         // Only the self-hosted KRot profile guarantees endpoint IP == exit IP.
         var expectedExit = core is NvpCoreProcess ? CurrentServerInfo().Host : "";
         await NoraDataPlaneProbe.VerifyAsync(core, timeout, AppendLog, expectedExit, cancellationToken);
+        if (core is XrayCoreProcess xray)
+            xray.RememberSuccessfulEndpoint();
     }
 
     private static Task StartCoreAsync(IVpnCoreProcess core, TimeSpan timeout, CancellationToken cancellationToken)
@@ -7263,6 +7342,8 @@ internal sealed class NoraWpfWindow : Window
             graph.SetTraffic(_trafficUpRate, _trafficDownRate, (long)_trafficUpBytes, (long)_trafficDownBytes, _connectedFor.Elapsed);
             graph.InvalidateVisual();
         }
+        if (_page == PageKind.Settings && previousState != state)
+            RenderPage(PageKind.Settings);
     }
 
     private void SeedDemoLogs()

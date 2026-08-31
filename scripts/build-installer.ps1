@@ -1,5 +1,5 @@
 param(
-    [string]$AppVersion = "0.1.0-pre.6",
+    [string]$AppVersion = "0.1.0-pre.6.99-dns-test",
     [string]$InstallerVersion = "0.1.0.6",
     [string]$BuildId = "",
     [string]$OutputDirectory = "",
