@@ -37,21 +37,15 @@ internal sealed class NoraSubscriptionInfo
     public long ExpireUnix { get; set; }
     public int UpdateIntervalHours { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
-    // Provider order is authoritative until the user explicitly moves a node
-    // in NORA's Arrange mode. Only then is the local order preserved on refresh.
-    public bool CustomServerOrder { get; set; }
     public List<NoraSubscriptionServer> Servers { get; set; } = [];
 }
 
 internal sealed class NoraSubscriptionServer
 {
     public string Id { get; set; } = "";
-    // Local-only position within its subscription; preserved by Store().
+    // Provider position within its subscription. Store() rewrites this from the
+    // incoming payload on every refresh.
     public int DisplayOrder { get; set; }
-    // Last position observed in the provider payload. This stays independent
-    // from DisplayOrder so an explicit "restore provider order" operation can
-    // be applied without downloading the subscription a second time.
-    public int ProviderOrder { get; set; }
     public string SubscriptionId { get; set; } = "";
     public string SubscriptionTitle { get; set; } = "";
     public string Name { get; set; } = "";
@@ -1643,57 +1637,12 @@ internal static class NoraSubscriptionStore
         if (string.IsNullOrWhiteSpace(sub.DisplayNameOverride) && !string.IsNullOrWhiteSpace(previous?.DisplayNameOverride))
             ApplyPreferredTitle(sub, previous.DisplayNameOverride);
 
-        // Follow the provider order by default. Preserve a local order only after
-        // the user explicitly moved a node in Arrange mode.
+        // Subscription cards remain user-orderable, but the servers inside a
+        // subscription always follow the exact order of the latest provider
+        // payload. ParsePayload and DeduplicateServers preserve first occurrence.
         sub.DisplayOrder = previous?.DisplayOrder > 0
             ? previous.DisplayOrder
             : NextSubscriptionDisplayOrder();
-        sub.CustomServerOrder = previous?.CustomServerOrder ?? false;
-        var previousServers = previous?.Servers ?? [];
-        // ParsePayload and DeduplicateServers retain first-occurrence order, so
-        // the incoming array is the authoritative provider sequence.
-        for (var index = 0; index < sub.Servers.Count; index++)
-            sub.Servers[index].ProviderOrder = index + 1;
-        if (!sub.CustomServerOrder)
-        {
-            for (var index = 0; index < sub.Servers.Count; index++)
-                sub.Servers[index].DisplayOrder = sub.Servers[index].ProviderOrder;
-        }
-        else
-        {
-            var nextServerOrder = Math.Max(0, previousServers.Select(server => server.DisplayOrder).DefaultIfEmpty(0).Max());
-            var claimedPrevious = new HashSet<NoraSubscriptionServer>();
-            foreach (var server in sub.Servers)
-            {
-                var prior = previousServers.FirstOrDefault(previousServer =>
-                                !claimedPrevious.Contains(previousServer) &&
-                                previousServer.DisplayOrder > 0 &&
-                                string.Equals(previousServer.Id, server.Id, StringComparison.OrdinalIgnoreCase))
-                            ?? previousServers.FirstOrDefault(previousServer =>
-                                !claimedPrevious.Contains(previousServer) &&
-                                previousServer.DisplayOrder > 0 &&
-                                SameProviderEntry(previousServer, server))
-                            // Legacy releases keyed nodes only by runtime connection.
-                            // Claim that fallback once so newly restored named rows do not
-                            // all inherit the same local position.
-                            ?? previousServers.FirstOrDefault(previousServer =>
-                                !claimedPrevious.Contains(previousServer) &&
-                                previousServer.DisplayOrder > 0 &&
-                                SameRuntimeConnection(previousServer, server));
-                if (prior is null)
-                {
-                    server.DisplayOrder = ++nextServerOrder;
-                    continue;
-                }
-
-                claimedPrevious.Add(prior);
-                server.DisplayOrder = prior.DisplayOrder;
-            }
-        }
-        sub.Servers = OrderServers(sub.Servers).ToList();
-        // Removed provider rows can leave gaps in a custom layout. Compacting
-        // positions after every merge keeps future matches deterministic while
-        // preserving the exact relative order chosen by the user.
         for (var index = 0; index < sub.Servers.Count; index++)
             sub.Servers[index].DisplayOrder = index + 1;
 
@@ -1730,57 +1679,6 @@ internal static class NoraSubscriptionStore
             subscriptions[order].DisplayOrder = order + 1;
             PersistSubscriptionOrder(subscriptions[order]);
         }
-        return true;
-    }
-
-    public static bool MoveServer(string subscriptionId, string serverId, int direction)
-    {
-        if (direction is not (-1 or 1) || string.IsNullOrWhiteSpace(subscriptionId) || string.IsNullOrWhiteSpace(serverId))
-            return false;
-        var subscription = LoadAll().FirstOrDefault(item =>
-            string.Equals(item.Id, subscriptionId, StringComparison.OrdinalIgnoreCase));
-        if (subscription is null)
-            return false;
-
-        var servers = OrderServers(subscription.Servers).ToList();
-        var index = servers.FindIndex(server => string.Equals(server.Id, serverId, StringComparison.OrdinalIgnoreCase));
-        if (!TryMove(servers, index, direction))
-            return false;
-
-        for (var order = 0; order < servers.Count; order++)
-            servers[order].DisplayOrder = order + 1;
-        subscription.CustomServerOrder = true;
-        subscription.Servers = servers;
-        PersistSubscriptionOrder(subscription);
-        return true;
-    }
-
-    public static bool ResetServerOrder(string subscriptionId)
-    {
-        if (string.IsNullOrWhiteSpace(subscriptionId))
-            return false;
-        var subscription = LoadAll().FirstOrDefault(item =>
-            string.Equals(item.Id, subscriptionId, StringComparison.OrdinalIgnoreCase));
-        if (subscription is null || subscription.Servers.Count == 0)
-            return false;
-
-        // Legacy files did not retain provider positions. A normal refresh on
-        // this version records them even while custom ordering remains active;
-        // until then there is no truthful provider order to reconstruct.
-        var providerOrders = subscription.Servers.Select(server => server.ProviderOrder).ToArray();
-        if (providerOrders.Any(order => order <= 0) ||
-            providerOrders.Distinct().Count() != providerOrders.Length)
-            return false;
-
-        subscription.CustomServerOrder = false;
-        subscription.Servers = subscription.Servers
-            .OrderBy(server => server.ProviderOrder)
-            .ThenBy(server => server.Name, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(server => server.Id, StringComparer.OrdinalIgnoreCase)
-            .ToList();
-        for (var index = 0; index < subscription.Servers.Count; index++)
-            subscription.Servers[index].DisplayOrder = index + 1;
-        PersistSubscriptionOrder(subscription);
         return true;
     }
 
@@ -2135,16 +2033,6 @@ internal static class NoraSubscriptionStore
             };
             var orderedSubscriptions = OrderSubscriptions(subscriptions).Select(item => item.Id).ToArray();
 
-            var servers = new List<NoraSubscriptionServer>
-            {
-                new() { Id = "a", DisplayOrder = 1 },
-                new() { Id = "b", DisplayOrder = 2 },
-                new() { Id = "c", DisplayOrder = 3 }
-            };
-            var moved = TryMove(servers, 1, -1);
-            for (var index = 0; index < servers.Count; index++)
-                servers[index].DisplayOrder = index + 1;
-
             Environment.SetEnvironmentVariable("NORA_DATA_ROOT", temporaryRoot);
             var first = Store(new NoraSubscriptionInfo
             {
@@ -2163,7 +2051,15 @@ internal static class NoraSubscriptionStore
                 ]
             }, "fixture:second");
             var movedSubscription = MoveSubscription(second.Id, -1);
-            var movedServer = MoveServer(second.Id, "second-b", -1);
+
+            // Simulate a legacy release that persisted a manual server order.
+            // The next provider refresh must ignore it completely.
+            var legacyManualOrder = LoadAll().Single(item => item.Id == second.Id);
+            legacyManualOrder.Servers.Reverse();
+            for (var index = 0; index < legacyManualOrder.Servers.Count; index++)
+                legacyManualOrder.Servers[index].DisplayOrder = index + 1;
+            PersistSubscriptionOrder(legacyManualOrder);
+
             var refreshed = Store(new NoraSubscriptionInfo
             {
                 Id = second.Id,
@@ -2177,19 +2073,10 @@ internal static class NoraSubscriptionStore
             }, "fixture:second");
             var persistedSubscriptions = LoadAll().Select(item => item.Id).ToArray();
             var persistedServers = refreshed.Servers.Select(item => item.Id).ToArray();
-            var customOrderSurvivesReload = LoadAll().Single(item => item.Id == second.Id)
+            var providerOrderSurvivesReload = LoadAll().Single(item => item.Id == second.Id)
                 .Servers.Select(item => item.Id)
-                .SequenceEqual(["second-b", "second-a", "second-c"], StringComparer.Ordinal);
-            var customOrdersCompacted = refreshed.Servers.Select(item => item.DisplayOrder).SequenceEqual([1, 2, 3]);
-            var providerSnapshotRecorded = refreshed.Servers
-                .OrderBy(item => item.ProviderOrder)
-                .Select(item => item.Id)
                 .SequenceEqual(["second-c", "second-a", "second-b"], StringComparer.Ordinal);
-            var resetApplied = ResetServerOrder(second.Id);
-            var resetSubscription = LoadAll().Single(item => item.Id == second.Id);
-            var resetPersisted = resetSubscription.Servers.Select(item => item.Id)
-                .SequenceEqual(["second-c", "second-a", "second-b"], StringComparer.Ordinal) &&
-                !resetSubscription.CustomServerOrder;
+            var providerOrdersCompacted = refreshed.Servers.Select(item => item.DisplayOrder).SequenceEqual([1, 2, 3]);
 
             var providerOrdered = Store(new NoraSubscriptionInfo
             {
@@ -2216,65 +2103,15 @@ internal static class NoraSubscriptionStore
             var providerOrderFollowed = providerOrdered.Servers.Select(item => item.Id)
                 .SequenceEqual(["provider-nl", "provider-ru"], StringComparer.Ordinal);
 
-            static NoraSubscriptionServer MigrationNode(string id, string name, string host) => new()
-            {
-                Id = id,
-                Name = name,
-                Host = host,
-                Port = 443,
-                Uuid = "66666666-6666-4666-8666-666666666666",
-                Network = "xhttp",
-                Security = "reality",
-                Sni = "migration.example",
-                Fingerprint = "firefox",
-                PublicKey = "migration-key",
-                ShortId = "cafe"
-            };
-            var legacyA = MigrationNode("legacy-name-a", "Legacy A", "198.51.100.31");
-            var legacyB = MigrationNode("legacy-name-b", "Legacy B", "198.51.100.32");
-            var legacySubscription = Store(new NoraSubscriptionInfo
-            {
-                Id = "migration-subscription",
-                Title = "Migration",
-                Servers = [legacyA, legacyB]
-            }, "fixture:migration");
-            var legacyMoved = MoveServer(legacySubscription.Id, legacyB.Id, -1);
-            var legacyWithoutSnapshot = LoadAll().Single(item => item.Id == legacySubscription.Id);
-            foreach (var server in legacyWithoutSnapshot.Servers)
-                server.ProviderOrder = 0;
-            PersistSubscriptionOrder(legacyWithoutSnapshot);
-            var legacyResetRequiresRefresh = !ResetServerOrder(legacySubscription.Id);
-            var semanticA = MigrationNode("", "Renamed A", legacyA.Host);
-            var semanticB = MigrationNode("", "Renamed B", legacyB.Host);
-            semanticA.Id = StableId("runtime-v1|" + RuntimeIdentity(semanticA));
-            semanticB.Id = StableId("runtime-v1|" + RuntimeIdentity(semanticB));
-            var migrated = Store(new NoraSubscriptionInfo
-            {
-                Id = legacySubscription.Id,
-                Title = legacySubscription.Title,
-                Servers = [semanticA, semanticB]
-            }, "fixture:migration");
-            var migratedIds = migrated.Servers.Select(item => item.Id).ToArray();
-            var migratedResetApplied = ResetServerOrder(legacySubscription.Id);
-            var migratedResetIds = LoadAll().Single(item => item.Id == legacySubscription.Id)
-                .Servers.Select(item => item.Id).ToArray();
-
             var passed = orderedSubscriptions.SequenceEqual(["first", "second", "third"], StringComparer.Ordinal) &&
-                         moved &&
-                         servers.Select(item => item.Id).SequenceEqual(["b", "a", "c"], StringComparer.Ordinal) &&
-                         servers.Select(item => item.DisplayOrder).SequenceEqual([1, 2, 3]) &&
                          first.DisplayOrder == 1 && second.DisplayOrder == 2 &&
-                         movedSubscription && movedServer &&
+                         movedSubscription &&
                          persistedSubscriptions.SequenceEqual(["second-subscription", "first-subscription"], StringComparer.Ordinal) &&
-                         persistedServers.SequenceEqual(["second-b", "second-a", "second-c"], StringComparer.Ordinal) &&
-                         customOrderSurvivesReload && customOrdersCompacted && providerSnapshotRecorded && resetApplied && resetPersisted &&
-                         providerFirstImportPreserved && providerOrderFollowed &&
-                         legacyMoved && legacyResetRequiresRefresh &&
-                         migratedIds.SequenceEqual([semanticB.Id, semanticA.Id], StringComparer.Ordinal) &&
-                         migratedResetApplied &&
-                         migratedResetIds.SequenceEqual([semanticA.Id, semanticB.Id], StringComparer.Ordinal);
+                         persistedServers.SequenceEqual(["second-c", "second-a", "second-b"], StringComparer.Ordinal) &&
+                         providerOrderSurvivesReload && providerOrdersCompacted &&
+                         providerFirstImportPreserved && providerOrderFollowed;
             output.WriteLine(passed
-                ? "SUBSCRIPTION ORDER SELF-TEST PASS: provider-order=followed/resettable; custom-order=stable/compacted; new-nodes=non-disruptive; legacy-refresh-contract=verified; moves=bounded"
+                ? "SUBSCRIPTION ORDER SELF-TEST PASS: subscription-card order persists; server order always follows provider payload; legacy manual order is discarded on refresh"
                 : "SUBSCRIPTION ORDER SELF-TEST FAIL: unexpected ordering result");
             return passed ? 0 : 1;
         }

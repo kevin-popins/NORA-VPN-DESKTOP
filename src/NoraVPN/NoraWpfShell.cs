@@ -648,7 +648,6 @@ internal sealed class NoraWpfWindow : Window
     private readonly List<NoraTrafficGraph> _graphs = [];
     private readonly Dictionary<string, TextBlock> _userStatusText = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, TextBlock> _userTrafficText = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, FrameworkElement> _serverRowElements = new(StringComparer.OrdinalIgnoreCase);
     private static readonly object ImageCacheSync = new();
     private static readonly Dictionary<string, IReadOnlyList<ImageSource>> LocationImageCache = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Dictionary<string, ImageSource> NamedImageCache = new(StringComparer.OrdinalIgnoreCase);
@@ -657,8 +656,6 @@ internal sealed class NoraWpfWindow : Window
     private static readonly Dictionary<string, ImageSource?> EmojiImageCache = new(StringComparer.OrdinalIgnoreCase);
 
     private NoraConnectButton? _connectButton;
-    private ScrollViewer? _serversScrollViewer;
-    private ServerViewportAnchor? _pendingServerViewportAnchor;
     private NoraCyberGrid? _heroGrid;
     private NoraAudioBarBackdrop? _audioBackdrop;
     private TextBlock? _discordModeStatusText;
@@ -699,7 +696,7 @@ internal sealed class NoraWpfWindow : Window
     private long _lastInterfaceBytesReceived = -1;
     private readonly Queue<(long Up, long Down)> _trafficHistory = [];
     private bool _isPinging;
-    private bool _isArrangingServers;
+    private bool _isArrangingSubscriptions;
     private bool _showActiveEndpoint;
     private string _selectedManagedServerPath = "";
     private string _expandedManagedServerPath = "";
@@ -768,7 +765,7 @@ internal sealed class NoraWpfWindow : Window
         var snapshotState = Environment.GetEnvironmentVariable("NORA_GUI_SNAPSHOT_STATE")?.Trim().ToLowerInvariant() ?? "";
         _snapshotServerInfo = BuildLocationSnapshotServer(snapshotState);
         if (snapshotState == "arrange")
-            _isArrangingServers = true;
+            _isArrangingSubscriptions = true;
         if (snapshotState == "endpoint-revealed")
             _showActiveEndpoint = true;
         if (snapshotState is "connected" or "discord-active" or "connecting" or "stopping" or "failed")
@@ -1578,12 +1575,6 @@ internal sealed class NoraWpfWindow : Window
         _heroGrid = null;
         _discordModeStatusText = null;
         _welcomeOverlayHost = null;
-        if (page != PageKind.Servers)
-        {
-            _serversScrollViewer = null;
-            _serverRowElements.Clear();
-            _pendingServerViewportAnchor = null;
-        }
         _contentHost.ClipToBounds = true;
         _contentHost.Children.Clear();
         _homeAtmosphereHost.Children.Clear();
@@ -3827,7 +3818,6 @@ internal sealed class NoraWpfWindow : Window
 
     private UIElement ServersPage()
     {
-        _serverRowElements.Clear();
         var root = new StackPanel();
         var radar = new NoraIcon { Kind = NoraIconKind.Radar, Width = 24, Height = 24, Stroke = NoraWpfTheme.OrangeBrush };
         if (_isPinging && NoraWpfTheme.MotionEnabled)
@@ -3837,10 +3827,13 @@ internal sealed class NoraWpfWindow : Window
             radar.RenderTransform = spin;
             spin.BeginAnimation(RotateTransform.AngleProperty, new DoubleAnimation(0, 360, TimeSpan.FromSeconds(1.6)) { RepeatBehavior = RepeatBehavior.Forever });
         }
-        root.Children.Add(ServersPageTitle(radar));
+        var subscriptions = NoraSubscriptionStore.LoadAll();
+        var canArrangeSubscriptions = subscriptions.Count > 1;
+        if (!canArrangeSubscriptions)
+            _isArrangingSubscriptions = false;
+        root.Children.Add(ServersPageTitle(radar, canArrangeSubscriptions));
 
         var list = new StackPanel { Margin = new Thickness(0, 16, 0, 14) };
-        var subscriptions = NoraSubscriptionStore.LoadAll();
         for (var index = 0; index < subscriptions.Count; index++)
             list.Children.Add(SubscriptionCard(subscriptions[index], index, subscriptions.Count));
 
@@ -3851,18 +3844,22 @@ internal sealed class NoraWpfWindow : Window
             list.Children.Add(EmptyState("No servers yet. Import a key, subscription URL, or install KRot on a VPS."));
         root.Children.Add(list);
 
-        var use = NoraButton(_isArrangingServers ? "Done arranging" : "Use selected", accent: true);
-        use.IsEnabled = !_isArrangingServers;
-        use.Opacity = _isArrangingServers ? 0.42 : 1;
-        use.Click += (_, _) => RenderPage(PageKind.Home);
+        var use = NoraButton(_isArrangingSubscriptions ? "Done arranging" : "Use selected", accent: true);
+        use.Click += (_, _) =>
+        {
+            if (_isArrangingSubscriptions)
+            {
+                _isArrangingSubscriptions = false;
+                RenderPage(PageKind.Servers);
+                return;
+            }
+            RenderPage(PageKind.Home);
+        };
         root.Children.Add(use);
-        var scroll = ScrollPage(root);
-        _serversScrollViewer = scroll;
-        RestorePendingServerViewportAnchor(scroll);
-        return scroll;
+        return ScrollPage(root);
     }
 
-    private UIElement ServersPageTitle(NoraIcon radar)
+    private UIElement ServersPageTitle(NoraIcon radar, bool canArrangeSubscriptions)
     {
         var grid = new Grid();
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -3872,11 +3869,11 @@ internal sealed class NoraWpfWindow : Window
         text.Children.Add(new TextBlock { Text = "Servers", FontSize = 42, FontWeight = FontWeights.Bold });
         text.Children.Add(new TextBlock
         {
-            Text = _isArrangingServers
-                ? "Move subscriptions and servers. Changes save instantly."
+            Text = _isArrangingSubscriptions
+                ? "Move subscriptions. Changes save instantly."
                 : _isPinging ? "Measuring latency..." : "Pick a node - the change applies instantly.",
             FontSize = 16,
-            Foreground = _isArrangingServers ? NoraWpfTheme.Brush(Color.FromRgb(224, 181, 112)) : NoraWpfTheme.MutedBrush,
+            Foreground = _isArrangingSubscriptions ? NoraWpfTheme.Brush(Color.FromRgb(224, 181, 112)) : NoraWpfTheme.MutedBrush,
             Margin = new Thickness(0, 8, 0, 0),
             TextWrapping = TextWrapping.Wrap
         });
@@ -3888,31 +3885,36 @@ internal sealed class NoraWpfWindow : Window
             VerticalAlignment = VerticalAlignment.Top,
             Margin = new Thickness(0, 8, 0, 0)
         };
-        var arrange = new NoraFxButton(
-            _isArrangingServers ? Color.FromArgb(44, 255, 156, 38) : Color.FromArgb(16, 255, 156, 38),
-            _isArrangingServers ? Color.FromArgb(68, 255, 184, 74) : Color.FromArgb(46, 255, 156, 38),
-            18,
-            accent: _isArrangingServers,
-            stroke: NoraWpfTheme.Brush(NoraWpfTheme.With(_isArrangingServers ? NoraWpfTheme.Orange2 : NoraWpfTheme.Orange, 130)))
+        if (canArrangeSubscriptions)
         {
-            Content = new NoraIcon
+            var arrange = new NoraFxButton(
+                _isArrangingSubscriptions ? Color.FromArgb(44, 255, 156, 38) : Color.FromArgb(16, 255, 156, 38),
+                _isArrangingSubscriptions ? Color.FromArgb(68, 255, 184, 74) : Color.FromArgb(46, 255, 156, 38),
+                18,
+                accent: _isArrangingSubscriptions,
+                stroke: NoraWpfTheme.Brush(NoraWpfTheme.With(_isArrangingSubscriptions ? NoraWpfTheme.Orange2 : NoraWpfTheme.Orange, 130)))
             {
-                Kind = _isArrangingServers ? NoraIconKind.Check : NoraIconKind.Pencil,
-                Width = 20,
-                Height = 20,
-                Stroke = _isArrangingServers ? NoraWpfTheme.BgBrush : NoraWpfTheme.OrangeBrush,
-                Weight = 2.0
-            },
-            Width = 46,
-            Height = 50,
-            ToolTip = _isArrangingServers ? "Done arranging" : "Arrange subscriptions and servers"
-        };
-        arrange.Click += (_, _) =>
-        {
-            _isArrangingServers = !_isArrangingServers;
-            RenderPage(PageKind.Servers);
-        };
-        actions.Children.Add(arrange);
+                Content = new NoraIcon
+                {
+                    Kind = _isArrangingSubscriptions ? NoraIconKind.Check : NoraIconKind.Pencil,
+                    Width = 20,
+                    Height = 20,
+                    Stroke = _isArrangingSubscriptions ? NoraWpfTheme.BgBrush : NoraWpfTheme.OrangeBrush,
+                    Weight = 2.0
+                },
+                Width = 46,
+                Height = 50,
+                ToolTip = _isArrangingSubscriptions ? "Done arranging" : "Arrange subscriptions"
+            };
+            arrange.Click += (_, _) =>
+            {
+                _isArrangingSubscriptions = !_isArrangingSubscriptions;
+                if (_isArrangingSubscriptions)
+                    _expandedSubscriptionId = "";
+                RenderPage(PageKind.Servers);
+            };
+            actions.Children.Add(arrange);
+        }
 
         var ping = new NoraFxButton(Color.FromArgb(20, 255, 156, 38), Color.FromArgb(46, 255, 156, 38), 18, accent: true)
         {
@@ -4051,40 +4053,8 @@ internal sealed class NoraWpfWindow : Window
             VerticalAlignment = VerticalAlignment.Center,
             Margin = new Thickness(4, 0, 4, 0)
         };
-        if (_isArrangingServers)
+        if (_isArrangingSubscriptions)
         {
-            if (sub.CustomServerOrder)
-            {
-                var resetOrder = new NoraFxButton(
-                    Color.FromArgb(14, 255, 156, 38),
-                    Color.FromArgb(40, 255, 156, 38),
-                    10,
-                    accent: false,
-                    stroke: NoraWpfTheme.Brush(Color.FromArgb(70, 255, 156, 38)))
-                {
-                    Width = 82,
-                    Height = 32,
-                    Margin = new Thickness(5, 0, 0, 0),
-                    ToolTip = "Restore the order supplied by the subscription provider",
-                    VerticalAlignment = VerticalAlignment.Center,
-                    Content = new TextBlock
-                    {
-                        Text = "Reset order",
-                        FontSize = 11,
-                        FontWeight = FontWeights.SemiBold,
-                        Foreground = NoraWpfTheme.OrangeBrush,
-                        HorizontalAlignment = HorizontalAlignment.Center,
-                        VerticalAlignment = VerticalAlignment.Center
-                    }
-                };
-                resetOrder.Click += async (_, eventArgs) =>
-                {
-                    eventArgs.Handled = true;
-                    await ResetSubscriptionServerOrderAsync(sub);
-                };
-                actions.Children.Add(resetOrder);
-            }
-
             if (subscriptionCount > 1)
             {
                 actions.Children.Add(ReorderStepper(
@@ -4114,7 +4084,7 @@ internal sealed class NoraWpfWindow : Window
         Grid.SetColumn(actions, 2);
         header.Children.Add(actions);
 
-        if (!_isArrangingServers)
+        if (!_isArrangingSubscriptions)
         {
             Grid.SetColumn(chevron, 3);
             header.Children.Add(chevron);
@@ -4195,17 +4165,17 @@ internal sealed class NoraWpfWindow : Window
 
         card.MouseLeftButtonUp += (_, _) =>
         {
-            if (_isArrangingServers)
+            if (_isArrangingSubscriptions)
                 return;
             _expandedSubscriptionId = expanded ? "" : sub.Id;
             RenderPage(PageKind.Servers);
         };
 
-        var wiggleSubscription = _isArrangingServers && subscriptionCount > 1;
+        var wiggleSubscription = _isArrangingSubscriptions && subscriptionCount > 1;
         if (wiggleSubscription)
-            ApplyArrangementWiggle(card, subscriptionIndex, isCard: true);
+            ApplyArrangementWiggle(card, subscriptionIndex);
 
-        if (expanded)
+        if (expanded && !_isArrangingSubscriptions)
         {
             var listHost = new StackPanel { Margin = new Thickness(0, 12, 0, 0) };
             listHost.Children.Add(new Border
@@ -4226,13 +4196,7 @@ internal sealed class NoraWpfWindow : Window
                     _ping.TryGetValue(server.LocalPath, out var p) ? p : PingStatus.Unknown,
                     index++,
                     async () => await ActivateSubscriptionServerAsync(server),
-                    async () => await DeleteSubscriptionServerAsync(server),
-                    _isArrangingServers && sub.Servers.Count > 1,
-                    async direction => await MoveSubscriptionServerAsync(sub, server, direction),
-                    index > 1,
-                    index < sub.Servers.Count);
-                if (row is FrameworkElement element)
-                    _serverRowElements[ServerViewportKey(sub.Id, server.Id)] = element;
+                    async () => await DeleteSubscriptionServerAsync(server));
                 listHost.Children.Add(row);
             }
             panel.Children.Add(listHost);
@@ -4612,11 +4576,7 @@ internal sealed class NoraWpfWindow : Window
         PingStatus ping,
         int index,
         Func<Task> select,
-        Func<Task>? delete = null,
-        bool arranging = false,
-        Func<int, Task>? move = null,
-        bool canMoveUp = false,
-        bool canMoveDown = false)
+        Func<Task>? delete = null)
     {
         var baseBg = selected ? Color.FromArgb(38, 255, 156, 38) : Color.FromArgb(0, 27, 34, 45);
         var hoverBg = selected ? Color.FromArgb(52, 255, 156, 38) : Color.FromArgb(170, 27, 34, 45);
@@ -4633,13 +4593,11 @@ internal sealed class NoraWpfWindow : Window
         };
         row.MouseEnter += (_, _) =>
         {
-            if (!arranging)
-                bg.BeginAnimation(SolidColorBrush.ColorProperty, ColorTo(hoverBg, 140));
+            bg.BeginAnimation(SolidColorBrush.ColorProperty, ColorTo(hoverBg, 140));
         };
         row.MouseLeave += (_, _) =>
         {
-            if (!arranging)
-                bg.BeginAnimation(SolidColorBrush.ColorProperty, ColorTo(baseBg, 220));
+            bg.BeginAnimation(SolidColorBrush.ColorProperty, ColorTo(baseBg, 220));
         };
 
         var grid = new Grid();
@@ -4695,16 +4653,7 @@ internal sealed class NoraWpfWindow : Window
             });
         }
         right.Children.Add(PingBadge(ping));
-        if (arranging && move is not null)
-        {
-            right.Children.Add(ReorderStepper(
-                canMoveUp,
-                canMoveDown,
-                move,
-                "Move server",
-                compact: true));
-        }
-        else if (delete is not null)
+        if (delete is not null)
         {
             var remove = IconActionButton(NoraIconKind.Trash, "Delete server", danger: true);
             remove.Width = 30;
@@ -4723,16 +4672,10 @@ internal sealed class NoraWpfWindow : Window
         row.MouseLeftButtonUp += async (_, e) =>
         {
             e.Handled = true;
-            if (arranging)
-                return;
             await select();
         };
 
-        if (arranging)
-        {
-            ApplyArrangementWiggle(row, index, isCard: false);
-        }
-        else if (NoraWpfTheme.MotionEnabled && index < 14)
+        if (NoraWpfTheme.MotionEnabled && index < 14)
         {
             // Staggered entrance: rows cascade in when a group expands.
             row.Opacity = 0;
@@ -4752,15 +4695,14 @@ internal sealed class NoraWpfWindow : Window
         bool canMoveUp,
         bool canMoveDown,
         Func<int, Task> move,
-        string label,
-        bool compact = false)
+        string label)
     {
         var stack = new StackPanel
         {
-            Width = compact ? 26 : 28,
-            Height = compact ? 32 : 36,
+            Width = 28,
+            Height = 36,
             VerticalAlignment = VerticalAlignment.Center,
-            Margin = new Thickness(compact ? 7 : 2, 0, 0, 0)
+            Margin = new Thickness(2, 0, 0, 0)
         };
 
         NoraFxButton Arrow(NoraIconKind icon, bool enabled, int direction, string tooltip)
@@ -4772,8 +4714,8 @@ internal sealed class NoraWpfWindow : Window
                 accent: false,
                 stroke: NoraWpfTheme.Brush(Color.FromArgb(70, 255, 156, 38)))
             {
-                Width = compact ? 26 : 28,
-                Height = compact ? 15 : 17,
+                Width = 28,
+                Height = 17,
                 Padding = new Thickness(0),
                 IsEnabled = enabled,
                 Opacity = enabled ? 1 : 0.24,
@@ -4781,8 +4723,8 @@ internal sealed class NoraWpfWindow : Window
                 Content = new NoraIcon
                 {
                     Kind = icon,
-                    Width = compact ? 12 : 13,
-                    Height = compact ? 12 : 13,
+                    Width = 13,
+                    Height = 13,
                     Stroke = NoraWpfTheme.OrangeBrush,
                     Weight = 2.0
                 }
@@ -4800,7 +4742,7 @@ internal sealed class NoraWpfWindow : Window
         return stack;
     }
 
-    private void ApplyArrangementWiggle(FrameworkElement element, int index, bool isCard)
+    private void ApplyArrangementWiggle(FrameworkElement element, int index)
     {
         if (!NoraWpfTheme.MotionEnabled)
             return;
@@ -4814,9 +4756,9 @@ internal sealed class NoraWpfWindow : Window
         element.RenderTransform = transforms;
 
         var delay = TimeSpan.FromMilliseconds((index % 5) * 72);
-        var cycle = TimeSpan.FromMilliseconds(isCard ? 920 : 760);
-        var x = isCard ? 0.72 : 0.65;
-        var angle = isCard ? 0.22 : 0.22;
+        var cycle = TimeSpan.FromMilliseconds(920);
+        const double x = 0.72;
+        const double angle = 0.22;
         var ease = new SineEase { EasingMode = EasingMode.EaseInOut };
         translate.BeginAnimation(TranslateTransform.XProperty, new DoubleAnimationUsingKeyFrames
         {
@@ -5015,72 +4957,6 @@ internal sealed class NoraWpfWindow : Window
             AppendLog($"Saved subscription order for {subscription.Title}.");
             RenderPage(PageKind.Servers);
         }
-    }
-
-    private async Task MoveSubscriptionServerAsync(NoraSubscriptionInfo subscription, NoraSubscriptionServer server, int direction)
-    {
-        var viewportAnchor = CaptureServerViewportAnchor(subscription.Id, server.Id);
-        if (await _subscriptionRefreshCoordinator.RunExclusiveSyncAsync(
-                () => NoraSubscriptionStore.MoveServer(subscription.Id, server.Id, direction)))
-        {
-            AppendLog($"Saved server order for {server.Name}.");
-            _pendingServerViewportAnchor = viewportAnchor;
-            RenderPage(PageKind.Servers);
-        }
-    }
-
-    private async Task ResetSubscriptionServerOrderAsync(NoraSubscriptionInfo subscription)
-    {
-        var reset = await _subscriptionRefreshCoordinator.RunExclusiveSyncAsync(
-            () => NoraSubscriptionStore.ResetServerOrder(subscription.Id));
-        if (!reset)
-        {
-            AppendLog($"Provider order is not available yet for {subscription.Title}; refresh the subscription first.");
-            ShowToast(
-                "Refresh required",
-                $"Refresh {subscription.Title} once, then reset its order.",
-                ToastKind.Info);
-            return;
-        }
-
-        AppendLog($"Restored provider server order for {subscription.Title}.");
-        RenderPage(PageKind.Servers);
-        ShowToast(
-            "Provider order restored",
-            $"{subscription.Title} now follows the provider's server order.",
-            ToastKind.Success);
-    }
-
-    private sealed record ServerViewportAnchor(string Key, double ViewportY);
-
-    private static string ServerViewportKey(string subscriptionId, string serverId) => subscriptionId + "\u001f" + serverId;
-
-    private ServerViewportAnchor? CaptureServerViewportAnchor(string subscriptionId, string serverId)
-    {
-        var key = ServerViewportKey(subscriptionId, serverId);
-        if (_serversScrollViewer is null || !_serverRowElements.TryGetValue(key, out var row) || !row.IsLoaded)
-            return null;
-
-        return new ServerViewportAnchor(key, row.TranslatePoint(new Point(0, 0), _serversScrollViewer).Y);
-    }
-
-    private void RestorePendingServerViewportAnchor(ScrollViewer scroll)
-    {
-        var anchor = _pendingServerViewportAnchor;
-        _pendingServerViewportAnchor = null;
-        if (anchor is null)
-            return;
-
-        scroll.Loaded += (_, _) => Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
-        {
-            if (_serversScrollViewer != scroll || !_serverRowElements.TryGetValue(anchor.Key, out var row))
-                return;
-
-            scroll.UpdateLayout();
-            var currentY = row.TranslatePoint(new Point(0, 0), scroll).Y;
-            var targetOffset = Math.Clamp(scroll.VerticalOffset + currentY - anchor.ViewportY, 0, scroll.ScrollableHeight);
-            scroll.ScrollToVerticalOffset(targetOffset);
-        }));
     }
 
     private UIElement PingBadge(PingStatus ping)

@@ -1,5 +1,5 @@
 param(
-    [string]$AppVersion = "0.1.0-pre.7-rc.1",
+    [string]$AppVersion = "0.1.0-pre.7-rc.2",
     [string]$InstallerVersion = "0.1.0.7",
     [string]$BuildId = "",
     [string]$OutputDirectory = "",
