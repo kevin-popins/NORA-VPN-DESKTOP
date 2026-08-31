@@ -48,6 +48,10 @@ internal sealed class NoraSubscriptionServer
     public string Id { get; set; } = "";
     // Local-only position within its subscription; preserved by Store().
     public int DisplayOrder { get; set; }
+    // Last position observed in the provider payload. This stays independent
+    // from DisplayOrder so an explicit "restore provider order" operation can
+    // be applied without downloading the subscription a second time.
+    public int ProviderOrder { get; set; }
     public string SubscriptionId { get; set; } = "";
     public string SubscriptionTitle { get; set; } = "";
     public string Name { get; set; } = "";
@@ -136,6 +140,15 @@ internal sealed class NoraExternalProfileInfo
 
 internal static class NoraSubscriptionStore
 {
+    // sing-box 1.13 can misclassify Roblox's RakNet-style UDP handshake as
+    // BitTorrent/uTP. Keep this allow-list deliberately narrow: only UDP owned
+    // by the actual Roblox game process bypasses the provider's BitTorrent
+    // reject rule. TCP and every other process still go through normal policy.
+    private static readonly string[] BittorrentFalsePositiveUdpProcessNames =
+    [
+        "RobloxPlayerBeta.exe"
+    ];
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -755,19 +768,29 @@ internal static class NoraSubscriptionStore
             rule["ip_cidr"] = StringArray(matchers.IpCidrs.Distinct());
     }
 
-    // Emits sing-box route rules for a provider policy: block first, then direct
-    // (bypass tunnel via the local `direct` outbound), then explicit proxy. The
-    // caller keeps `final=proxy`, so anything unmatched still goes through the VPN.
+    // Emits sing-box route rules for a provider policy: explicit blocks first,
+    // then the narrow Roblox UDP false-positive exception and BitTorrent block,
+    // then direct and explicit proxy. The caller keeps `final=proxy`, so anything
+    // unmatched still goes through the VPN.
     private static void AppendPolicyRouteRules(JsonArray rules, NoraRoutePolicy policy)
     {
-        if (policy.BlockBittorrent)
-            rules.Add(new JsonObject { ["protocol"] = new JsonArray("bittorrent"), ["action"] = "reject" });
         if (!policy.Block.IsEmpty)
         {
             var rule = new JsonObject();
             AddMatchers(rule, policy.Block);
             rule["action"] = "reject";
             rules.Add(rule);
+        }
+        if (policy.BlockBittorrent)
+        {
+            rules.Add(new JsonObject
+            {
+                ["process_name"] = StringArray(BittorrentFalsePositiveUdpProcessNames),
+                ["network"] = new JsonArray("udp"),
+                ["action"] = "route",
+                ["outbound"] = "proxy"
+            });
+            rules.Add(new JsonObject { ["protocol"] = new JsonArray("bittorrent"), ["action"] = "reject" });
         }
         if (!policy.Direct.IsEmpty)
         {
@@ -1082,6 +1105,16 @@ internal static class NoraSubscriptionStore
         if (policy is not null)
             AppendPolicyRouteRules(routeRules, policy);
 
+        var route = new JsonObject
+        {
+            ["rules"] = routeRules,
+            ["auto_detect_interface"] = true,
+            ["default_domain_resolver"] = "local",
+            ["final"] = "proxy"
+        };
+        if (policy?.BlockBittorrent == true)
+            route["find_process"] = true;
+
         var root = new JsonObject
         {
             ["log"] = new JsonObject { ["level"] = "info", ["timestamp"] = true },
@@ -1113,16 +1146,103 @@ internal static class NoraSubscriptionStore
                 },
                 new JsonObject { ["type"] = "direct", ["tag"] = "direct" }
             },
-            ["route"] = new JsonObject
-            {
-                ["rules"] = routeRules,
-                ["auto_detect_interface"] = true,
-                ["default_domain_resolver"] = "local",
-                ["final"] = "proxy"
-            }
+            ["route"] = route
         };
         return root.ToJsonString(JsonOptions);
     }
+
+    public static int RunRobloxRoutingSelfTest(TextWriter output)
+    {
+        const string providerPolicy = """
+            {
+              "routing": {
+                "rules": [
+                  {"type":"field","protocol":["bittorrent"],"outboundTag":"block"}
+                ]
+              }
+            }
+            """;
+        try
+        {
+            var server = new NoraSubscriptionServer
+            {
+                Id = "roblox-routing-fixture",
+                Name = "Roblox routing fixture",
+                Protocol = "VLESS",
+                Host = "198.51.100.9",
+                Port = 443,
+                RawConfigJson = providerPolicy
+            };
+            var generated = BuildXrayTunFrontendConfig(20808, server, "NORA-Xray-Roblox-selftest");
+            using var document = JsonDocument.Parse(generated);
+            var route = document.RootElement.GetProperty("route");
+            var rules = route.GetProperty("rules").EnumerateArray().ToArray();
+
+            var robloxRuleIndex = Array.FindIndex(rules, rule =>
+                RuleContains(rule, "process_name", "RobloxPlayerBeta.exe") &&
+                RuleContains(rule, "network", "udp") &&
+                RuleString(rule, "action") == "route" &&
+                RuleString(rule, "outbound") == "proxy");
+            var bittorrentRejectIndex = Array.FindIndex(rules, rule =>
+                RuleContains(rule, "protocol", "bittorrent") &&
+                RuleString(rule, "action") == "reject");
+
+            var robloxRuleIsNarrow = robloxRuleIndex >= 0 &&
+                                     RuleValues(rules[robloxRuleIndex], "process_name")
+                                         .SequenceEqual(BittorrentFalsePositiveUdpProcessNames, StringComparer.OrdinalIgnoreCase) &&
+                                     RuleValues(rules[robloxRuleIndex], "network")
+                                         .SequenceEqual(["udp"], StringComparer.OrdinalIgnoreCase);
+
+            // This is a deterministic structural test of the real generated
+            // sing-box config. Runtime process attribution is verified separately
+            // by a live Roblox join test on Windows.
+            var passed = route.GetProperty("find_process").GetBoolean() &&
+                         robloxRuleIsNarrow &&
+                         robloxRuleIndex < bittorrentRejectIndex &&
+                         bittorrentRejectIndex >= 0 &&
+                         ValidateSingBoxConfigSyntax(generated);
+
+            output.WriteLine(passed
+                ? "ROBLOX ROUTING SELF-TEST PASS: generated config places only RobloxPlayerBeta UDP before BitTorrent reject; non-Roblox BitTorrent UDP and TCP remain rejected"
+                : "ROBLOX ROUTING SELF-TEST FAIL");
+            return passed ? 0 : 1;
+        }
+        catch (Exception exception)
+        {
+            output.WriteLine("ROBLOX ROUTING SELF-TEST FAIL: " + exception.GetType().Name + ": " + exception.Message);
+            return 1;
+        }
+    }
+
+    private static bool RuleContains(JsonElement rule, string propertyName, string expected)
+    {
+        if (!rule.TryGetProperty(propertyName, out var property))
+            return false;
+        if (property.ValueKind == JsonValueKind.String)
+            return string.Equals(property.GetString(), expected, StringComparison.OrdinalIgnoreCase);
+        return property.ValueKind == JsonValueKind.Array && property.EnumerateArray().Any(item =>
+            item.ValueKind == JsonValueKind.String &&
+            string.Equals(item.GetString(), expected, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string[] RuleValues(JsonElement rule, string propertyName)
+    {
+        if (!rule.TryGetProperty(propertyName, out var property))
+            return [];
+        if (property.ValueKind == JsonValueKind.String)
+            return [property.GetString() ?? ""];
+        return property.ValueKind == JsonValueKind.Array
+            ? property.EnumerateArray()
+                .Where(item => item.ValueKind == JsonValueKind.String)
+                .Select(item => item.GetString() ?? "")
+                .ToArray()
+            : [];
+    }
+
+    private static string RuleString(JsonElement rule, string propertyName)
+        => rule.TryGetProperty(propertyName, out var property) && property.ValueKind == JsonValueKind.String
+            ? property.GetString() ?? ""
+            : "";
 
     private static JsonObject BuildXrayVlessOutbound(NoraSubscriptionServer server)
     {
@@ -1530,10 +1650,14 @@ internal static class NoraSubscriptionStore
             : NextSubscriptionDisplayOrder();
         sub.CustomServerOrder = previous?.CustomServerOrder ?? false;
         var previousServers = previous?.Servers ?? [];
+        // ParsePayload and DeduplicateServers retain first-occurrence order, so
+        // the incoming array is the authoritative provider sequence.
+        for (var index = 0; index < sub.Servers.Count; index++)
+            sub.Servers[index].ProviderOrder = index + 1;
         if (!sub.CustomServerOrder)
         {
             for (var index = 0; index < sub.Servers.Count; index++)
-                sub.Servers[index].DisplayOrder = index + 1;
+                sub.Servers[index].DisplayOrder = sub.Servers[index].ProviderOrder;
         }
         else
         {
@@ -1567,6 +1691,11 @@ internal static class NoraSubscriptionStore
             }
         }
         sub.Servers = OrderServers(sub.Servers).ToList();
+        // Removed provider rows can leave gaps in a custom layout. Compacting
+        // positions after every merge keeps future matches deterministic while
+        // preserving the exact relative order chosen by the user.
+        for (var index = 0; index < sub.Servers.Count; index++)
+            sub.Servers[index].DisplayOrder = index + 1;
 
         foreach (var server in sub.Servers)
         {
@@ -1622,6 +1751,35 @@ internal static class NoraSubscriptionStore
             servers[order].DisplayOrder = order + 1;
         subscription.CustomServerOrder = true;
         subscription.Servers = servers;
+        PersistSubscriptionOrder(subscription);
+        return true;
+    }
+
+    public static bool ResetServerOrder(string subscriptionId)
+    {
+        if (string.IsNullOrWhiteSpace(subscriptionId))
+            return false;
+        var subscription = LoadAll().FirstOrDefault(item =>
+            string.Equals(item.Id, subscriptionId, StringComparison.OrdinalIgnoreCase));
+        if (subscription is null || subscription.Servers.Count == 0)
+            return false;
+
+        // Legacy files did not retain provider positions. A normal refresh on
+        // this version records them even while custom ordering remains active;
+        // until then there is no truthful provider order to reconstruct.
+        var providerOrders = subscription.Servers.Select(server => server.ProviderOrder).ToArray();
+        if (providerOrders.Any(order => order <= 0) ||
+            providerOrders.Distinct().Count() != providerOrders.Length)
+            return false;
+
+        subscription.CustomServerOrder = false;
+        subscription.Servers = subscription.Servers
+            .OrderBy(server => server.ProviderOrder)
+            .ThenBy(server => server.Name, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(server => server.Id, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        for (var index = 0; index < subscription.Servers.Count; index++)
+            subscription.Servers[index].DisplayOrder = index + 1;
         PersistSubscriptionOrder(subscription);
         return true;
     }
@@ -2012,13 +2170,26 @@ internal static class NoraSubscriptionStore
                 Title = second.Title,
                 Servers =
                 [
+                    new NoraSubscriptionServer { Id = "second-c", Name = "Second C", Host = "198.51.100.4" },
                     new NoraSubscriptionServer { Id = "second-a", Name = "Second A", Host = "198.51.100.2" },
-                    new NoraSubscriptionServer { Id = "second-b", Name = "Second B", Host = "198.51.100.3" },
-                    new NoraSubscriptionServer { Id = "second-c", Name = "Second C", Host = "198.51.100.4" }
+                    new NoraSubscriptionServer { Id = "second-b", Name = "Second B", Host = "198.51.100.3" }
                 ]
             }, "fixture:second");
             var persistedSubscriptions = LoadAll().Select(item => item.Id).ToArray();
             var persistedServers = refreshed.Servers.Select(item => item.Id).ToArray();
+            var customOrderSurvivesReload = LoadAll().Single(item => item.Id == second.Id)
+                .Servers.Select(item => item.Id)
+                .SequenceEqual(["second-b", "second-a", "second-c"], StringComparer.Ordinal);
+            var customOrdersCompacted = refreshed.Servers.Select(item => item.DisplayOrder).SequenceEqual([1, 2, 3]);
+            var providerSnapshotRecorded = refreshed.Servers
+                .OrderBy(item => item.ProviderOrder)
+                .Select(item => item.Id)
+                .SequenceEqual(["second-c", "second-a", "second-b"], StringComparer.Ordinal);
+            var resetApplied = ResetServerOrder(second.Id);
+            var resetSubscription = LoadAll().Single(item => item.Id == second.Id);
+            var resetPersisted = resetSubscription.Servers.Select(item => item.Id)
+                .SequenceEqual(["second-c", "second-a", "second-b"], StringComparer.Ordinal) &&
+                !resetSubscription.CustomServerOrder;
 
             var providerOrdered = Store(new NoraSubscriptionInfo
             {
@@ -2030,6 +2201,8 @@ internal static class NoraSubscriptionStore
                     new NoraSubscriptionServer { Id = "provider-nl", Name = "Netherlands", Host = "198.51.100.11", DisplayOrder = 2 }
                 ]
             }, "fixture:provider-order");
+            var providerFirstImportPreserved = providerOrdered.Servers.Select(item => item.Id)
+                .SequenceEqual(["provider-ru", "provider-nl"], StringComparer.Ordinal);
             providerOrdered = Store(new NoraSubscriptionInfo
             {
                 Id = providerOrdered.Id,
@@ -2066,6 +2239,11 @@ internal static class NoraSubscriptionStore
                 Servers = [legacyA, legacyB]
             }, "fixture:migration");
             var legacyMoved = MoveServer(legacySubscription.Id, legacyB.Id, -1);
+            var legacyWithoutSnapshot = LoadAll().Single(item => item.Id == legacySubscription.Id);
+            foreach (var server in legacyWithoutSnapshot.Servers)
+                server.ProviderOrder = 0;
+            PersistSubscriptionOrder(legacyWithoutSnapshot);
+            var legacyResetRequiresRefresh = !ResetServerOrder(legacySubscription.Id);
             var semanticA = MigrationNode("", "Renamed A", legacyA.Host);
             var semanticB = MigrationNode("", "Renamed B", legacyB.Host);
             semanticA.Id = StableId("runtime-v1|" + RuntimeIdentity(semanticA));
@@ -2077,6 +2255,9 @@ internal static class NoraSubscriptionStore
                 Servers = [semanticA, semanticB]
             }, "fixture:migration");
             var migratedIds = migrated.Servers.Select(item => item.Id).ToArray();
+            var migratedResetApplied = ResetServerOrder(legacySubscription.Id);
+            var migratedResetIds = LoadAll().Single(item => item.Id == legacySubscription.Id)
+                .Servers.Select(item => item.Id).ToArray();
 
             var passed = orderedSubscriptions.SequenceEqual(["first", "second", "third"], StringComparer.Ordinal) &&
                          moved &&
@@ -2086,11 +2267,14 @@ internal static class NoraSubscriptionStore
                          movedSubscription && movedServer &&
                          persistedSubscriptions.SequenceEqual(["second-subscription", "first-subscription"], StringComparer.Ordinal) &&
                          persistedServers.SequenceEqual(["second-b", "second-a", "second-c"], StringComparer.Ordinal) &&
-                         providerOrderFollowed &&
-                         legacyMoved &&
-                         migratedIds.SequenceEqual([semanticB.Id, semanticA.Id], StringComparer.Ordinal);
+                         customOrderSurvivesReload && customOrdersCompacted && providerSnapshotRecorded && resetApplied && resetPersisted &&
+                         providerFirstImportPreserved && providerOrderFollowed &&
+                         legacyMoved && legacyResetRequiresRefresh &&
+                         migratedIds.SequenceEqual([semanticB.Id, semanticA.Id], StringComparer.Ordinal) &&
+                         migratedResetApplied &&
+                         migratedResetIds.SequenceEqual([semanticA.Id, semanticB.Id], StringComparer.Ordinal);
             output.WriteLine(passed
-                ? "SUBSCRIPTION ORDER SELF-TEST PASS: provider-order=followed; custom-order=stable; semantic-id-migration=stable; moves=bounded"
+                ? "SUBSCRIPTION ORDER SELF-TEST PASS: provider-order=followed/resettable; custom-order=stable/compacted; new-nodes=non-disruptive; legacy-refresh-contract=verified; moves=bounded"
                 : "SUBSCRIPTION ORDER SELF-TEST FAIL: unexpected ordering result");
             return passed ? 0 : 1;
         }

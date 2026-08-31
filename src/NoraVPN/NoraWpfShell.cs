@@ -4051,13 +4051,48 @@ internal sealed class NoraWpfWindow : Window
             VerticalAlignment = VerticalAlignment.Center,
             Margin = new Thickness(4, 0, 4, 0)
         };
-        if (_isArrangingServers && subscriptionCount > 1)
+        if (_isArrangingServers)
         {
-            actions.Children.Add(ReorderStepper(
-                subscriptionIndex > 0,
-                subscriptionIndex < subscriptionCount - 1,
-                async direction => await MoveSubscriptionAsync(sub, direction),
-                "Move subscription"));
+            if (sub.CustomServerOrder)
+            {
+                var resetOrder = new NoraFxButton(
+                    Color.FromArgb(14, 255, 156, 38),
+                    Color.FromArgb(40, 255, 156, 38),
+                    10,
+                    accent: false,
+                    stroke: NoraWpfTheme.Brush(Color.FromArgb(70, 255, 156, 38)))
+                {
+                    Width = 82,
+                    Height = 32,
+                    Margin = new Thickness(5, 0, 0, 0),
+                    ToolTip = "Restore the order supplied by the subscription provider",
+                    VerticalAlignment = VerticalAlignment.Center,
+                    Content = new TextBlock
+                    {
+                        Text = "Reset order",
+                        FontSize = 11,
+                        FontWeight = FontWeights.SemiBold,
+                        Foreground = NoraWpfTheme.OrangeBrush,
+                        HorizontalAlignment = HorizontalAlignment.Center,
+                        VerticalAlignment = VerticalAlignment.Center
+                    }
+                };
+                resetOrder.Click += async (_, eventArgs) =>
+                {
+                    eventArgs.Handled = true;
+                    await ResetSubscriptionServerOrderAsync(sub);
+                };
+                actions.Children.Add(resetOrder);
+            }
+
+            if (subscriptionCount > 1)
+            {
+                actions.Children.Add(ReorderStepper(
+                    subscriptionIndex > 0,
+                    subscriptionIndex < subscriptionCount - 1,
+                    async direction => await MoveSubscriptionAsync(sub, direction),
+                    "Move subscription"));
+            }
         }
         else
         {
@@ -4992,6 +5027,28 @@ internal sealed class NoraWpfWindow : Window
             _pendingServerViewportAnchor = viewportAnchor;
             RenderPage(PageKind.Servers);
         }
+    }
+
+    private async Task ResetSubscriptionServerOrderAsync(NoraSubscriptionInfo subscription)
+    {
+        var reset = await _subscriptionRefreshCoordinator.RunExclusiveSyncAsync(
+            () => NoraSubscriptionStore.ResetServerOrder(subscription.Id));
+        if (!reset)
+        {
+            AppendLog($"Provider order is not available yet for {subscription.Title}; refresh the subscription first.");
+            ShowToast(
+                "Refresh required",
+                $"Refresh {subscription.Title} once, then reset its order.",
+                ToastKind.Info);
+            return;
+        }
+
+        AppendLog($"Restored provider server order for {subscription.Title}.");
+        RenderPage(PageKind.Servers);
+        ShowToast(
+            "Provider order restored",
+            $"{subscription.Title} now follows the provider's server order.",
+            ToastKind.Success);
     }
 
     private sealed record ServerViewportAnchor(string Key, double ViewportY);

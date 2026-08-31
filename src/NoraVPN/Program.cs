@@ -182,6 +182,16 @@ internal static class Program
 #endif
         }
 
+        if (args.Length == 1 && args[0].Equals("roblox-routing-selftest", StringComparison.OrdinalIgnoreCase))
+        {
+#if WINDOWS
+            return NoraSubscriptionStore.RunRobloxRoutingSelfTest(Console.Out);
+#else
+            Console.Error.WriteLine("Roblox routing self-test is only available in the Windows client build.");
+            return 2;
+#endif
+        }
+
         if (args.Length == 1 && args[0].Equals("subscription-refresh-selftest", StringComparison.OrdinalIgnoreCase))
         {
 #if WINDOWS
@@ -431,6 +441,7 @@ internal static class Program
             Console.WriteLine("  nvp crypt5-selftest");
             Console.WriteLine("  nvp subscription-transport-selftest");
             Console.WriteLine("  nvp subscription-order-selftest");
+            Console.WriteLine("  nvp roblox-routing-selftest");
             Console.WriteLine("  nvp subscription-refresh-selftest");
             Console.WriteLine("  nvp deep-link-selftest");
             Console.WriteLine("  nvp update-selftest");
