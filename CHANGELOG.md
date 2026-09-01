@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-pre.7 — 2026-09-01
+
+- Made subscription servers always follow the provider's order and kept manual reordering only for subscription cards.
+- Fixed Roblox game connections being falsely blocked as BitTorrent traffic.
+- Applied subscription-provided DNS correctly and added secure in-tunnel fallback resolution.
+
 ## 0.1.0-pre.6 — 2026-08-30
 
 - Added Windows deep links for importing subscriptions and profiles.
