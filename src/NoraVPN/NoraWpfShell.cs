@@ -2804,7 +2804,7 @@ internal sealed class NoraWpfWindow : Window
         content.Children.Add(top);
 
         var body = new StackPanel { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 4, 0, 0) };
-        body.Children.Add(EmojiAwareTextBlock(server.Name, new TextBlock
+        body.Children.Add(EmojiAwareTextBlock(ServerDisplayName(server.Name, server.Country), new TextBlock
         {
             FontSize = 27,
             FontWeight = FontWeights.Bold,
@@ -4617,7 +4617,7 @@ internal sealed class NoraWpfWindow : Window
 
         var info = new StackPanel { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(2, 0, 10, 0) };
         Grid.SetColumn(info, 1);
-        info.Children.Add(EmojiAwareTextBlock(name, new TextBlock
+        info.Children.Add(EmojiAwareTextBlock(ServerDisplayName(name, country), new TextBlock
         {
             FontSize = 14,
             FontWeight = FontWeights.SemiBold,
@@ -4806,6 +4806,7 @@ internal sealed class NoraWpfWindow : Window
     private static TextBlock EmojiAwareTextBlock(string? value, TextBlock textBlock)
     {
         textBlock.FontFamily = NoraWpfTheme.UiFont;
+        textBlock.Inlines.Clear();
         var plain = new StringBuilder();
 
         void FlushPlain()
@@ -4818,6 +4819,17 @@ internal sealed class NoraWpfWindow : Window
 
         foreach (var token in EmojiTokens(value ?? string.Empty))
         {
+            if (token.EnumerateRunes().Any(rune => rune.Value is >= 0x16800 and <= 0x16A3F or >= 0xA6A0 and <= 0xA6FF))
+            {
+                FlushPlain();
+                textBlock.Inlines.Add(new System.Windows.Documents.Run(token)
+                {
+                    FontFamily = BamumFont,
+                    FontSize = textBlock.FontSize * 1.12,
+                    FontWeight = FontWeights.Normal
+                });
+                continue;
+            }
             var emoji = LoadEmoji(token);
             if (emoji is null)
             {
@@ -4826,19 +4838,22 @@ internal sealed class NoraWpfWindow : Window
             }
 
             FlushPlain();
-            var size = Math.Clamp(textBlock.FontSize * 1.04, 13, 24);
-            textBlock.Inlines.Add(new System.Windows.Documents.InlineUIContainer(new System.Windows.Controls.Image
+            var size = Math.Clamp(textBlock.FontSize * 1.12, 14, 32);
+            var image = new System.Windows.Controls.Image
             {
                 Source = emoji,
                 Width = size,
                 Height = size,
                 Stretch = Stretch.Uniform,
+                Margin = new Thickness(0.6, 0, 0.6, 0),
                 SnapsToDevicePixels = true,
                 UseLayoutRounding = true,
                 IsHitTestVisible = false
-            })
+            };
+            RenderOptions.SetBitmapScalingMode(image, BitmapScalingMode.HighQuality);
+            textBlock.Inlines.Add(new System.Windows.Documents.InlineUIContainer(image)
             {
-                BaselineAlignment = System.Windows.BaselineAlignment.Baseline
+                BaselineAlignment = System.Windows.BaselineAlignment.Center
             });
         }
 
@@ -4848,6 +4863,16 @@ internal sealed class NoraWpfWindow : Window
 
     private static ImageSource? LoadEmoji(string token)
     {
+        // Text presentation stays text; lookup only pictographs/symbols, not
+        // every ordinary character. Grapheme parsing keeps selectors and ZWJ
+        // sequences together, including arrows, keycaps and skin-tone variants.
+        if (token.Contains('\uFE0E') || string.IsNullOrEmpty(token))
+            return null;
+        var first = token.EnumerateRunes().First();
+        if (!(first.Value is >= 0x1F000 and <= 0x1FAFF) &&
+            Rune.GetUnicodeCategory(first) is not (UnicodeCategory.OtherSymbol or UnicodeCategory.MathSymbol) &&
+            !token.Contains('\u20E3'))
+            return null;
         var keys = EmojiAssetKeys(token);
         if (keys.Count == 0)
             return null;
@@ -4909,45 +4934,54 @@ internal sealed class NoraWpfWindow : Window
 
     private static IEnumerable<string> EmojiTokens(string text)
     {
-        var runes = text.EnumerateRunes().ToArray();
-        for (var index = 0; index < runes.Length;)
-        {
-            if (!IsEmojiBase(runes[index].Value))
-            {
-                yield return runes[index++].ToString();
-                continue;
-            }
-
-            var token = new StringBuilder(runes[index++].ToString());
-            if (IsRegionalIndicator(runes[index - 1].Value) && index < runes.Length && IsRegionalIndicator(runes[index].Value))
-                token.Append(runes[index++].ToString());
-
-            while (index < runes.Length && IsEmojiSuffix(runes[index].Value))
-                token.Append(runes[index++].ToString());
-
-            while (index + 1 < runes.Length && runes[index].Value == 0x200D && IsEmojiBase(runes[index + 1].Value))
-            {
-                token.Append(runes[index++].ToString());
-                token.Append(runes[index++].ToString());
-                while (index < runes.Length && IsEmojiSuffix(runes[index].Value))
-                    token.Append(runes[index++].ToString());
-            }
-
-            yield return token.ToString();
-        }
+        var elements = StringInfo.GetTextElementEnumerator(text);
+        while (elements.MoveNext())
+            yield return elements.GetTextElement();
     }
 
-    private static bool IsEmojiBase(int value) =>
-        value is >= 0x1F000 and <= 0x1FAFF ||
-        value is >= 0x2600 and <= 0x27BF ||
-        value is 0x00A9 or 0x00AE or 0x203C or 0x2049 or 0x2122 or 0x2139 or 0x3030 or 0x303D or 0x3297 or 0x3299;
+    private static readonly FontFamily BamumFont = new(
+        new Uri(Path.Combine(AppContext.BaseDirectory, "assets", "fonts") + Path.DirectorySeparatorChar),
+        "./#Noto Sans Bamum");
 
-    private static bool IsEmojiSuffix(int value) =>
-        value is 0xFE0F or 0x20E3 ||
-        value is >= 0x1F3FB and <= 0x1F3FF ||
-        value is >= 0xE0020 and <= 0xE007F;
+    internal static string ServerDisplayName(string name, string country)
+    {
+        var code = FlagIcon.ResolveCountryCode(country);
+        if (code.Length != 2 || code.Any(c => c is < 'A' or > 'Z'))
+            return name;
+        var flag = char.ConvertFromUtf32(0x1F1E6 + code[0] - 'A') +
+                   char.ConvertFromUtf32(0x1F1E6 + code[1] - 'A');
+        // Presentation only. Keep other flags (for example a RU -> NL route),
+        // and never change persisted names/IDs used by refresh and artwork.
+        if (!name.Contains(flag, StringComparison.Ordinal))
+            return name;
+        var display = Regex.Replace(name.Replace(flag, " ", StringComparison.Ordinal), @"\s+", " ").Trim();
+        return display.Length == 0 ? name : display;
+    }
 
-    private static bool IsRegionalIndicator(int value) => value is >= 0x1F1E6 and <= 0x1F1FF;
+    internal static int RunEmojiSelfTest(TextWriter output)
+    {
+        try
+        {
+            const string original = "𖣐 NORA 🇪🇪 Эстония";
+            var glyphs = new GlyphTypeface(new Uri(Path.Combine(AppContext.BaseDirectory, "assets", "fonts", "NotoSansBamum-Regular.ttf")));
+            var text = EmojiAwareTextBlock("𖣐 NORA ⬇️ 1️⃣ 👍🏽 👩‍💻", new TextBlock { FontSize = 14 });
+            var passed = glyphs.CharacterToGlyphMap.TryGetValue(0x168D0, out var glyph) && glyph != 0 &&
+                ServerDisplayName(original, "Estonia") == "𖣐 NORA Эстония" &&
+                ServerDisplayName("🇷🇺 RU → 🇳🇱 Netherlands", "Netherlands") == "🇷🇺 RU → Netherlands" &&
+                ServerDisplayName("🇪🇪 only", "Unknown") == "🇪🇪 only" &&
+                EmojiTokens("⬇️1️⃣👍🏽👩‍💻🇪🇪").SequenceEqual(["⬇️", "1️⃣", "👍🏽", "👩‍💻", "🇪🇪"]) &&
+                text.Inlines.OfType<System.Windows.Documents.InlineUIContainer>().Count() == 4 &&
+                text.Inlines.OfType<System.Windows.Documents.Run>().Any(run => run.Text == "𖣐" && run.FontFamily == BamumFont) &&
+                LoadEmoji("⬇\uFE0E") is null;
+            output.WriteLine(passed ? "EMOJI SELF-TEST PASS: bundled supplementary glyph, complete emoji sequences and display-only flag removal" : "EMOJI SELF-TEST FAIL");
+            return passed ? 0 : 1;
+        }
+        catch (Exception exception)
+        {
+            output.WriteLine("EMOJI SELF-TEST FAIL: " + exception.GetBaseException().Message);
+            return 1;
+        }
+    }
 
     private async Task MoveSubscriptionAsync(NoraSubscriptionInfo subscription, int direction)
     {
@@ -5196,7 +5230,7 @@ internal sealed class NoraWpfWindow : Window
         header.Children.Add(flagHolder);
 
         var text = new StackPanel { Margin = new Thickness(12, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center };
-        text.Children.Add(EmojiAwareTextBlock(server.Name, new TextBlock
+        text.Children.Add(EmojiAwareTextBlock(ServerDisplayName(server.Name, server.Country), new TextBlock
         {
             FontSize = 17,
             FontWeight = FontWeights.Bold,
@@ -10669,7 +10703,7 @@ internal sealed class FlagIcon : FrameworkElement
         }
     }
 
-    private static string ResolveCountryCode(string? country)
+    internal static string ResolveCountryCode(string? country)
     {
         var value = country?.Trim() ?? "";
         if (value.Length == 2 && value.All(char.IsLetter))

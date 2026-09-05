@@ -12,6 +12,8 @@ $required = @(
     "assets\logo.svg",
     "assets\flags\eu.png",
     "assets\emoji\1f680.png",
+    "assets\fonts\NotoSansBamum-Regular.ttf",
+    "assets\fonts\OFL.txt",
     "wintun.dll",
     "cores\xray.exe",
     "cores\sing-box.exe",
@@ -113,7 +115,7 @@ if ($LASTEXITCODE -ne 0) {
 $isAdministrator = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($isAdministrator) {
-    foreach ($selfTestName in @("subscription-transport-selftest", "subscription-order-selftest", "roblox-routing-selftest", "subscription-refresh-selftest", "deep-link-selftest", "update-selftest", "dns-bootstrap-selftest", "country-flag-selftest", "location-artwork-selftest", "ui-preferences-selftest", "appearance-availability-selftest", "ui-icon-selftest", "discord-routing-selftest", "xray-tun-recovery-selftest")) {
+    foreach ($selfTestName in @("subscription-transport-selftest", "subscription-order-selftest", "roblox-routing-selftest", "subscription-refresh-selftest", "deep-link-selftest", "update-selftest", "dns-bootstrap-selftest", "country-flag-selftest", "emoji-selftest", "location-artwork-selftest", "ui-preferences-selftest", "appearance-availability-selftest", "ui-icon-selftest", "discord-routing-selftest", "xray-tun-recovery-selftest")) {
         $selfTest = Start-Process -FilePath (Join-Path $root "NoraVPN.exe") -ArgumentList @($selfTestName) -WorkingDirectory $root -WindowStyle Hidden -Wait -PassThru
         if ($selfTest.ExitCode -ne 0) {
             throw "$selfTestName failed with exit code $($selfTest.ExitCode)"
@@ -125,7 +127,7 @@ else {
     if (-not (Test-Path -LiteralPath $buildDll)) {
         throw "Non-elevated portable verification requires the Release build output: $buildDll"
     }
-    foreach ($selfTestName in @("subscription-transport-selftest", "subscription-order-selftest", "roblox-routing-selftest", "subscription-refresh-selftest", "deep-link-selftest", "update-selftest", "dns-bootstrap-selftest", "country-flag-selftest", "location-artwork-selftest", "ui-preferences-selftest", "appearance-availability-selftest", "ui-icon-selftest", "discord-routing-selftest", "xray-tun-recovery-selftest")) {
+    foreach ($selfTestName in @("subscription-transport-selftest", "subscription-order-selftest", "roblox-routing-selftest", "subscription-refresh-selftest", "deep-link-selftest", "update-selftest", "dns-bootstrap-selftest", "country-flag-selftest", "emoji-selftest", "location-artwork-selftest", "ui-preferences-selftest", "appearance-availability-selftest", "ui-icon-selftest", "discord-routing-selftest", "xray-tun-recovery-selftest")) {
         dotnet $buildDll $selfTestName
         if ($LASTEXITCODE -ne 0) {
             throw "$selfTestName failed from Release build output with exit code $LASTEXITCODE"

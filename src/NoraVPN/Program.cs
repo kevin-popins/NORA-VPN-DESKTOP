@@ -41,6 +41,9 @@ internal static class Program
         if (args.Length == 1 && args[0].Equals("update-selftest", StringComparison.OrdinalIgnoreCase))
             return NoraUpdateService.RunSelfTest(Console.Out);
 
+        if (args.Length == 1 && args[0].Equals("emoji-selftest", StringComparison.OrdinalIgnoreCase))
+            return NoraWpfWindow.RunEmojiSelfTest(Console.Out);
+
         if (args.Length == 1 && args[0].Equals("xray-tun-recovery-selftest", StringComparison.OrdinalIgnoreCase))
             return XrayCoreProcess.RunTunRecoverySelfTest(Console.Out);
 

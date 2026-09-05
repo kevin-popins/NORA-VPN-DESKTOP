@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-pre.8 — 2026-09-05
+
+- Improved emoji rendering and added support for missing Unicode symbols in subscription names.
+- Removed duplicate country flags from server names when a flag is already displayed beside them.
+- Restored release detection by older clients with a compatible Windows installer asset name.
+
 ## 0.1.0-pre.7 — 2026-09-01
 
 - Made subscription servers always follow the provider's order and kept manual reordering only for subscription cards.

@@ -1,6 +1,6 @@
 param(
-    [string]$AppVersion = "0.1.0-pre.7",
-    [string]$InstallerVersion = "0.1.0.7",
+    [string]$AppVersion = "0.1.0-pre.8",
+    [string]$InstallerVersion = "0.1.0.8",
     [string]$BuildId = "",
     [string]$OutputDirectory = "",
     [switch]$NoRestore
@@ -19,7 +19,8 @@ $output = [System.IO.Path]::GetFullPath($OutputDirectory)
 $artifactRoot = Join-Path $root "artifacts\installer"
 $staging = Join-Path $artifactRoot ("payload-" + $BuildId)
 $visuals = Join-Path $artifactRoot ("visuals-" + $BuildId)
-$expectedSetup = Join-Path $output "NORA-VPN-Setup-$AppVersion-$BuildId-win-x64.exe"
+# Older clients require this exact public asset name to discover an update.
+$expectedSetup = Join-Path $output "NORA-VPN-Setup-v$AppVersion-win-x64.exe"
 
 foreach ($path in @($staging, $visuals)) {
     if (Test-Path -LiteralPath $path) {

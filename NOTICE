@@ -25,6 +25,10 @@ This project includes or supports the following third-party work:
 * Country flag artwork — sourced from stefangabos/world_countries and
   lipis/flag-icons. Provenance is in assets/flags/ATTRIBUTION.md.
 
+* Noto Sans Bamum — Copyright The Noto Project Authors — SIL Open Font License 1.1
+  https://github.com/notofonts/noto-fonts
+  Bundled for Unicode symbols in subscription names; licence: assets/fonts/OFL.txt.
+
 Portable builds may obtain or package these independently licensed runtime
 components from their official upstream releases:
 

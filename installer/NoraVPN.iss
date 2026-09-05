@@ -5,10 +5,10 @@
   #define OutputDir "..\dist"
 #endif
 #ifndef AppVersion
-  #define AppVersion "0.1.0-pre.7"
+  #define AppVersion "0.1.0-pre.8"
 #endif
 #ifndef InstallerVersion
-  #define InstallerVersion "0.1.0.7"
+  #define InstallerVersion "0.1.0.8"
 #endif
 #ifndef BuildId
   #define BuildId "local"
@@ -72,7 +72,7 @@ Uninstallable=yes
 UninstallDisplayName=NORA VPN
 UninstallDisplayIcon={app}\NoraVPN.exe
 OutputDir={#OutputDir}
-OutputBaseFilename=NORA-VPN-Setup-{#AppVersion}-{#BuildId}-win-x64
+OutputBaseFilename=NORA-VPN-Setup-v{#AppVersion}-win-x64
 SetupIconFile=..\assets\logo.ico
 VersionInfoVersion={#InstallerVersion}
 VersionInfoProductVersion={#InstallerVersion}
