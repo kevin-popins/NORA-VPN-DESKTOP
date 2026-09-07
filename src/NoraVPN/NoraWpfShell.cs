@@ -609,7 +609,7 @@ internal static class NoraWindowScalePolicy
     }
 }
 
-internal sealed class NoraWpfWindow : Window
+internal sealed partial class NoraWpfWindow : Window
 {
     private const string OfficialVpnBotUrl = "https://t.me/noravpnrobertsonbot";
     private enum PageKind { Home, Servers, Add, Users, Logs, Settings, VoiceMode }
@@ -666,6 +666,8 @@ internal sealed class NoraWpfWindow : Window
     // connection after the user has pressed the same button to stop it.
     private CancellationTokenSource? _connectCancellation;
     private CancellationTokenSource? _diagnosticCancellation;
+    private readonly CancellationTokenSource _updateCheckLifetime = new();
+    private bool _updateCheckStarted;
     private bool _diagnosticRunning;
     private bool _discordModeTransitionInProgress;
     private string _diagnosticStatus = "";
@@ -907,6 +909,7 @@ internal sealed class NoraWpfWindow : Window
         Closing += OnWindowClosing;
         Closed += (_, _) =>
         {
+            _updateCheckLifetime.Cancel();
             _diagnosticCancellation?.Cancel();
             _subscriptionRefreshScheduler.Dispose();
             _trafficSampleTimer.Stop();
@@ -2584,15 +2587,24 @@ internal sealed class NoraWpfWindow : Window
 
     private async Task CheckForApplicationUpdateAsync()
     {
+        if (_updateCheckStarted)
+            return;
+        _updateCheckStarted = true;
+        var cancellationToken = _updateCheckLifetime.Token;
         try
         {
-            await Task.Delay(700);
-            var update = await NoraUpdateService.CheckAsync();
+            await Task.Delay(700, cancellationToken);
+            var update = await NoraUpdateService.CheckAsync(cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
             if (update is null ||
                 string.Equals(NoraUiPreferences.SkippedUpdateVersion, update.Version, StringComparison.OrdinalIgnoreCase) ||
                 !IsLoaded || Dispatcher.HasShutdownStarted)
                 return;
             ShowAvailableUpdate(update);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Closing to the tray does not cancel; only an actual exit does.
         }
         catch (Exception exception)
         {
@@ -2790,7 +2802,7 @@ internal sealed class NoraWpfWindow : Window
             Orientation = Orientation.Horizontal,
             Children =
             {
-                new FlagIcon { Country = server.Country, Width = 24, Height = 17, Margin = new Thickness(0, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center },
+                new FlagIcon { Country = NoraDisplayRegion.Country(server.Name, server.Country), Width = 24, Height = 17, Margin = new Thickness(0, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center },
                 new TextBlock { Text = server.Country, FontSize = 12.5, FontWeight = FontWeights.SemiBold, Foreground = NoraWpfTheme.TextBrush, VerticalAlignment = VerticalAlignment.Center }
             }
         });
@@ -2991,6 +3003,8 @@ internal sealed class NoraWpfWindow : Window
 
     internal static string ResolveLocationArtworkKey(string? serverName, string? country)
     {
+        if (NoraDisplayRegion.IsAntarctica(serverName, country))
+            return NoraDisplayRegion.AntarcticaCode;
         var name = NormalizeLocationSearchText(serverName);
         var namedLocation = NamedLocationArtworkKey(name);
         if (namedLocation.Length > 0)
@@ -3043,6 +3057,8 @@ internal sealed class NoraWpfWindow : Window
 
     private static string NormalizeCountryArtworkKey(string? country)
     {
+        if (NoraDisplayRegion.IsAntarcticaCountry(country))
+            return NoraDisplayRegion.AntarcticaCode;
         var normalized = NormalizeLocationSearchText(country);
         return normalized switch
         {
@@ -3146,11 +3162,17 @@ internal sealed class NoraWpfWindow : Window
                 ResolveLocationArtworkKey("India", "Unknown") == "India" &&
                 ResolveLocationArtworkKey("Kazakhstan", "Unknown") == "KZ" &&
                 ResolveLocationArtworkKey("Turkey", "Unknown") == "TR" &&
-                ResolveLocationArtworkKey("Ukraine", "Unknown") == "Ukraine";
+                ResolveLocationArtworkKey("Ukraine", "Unknown") == "Ukraine" &&
+                ResolveLocationArtworkKey("𖣐 NORA 🇸🇴 Антарктида 1", "Somalia") == "AQ" &&
+                ResolveLocationArtworkKey("NORA Antarctica2", "SO") == "AQ" &&
+                ResolveLocationArtworkKey("🇸🇴 Somalia", "Somalia") == "Somalia" &&
+                ServerDisplayName("𖣐 NORA 🇸🇴 Антарктида 1", "Somalia") == "𖣐 NORA Антарктида 1" &&
+                ServerDisplayName("🇦🇶 Antarctica", "Antarctica") == "Antarctica";
 
             var root = Path.Combine(AppContext.BaseDirectory, "assets", "locations");
             var expectedCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
             {
+                ["AQ"] = 5,
                 ["Germany"] = 5,
                 ["Netherlands"] = 5,
                 ["Poland"] = 3,
@@ -3162,15 +3184,25 @@ internal sealed class NoraWpfWindow : Window
                 ["TR"] = 3,
                 ["Ukraine"] = 1,
                 ["RUALL"] = 1,
-                ["EUALL"] = 1
+                ["EUALL"] = 1,
+                ["China"] = 1, ["Discord"] = 4, ["Estonia"] = 1, ["Finland"] = 3,
+                ["France"] = 3, ["Ireland"] = 2, ["Italy"] = 1, ["Lithuania"] = 3,
+                ["Portugal"] = 1, ["RUSSIA"] = 3, ["Spain"] = 1, ["UK"] = 3,
+                ["USA"] = 3, ["Universal"] = 1
             };
             var assetsPassed = expectedCounts.All(pair => FindLocationPaths(root, pair.Key).Count == pair.Value);
             var freeTierPassed = expectedCounts.Keys.All(key => LoadLocationImages(key, loadAll: false).Count == 1);
             var allFramesPassed = expectedCounts.All(pair => LoadLocationImages(pair.Key, loadAll: true).Count == pair.Value);
-            var passed = mappingsPassed && assetsPassed && freeTierPassed && allFramesPassed;
+            var shippingFiles = Directory.GetFiles(root).Where(path => Path.GetExtension(path).ToLowerInvariant() is ".png" or ".jpg" or ".jpeg").ToArray();
+            var complete = shippingFiles.Length == 74 && shippingFiles.All(path => LoadBitmap(path) is BitmapSource { PixelWidth: > 0, PixelHeight: > 0 });
+            var namedAssets = new[] { "earth", "moon", "universe", "welocmescreengirl" }.All(name => LoadNamedVisualAsset(name) is not null);
+            var aqPaths = FindLocationPaths(root, "AQ");
+            var aqOrder = aqPaths.Select(Path.GetFileNameWithoutExtension).SequenceEqual(new[] { "AQ1", "AQ2", "AQ3", "AQ4", "AQ5" });
+            var overlayPassed = VerifyArtworkOverlay();
+            var passed = mappingsPassed && assetsPassed && freeTierPassed && allFramesPassed && complete && namedAssets && aqOrder && overlayPassed;
             output.WriteLine(passed
                 ? "LOCATION ARTWORK SELF-TEST PASS: specific-country priority; RU/EU groups; default-first and slideshow assets complete"
-                : $"LOCATION ARTWORK SELF-TEST FAIL: mappings={mappingsPassed}; assets={assetsPassed}; first={freeTierPassed}; all={allFramesPassed}");
+                : $"LOCATION ARTWORK SELF-TEST FAIL: mappings={mappingsPassed}; assets={assetsPassed}; first={freeTierPassed}; all={allFramesPassed}; complete={complete}; named={namedAssets}; AQ_order={aqOrder}; overlay={overlayPassed}");
             return passed ? 0 : 1;
         }
         catch (Exception exception)
@@ -3180,11 +3212,32 @@ internal sealed class NoraWpfWindow : Window
         }
     }
 
+    private static bool VerifyArtworkOverlay()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "nora-artwork-overlay-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            foreach (var file in new[] { "AQ1.png", "AQ1.jpg", "AQ2.jpg", "AQ3.jpeg", "AQ4.png", "AQ5.jpg", "AQX.jpg", "AQ2.txt" })
+                File.WriteAllBytes(Path.Combine(root, file), []);
+            return FindLocationPaths(root, "AQ").Select(Path.GetFileName)
+                .SequenceEqual(new[] { "AQ1.jpg", "AQ2.jpg", "AQ3.jpeg", "AQ4.png", "AQ5.jpg" });
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
     private static List<string> FindLocationPaths(string root, string countryName)
     {
         if (!Directory.Exists(root) || string.IsNullOrWhiteSpace(countryName))
             return [];
-        var matches = Directory.GetFiles(root, "*.png", SearchOption.TopDirectoryOnly)
+        var matches = Directory.GetFiles(root, "*", SearchOption.TopDirectoryOnly)
+            .Where(path => Path.GetExtension(path).ToLowerInvariant() is ".png" or ".jpg" or ".jpeg")
+            // Portable users may extract over an older release. Prefer the new
+            // derivative and keep each frame once even if its old PNG remains.
+            .OrderBy(path => Path.GetExtension(path).Equals(".png", StringComparison.OrdinalIgnoreCase) ? 1 : 0)
+            .ThenBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .GroupBy(Path.GetFileNameWithoutExtension, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
             .Select(path => new
             {
                 Path = path,
@@ -3258,12 +3311,14 @@ internal sealed class NoraWpfWindow : Window
             Path.Combine(Directory.GetCurrentDirectory(), "assets", "atmosphere"),
             Path.Combine(Directory.GetCurrentDirectory(), "futurelocationphotos")
         };
-        var extensions = new HashSet<string>(new[] { ".png", ".jpg", ".jpeg", ".webp" }, StringComparer.OrdinalIgnoreCase);
+        var extensions = new HashSet<string>(new[] { ".png", ".jpg", ".jpeg" }, StringComparer.OrdinalIgnoreCase);
         foreach (var root in roots.Distinct(StringComparer.OrdinalIgnoreCase))
         {
             if (!Directory.Exists(root))
                 continue;
             var path = Directory.GetFiles(root)
+                .OrderBy(file => Path.GetExtension(file).Equals(".png", StringComparison.OrdinalIgnoreCase) ? 1 : 0)
+                .ThenBy(file => file, StringComparer.OrdinalIgnoreCase)
                 .FirstOrDefault(file =>
                     Path.GetFileNameWithoutExtension(file).Equals(assetName, StringComparison.OrdinalIgnoreCase) &&
                     extensions.Contains(Path.GetExtension(file)));
@@ -4578,6 +4633,7 @@ internal sealed class NoraWpfWindow : Window
         Func<Task> select,
         Func<Task>? delete = null)
     {
+        country = NoraDisplayRegion.Country(name, country);
         var baseBg = selected ? Color.FromArgb(38, 255, 156, 38) : Color.FromArgb(0, 27, 34, 45);
         var hoverBg = selected ? Color.FromArgb(52, 255, 156, 38) : Color.FromArgb(170, 27, 34, 45);
         var bg = new SolidColorBrush(baseBg);
@@ -4945,7 +5001,8 @@ internal sealed class NoraWpfWindow : Window
 
     internal static string ServerDisplayName(string name, string country)
     {
-        var code = FlagIcon.ResolveCountryCode(country);
+        name = NoraDisplayRegion.Name(name, country);
+        var code = FlagIcon.ResolveCountryCode(NoraDisplayRegion.Country(name, country));
         if (code.Length != 2 || code.Any(c => c is < 'A' or > 'Z'))
             return name;
         var flag = char.ConvertFromUtf32(0x1F1E6 + code[0] - 'A') +
@@ -5225,7 +5282,7 @@ internal sealed class NoraWpfWindow : Window
             BorderBrush = NoraWpfTheme.Brush(Color.FromArgb(120, 43, 52, 65)),
             BorderThickness = new Thickness(1),
             VerticalAlignment = VerticalAlignment.Center,
-            Child = new FlagIcon { Country = server.Country, Width = 26, Height = 18, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center }
+            Child = new FlagIcon { Country = NoraDisplayRegion.Country(server.Name, server.Country), Width = 26, Height = 18, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center }
         };
         header.Children.Add(flagHolder);
 
@@ -7156,13 +7213,13 @@ internal sealed class NoraWpfWindow : Window
         if (_activeSubscriptionServer is not null)
         {
             var subOnline = _state is TunnelState.Connected or TunnelState.Connecting || (_ping.TryGetValue(_activeSubscriptionServer.LocalPath, out var sp) && sp.Online);
-            return new ServerInfo(_activeSubscriptionServer.Name, _activeSubscriptionServer.Host, _activeSubscriptionServer.Port, _activeSubscriptionServer.Country, subOnline, _activeSubscriptionServer.Protocol);
+            return new ServerInfo(_activeSubscriptionServer.Name, _activeSubscriptionServer.Host, _activeSubscriptionServer.Port, NoraDisplayRegion.Country(_activeSubscriptionServer.Name, _activeSubscriptionServer.Country), subOnline, _activeSubscriptionServer.Protocol);
         }
         if (!string.IsNullOrWhiteSpace(_activeExternalProtocol))
         {
             var external = ProfileListItem.From(_activeProfilePath, _activeProfilePath);
             var externalOnline = _state is TunnelState.Connected or TunnelState.Connecting || (_ping.TryGetValue(_activeProfilePath, out var ep) && ep.Online);
-            return new ServerInfo(external.Name, external.Host, external.Port, external.Country, externalOnline, external.Protocol);
+            return new ServerInfo(external.Name, external.Host, external.Port, NoraDisplayRegion.Country(external.Name, external.Country), externalOnline, external.Protocol);
         }
         if (_activeConfig is null)
             return new ServerInfo("No server", "0.0.0.0", 443, "Netherlands", false, "No profile");
@@ -7175,6 +7232,7 @@ internal sealed class NoraWpfWindow : Window
 
     private static ServerInfo? BuildLocationSnapshotServer(string state) => state switch
     {
+        "location-antarctica" => new ServerInfo("𖣐 NORA 🇸🇴 Антарктида 1", "antarctica.demo.test", 443, NoraDisplayRegion.AntarcticaLabel, true, "VLESS · Reality"),
         "location-ruall" => new ServerInfo("RU Kazan · all operators", "ru-group.demo.test", 443, "Russia", true, "VLESS · XHTTP"),
         "location-euall" => new ServerInfo("EU · all operators", "eu-group.demo.test", 443, "EU", true, "VLESS · Reality"),
         "location-eu-germany" => new ServerInfo("EU Germany · all operators", "de-group.demo.test", 443, "EU", true, "VLESS · Reality"),
@@ -10627,12 +10685,16 @@ internal sealed class FlagIcon : FrameworkElement
             ("Brazil", "BR"),
             ("Europe", "EU"),
             ("United Kingdom", "GB"),
-            ("Kosovo", "XK")
+            ("Kosovo", "XK"),
+            ("Antarctica", "AQ"),
+            ("Антарктида", "AQ"),
+            ("Somalia", "SO")
         };
         var emojiFallback = NoraWpfWindow.EmojiAssetKeys("🍄‍🟫");
         var passed = expected.All(item =>
             ResolveCountryCode(item.Item1) == item.Item2 &&
             File.Exists(Path.Combine(AppContext.BaseDirectory, "assets", "flags", item.Item2.ToLowerInvariant() + ".png"))) &&
+            LoadFlag("AQ") is BitmapSource { PixelWidth: > 0, PixelHeight: > 0 } &&
             emojiFallback.SequenceEqual(["1f344-200d-1f7eb", "1f344"], StringComparer.Ordinal) &&
             File.Exists(Path.Combine(AppContext.BaseDirectory, "assets", "emoji", "1f344.png"));
         output.WriteLine(passed
@@ -10706,6 +10768,8 @@ internal sealed class FlagIcon : FrameworkElement
     internal static string ResolveCountryCode(string? country)
     {
         var value = country?.Trim() ?? "";
+        if (NoraDisplayRegion.IsAntarcticaCountry(value))
+            return NoraDisplayRegion.AntarcticaCode;
         if (value.Length == 2 && value.All(char.IsLetter))
         {
             value = value.ToUpperInvariant();

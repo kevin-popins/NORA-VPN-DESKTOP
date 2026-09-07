@@ -2019,6 +2019,73 @@ internal static class NoraSubscriptionStore
         }
     }
 
+    public static int RunDisplayRegionSelfTest(TextWriter output)
+    {
+        var originalRoot = Environment.GetEnvironmentVariable("NORA_DATA_ROOT");
+        var temporaryRoot = Path.Combine(Path.GetTempPath(), "nora-region-selftest-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Environment.SetEnvironmentVariable("NORA_DATA_ROOT", temporaryRoot);
+            var names = new[] { "🇸🇴 Антарктида", "𖣐 NORA 🇸🇴 Антарктида 1", " NORA  🇸🇴  Antarctica  2 ", "NORA Антарктида3", "Antarctica" };
+            var positive = names.All(name => GuessCountry(name, "fixture.example.test") == "Antarctica" &&
+                NoraDisplayRegion.Country(name, "Somalia") == "Антарктида");
+            var negative = new[] { "🇸🇴 Somalia", "🇸🇴 Сомали", "Somalia", "NotAntarctica", "Antarctican" }
+                .All(name => !NoraDisplayRegion.HasAntarcticaName(name) && NoraDisplayRegion.Country(name, "Somalia") == "Somalia");
+            var aliases = new[] { "AQ", "Antarctica", "Антарктида" }.All(country => CanonicalCountry(country) == "Antarctica");
+            var raw = "vless://00000000-0000-4000-8000-000000000001@fixture.example.test:443?security=tls&type=ws&path=%2Ffixture#" + Uri.EscapeDataString(names[1]);
+            var imported = ParsePayload(raw, "https://subscription.example.test/fixture", new Dictionary<string, string>(), _ => { });
+            var node = imported.Servers.Single();
+            var importedCountry = node.Country == "Antarctica";
+            // Simulate a profile saved by the previous client, including its old country.
+            node.Country = "Somalia";
+            Store(imported, "fixture");
+            var selectedPath = node.LocalPath;
+            var id = node.Id;
+            var json = node.RawConfigJson;
+            var source = node.SourceLink;
+            var runtime = RuntimeIdentity(node);
+            var reloaded = LoadAll().Single().Servers.Single();
+            var legacy = reloaded.Country == "Somalia" && NoraDisplayRegion.Country(reloaded.Name, reloaded.Country) == "Антарктида";
+            var refresh = ParsePayload(raw, "https://subscription.example.test/fixture", new Dictionary<string, string>(), _ => { });
+            Store(refresh, "fixture");
+            var refreshed = LoadAll().Single().Servers.Single();
+            var preserved = refreshed.Id == id && refreshed.LocalPath == selectedPath && refreshed.Name == node.Name &&
+                refreshed.RawConfigJson == json && refreshed.SourceLink == source && RuntimeIdentity(refreshed) == runtime &&
+                SameProviderEntry(reloaded, refreshed);
+            const string transport = "{\"outbounds\":[{\"protocol\":\"vless\",\"settings\":{\"vnext\":[{\"address\":\"fixture.example.test\",\"port\":443,\"users\":[{\"id\":\"00000000-0000-4000-8000-000000000001\"}]}]}}]}";
+            var saved = new NoraSubscriptionServer { Name = names[0], Country = "Somalia", RawConfigJson = transport, Id = "saved" };
+            var before = JsonSerializer.Serialize(saved);
+            _ = NoraDisplayRegion.Country(saved.Name, saved.Country);
+            _ = NoraDisplayRegion.Name(saved.Name, saved.Country);
+            var untouched = JsonSerializer.Serialize(saved) == before;
+            var directPath = Path.Combine(temporaryRoot, "direct.json");
+            var metadataPath = ExternalProfileMetadataPath(directPath);
+            File.WriteAllText(directPath, transport);
+            File.WriteAllText(metadataPath, JsonSerializer.Serialize(new NoraExternalProfileInfo
+            {
+                Name = names[0], Country = "Somalia", Host = "fixture.example.test", Protocol = "VLESS"
+            }));
+            var metadataBefore = File.ReadAllText(metadataPath);
+            var direct = TryReadExternalProfileInfo(directPath, out var directInfo) &&
+                NoraDisplayRegion.Country(directInfo.Name, directInfo.Country) == "Антарктида" &&
+                File.ReadAllText(directPath) == transport && File.ReadAllText(metadataPath) == metadataBefore;
+            var passed = positive && negative && aliases && importedCountry && legacy && preserved && untouched && direct;
+            output.WriteLine($"DISPLAY REGION SELF-TEST {(passed ? "PASS" : "FAIL")}: names={positive}; Somalia={negative}; aliases={aliases}; import={importedCountry}; saved={legacy}; refresh_identity={preserved}; raw_unchanged={untouched}; direct={direct}");
+            return passed ? 0 : 1;
+        }
+        catch (Exception exception)
+        {
+            output.WriteLine("DISPLAY REGION SELF-TEST FAIL: " + exception.GetType().Name + ": " + exception.Message);
+            return 1;
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("NORA_DATA_ROOT", originalRoot);
+            if (Directory.Exists(temporaryRoot))
+                Directory.Delete(temporaryRoot, recursive: true);
+        }
+    }
+
     public static int RunOrderingSelfTest(TextWriter output)
     {
         var originalRoot = Environment.GetEnvironmentVariable("NORA_DATA_ROOT");
@@ -2962,6 +3029,8 @@ internal static class NoraSubscriptionStore
 
     private static string GuessCountry(string name, string host)
     {
+        if (NoraDisplayRegion.HasAntarcticaName(name))
+            return NoraDisplayRegion.AntarcticaCountry;
         var code = CountryCodeFromFlag(name);
         if (code.Length == 2)
             return CountryNameFromCode(code);
@@ -2983,6 +3052,8 @@ internal static class NoraSubscriptionStore
     private static string CanonicalCountry(string value)
     {
         value = value.Trim();
+        if (NoraDisplayRegion.IsAntarcticaCountry(value))
+            return NoraDisplayRegion.AntarcticaCountry;
         if (value.Length == 2)
         {
             var byCode = CountryNameFromCode(value);
@@ -3010,6 +3081,8 @@ internal static class NoraSubscriptionStore
 
     private static string CountryNameFromCode(string code)
     {
+        if (code.Equals("AQ", StringComparison.OrdinalIgnoreCase))
+            return NoraDisplayRegion.AntarcticaCountry;
         if (code.Equals("EU", StringComparison.OrdinalIgnoreCase))
             return "Europe";
         try { return new RegionInfo(code.ToUpperInvariant()).EnglishName; }

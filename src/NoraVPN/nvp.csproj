@@ -108,7 +108,7 @@
       <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
       <TargetPath>wintun.dll</TargetPath>
     </Content>
-    <Content Include="..\..\assets\locations\*.png">
+    <Content Include="..\..\assets\locations\*.png;..\..\assets\locations\*.jpg;..\..\assets\locations\*.jpeg">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <ExcludeFromSingleFile>true</ExcludeFromSingleFile>

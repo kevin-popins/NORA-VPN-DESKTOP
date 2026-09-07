@@ -38,6 +38,12 @@ internal static class Program
         if (args.Length == 1 && args[0].Equals("deep-link-selftest", StringComparison.OrdinalIgnoreCase))
             return NoraDeepLinkParser.RunSelfTest(Console.Out);
 
+        if (args.Length == 1 && args[0].Equals("location-motion-selftest", StringComparison.OrdinalIgnoreCase))
+            return NoraWpfWindow.RunLocationMotionSelfTest(Console.Out);
+
+        if (args.Length == 1 && args[0].Equals("display-region-selftest", StringComparison.OrdinalIgnoreCase))
+            return NoraSubscriptionStore.RunDisplayRegionSelfTest(Console.Out);
+
         if (args.Length == 1 && args[0].Equals("update-selftest", StringComparison.OrdinalIgnoreCase))
             return NoraUpdateService.RunSelfTest(Console.Out);
 
