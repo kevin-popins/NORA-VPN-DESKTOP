@@ -516,3 +516,11 @@ begin
     else WizardForm.StatusLabel.Caption := CustomMessage('InstallStageFinish');
   end;
 end;
+
+#include "LegacyLocationPngCleanup.iss"
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    RemoveLegacyLocationPngs();
+end;
