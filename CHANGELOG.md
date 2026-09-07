@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-pre.9 — 2026-09-07
+
+- Fixed Antarctica names, flags and backgrounds, including previously saved profiles; added all five location photos.
+- Reduced bundled background image size while preserving every location and frame.
+- Fixed missed update notifications after slow or temporarily unavailable GitHub connections.
+
 ## 0.1.0-pre.8 — 2026-09-05
 
 - Improved emoji rendering and added support for missing Unicode symbols in subscription names.
