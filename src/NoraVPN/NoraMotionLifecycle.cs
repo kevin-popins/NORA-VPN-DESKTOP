@@ -1,6 +1,8 @@
 #if WINDOWS
 using System.Runtime.CompilerServices;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Threading;
@@ -82,6 +84,9 @@ internal static class NoraMotionLifecycle
     // The weak keys do not keep detached controls alive.
     internal static IReadOnlyList<NoraMotionBinding> For(FrameworkElement visual)
         => Bindings.TryGetValue(visual, out var bindings) ? bindings : [];
+
+    internal static bool IsPresented(FrameworkElement visual)
+        => For(visual).Any(binding => binding.Kind == "render" && binding.IsActive);
 }
 
 internal sealed class NoraMotionBinding
@@ -91,6 +96,7 @@ internal sealed class NoraMotionBinding
     private readonly Action _suspend;
     private readonly Func<bool>? _isEligible;
     private Window? _window;
+    private readonly List<(ScrollViewer Viewer, ScrollContentPresenter? Presenter)> _viewports = [];
     private bool _initialized;
 
     internal NoraMotionBinding(FrameworkElement visual, string kind, Action resume, Action suspend, Func<bool>? isEligible = null)
@@ -122,6 +128,7 @@ internal sealed class NoraMotionBinding
         _visual.Loaded += OnLoaded;
         _visual.Unloaded += OnUnloaded;
         _visual.IsVisibleChanged += OnVisibilityChanged;
+        _visual.SizeChanged += OnSizeChanged;
         if (_visual.IsLoaded)
             OnLoaded(_visual, new RoutedEventArgs());
     }
@@ -141,12 +148,14 @@ internal sealed class NoraMotionBinding
                 _window.Closed += OnWindowClosed;
             }
         }
+        AttachViewports();
         Update();
     }
 
     private void OnUnloaded(object sender, RoutedEventArgs args)
     {
         SetActive(false);
+        DetachViewports();
         DetachWindow();
     }
 
@@ -154,16 +163,63 @@ internal sealed class NoraMotionBinding
 
     private void OnWindowStateChanged(object? sender, EventArgs args) => Update();
 
+    private void OnSizeChanged(object sender, SizeChangedEventArgs args) => Update();
+
+    private void OnScrollChanged(object sender, ScrollChangedEventArgs args) => Update();
+
     private void OnWindowClosed(object? sender, EventArgs args)
     {
         SetActive(false);
+        DetachViewports();
         DetachWindow();
     }
 
     private void Update() => SetActive(
         _visual.IsLoaded && _visual.IsVisible &&
         _window is { IsVisible: true } && _window.WindowState != WindowState.Minimized &&
-        (_isEligible?.Invoke() ?? true));
+        (_isEligible?.Invoke() ?? true) && IntersectsViewports());
+
+    private void AttachViewports()
+    {
+        DetachViewports();
+        ScrollContentPresenter? presenter = null;
+        for (var ancestor = VisualTreeHelper.GetParent(_visual); ancestor is not null; ancestor = VisualTreeHelper.GetParent(ancestor))
+        {
+            if (ancestor is ScrollContentPresenter content) presenter = content;
+            if (ancestor is not ScrollViewer viewer) continue;
+            _viewports.Add((viewer, presenter));
+            viewer.ScrollChanged += OnScrollChanged;
+            viewer.SizeChanged += OnSizeChanged;
+            presenter = null;
+        }
+    }
+
+    private bool IntersectsViewports()
+    {
+        foreach (var (viewer, presenter) in _viewports)
+        {
+            FrameworkElement viewport = presenter is null ? viewer : presenter;
+            if (viewport.ActualWidth <= 0 || viewport.ActualHeight <= 0) return false;
+            try
+            {
+                var bounds = _visual.TransformToAncestor(viewport).TransformBounds(new Rect(_visual.RenderSize));
+                var visible = Rect.Intersect(bounds, new Rect(viewport.RenderSize));
+                if (visible.IsEmpty || visible.Width <= 0 || visible.Height <= 0) return false;
+            }
+            catch (InvalidOperationException) { return false; }
+        }
+        return true;
+    }
+
+    private void DetachViewports()
+    {
+        foreach (var (viewer, _) in _viewports)
+        {
+            viewer.ScrollChanged -= OnScrollChanged;
+            viewer.SizeChanged -= OnSizeChanged;
+        }
+        _viewports.Clear();
+    }
 
     private void SetActive(bool active)
     {

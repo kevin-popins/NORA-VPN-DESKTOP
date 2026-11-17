@@ -636,8 +636,6 @@ internal sealed partial class NoraWpfWindow : Window
     private Grid? _scaleHost;
     private ScaleTransform? _shellScaleTransform;
     private NoraMotionBinding? _presentationClockBinding;
-    private NoraSubscriptionInfo? _homeStatusSubscription;
-    private string _homeServiceNoticeKey = "";
     private readonly DispatcherTimer _clock = new() { Interval = TimeSpan.FromSeconds(1) };
     private readonly DispatcherTimer _trafficSampleTimer = new() { Interval = TimeSpan.FromMilliseconds(250) };
     private readonly DispatcherTimer _managedRefreshTimer = new() { Interval = TimeSpan.FromSeconds(20) };
@@ -862,21 +860,16 @@ internal sealed partial class NoraWpfWindow : Window
 
         _clock.Tick += (_, _) =>
         {
-            if (_homeStatusSubscription is not null &&
-                NoraSubscriptionNoticeView.Signature(NoraSubscriptionMetadata.EffectiveFor(_homeStatusSubscription)) != _homeServiceNoticeKey)
-            {
-                RenderPage(PageKind.Home);
-                return;
-            }
             if (_state == TunnelState.Connected)
             {
-                if (_connectButton is not null)
+                if (_connectButton is not null && NoraMotionLifecycle.IsPresented(_connectButton))
                 {
                     _connectButton.DetailText = _connectedFor.Elapsed.ToString(@"hh\:mm\:ss", CultureInfo.InvariantCulture);
                     _connectButton.InvalidateVisual();
                 }
                 foreach (var graph in _graphs)
-                    graph.SetTraffic(_trafficUpRate, _trafficDownRate, (long)_trafficUpBytes, (long)_trafficDownBytes, _connectedFor.Elapsed);
+                    if (NoraMotionLifecycle.IsPresented(graph))
+                        graph.SetTraffic(_trafficUpRate, _trafficDownRate, (long)_trafficUpBytes, (long)_trafficDownBytes, _connectedFor.Elapsed);
             }
         };
         Loaded += (_, _) =>
@@ -1499,34 +1492,28 @@ internal sealed partial class NoraWpfWindow : Window
         // Every Windows surface uses the established ring logo. Keeping one
         // canonical source keeps the product identity consistent at runtime.
         if (_taskbarIconHandle == IntPtr.Zero)
-            _taskbarIconHandle = CreateTaskbarIconHandle();
+        {
+            foreach (var path in BrandIconPaths())
+            {
+                if (!File.Exists(path))
+                    continue;
+                try
+                {
+                    using var icon = new DrawingIcon(path, new System.Drawing.Size(48, 48));
+                    using var bitmap = icon.ToBitmap();
+                    _taskbarIconHandle = bitmap.GetHicon();
+                    if (_taskbarIconHandle != IntPtr.Zero)
+                        break;
+                }
+                catch
+                {
+                    // The normal application icon remains available as the fallback.
+                }
+            }
+        }
 
         if (_taskbarIconHandle != IntPtr.Zero)
             _ = SendMessage(hwnd, 0x0080 /* WM_SETICON */, new IntPtr(1) /* ICON_BIG */, _taskbarIconHandle);
-    }
-
-    // Caller owns the returned HICON. Both the product and its isolated HWND
-    // proof use this exact canonical 48px Windows icon creation path.
-    internal static IntPtr CreateTaskbarIconHandle()
-    {
-        foreach (var path in BrandIconPaths())
-        {
-            if (!File.Exists(path))
-                continue;
-            try
-            {
-                using var icon = new DrawingIcon(path, new System.Drawing.Size(48, 48));
-                using var bitmap = icon.ToBitmap();
-                var handle = bitmap.GetHicon();
-                if (handle != IntPtr.Zero)
-                    return handle;
-            }
-            catch
-            {
-                // The normal application icon remains available as the fallback.
-            }
-        }
-        return IntPtr.Zero;
     }
 
     private void DisposeTaskbarIcon()
@@ -1908,18 +1895,7 @@ internal sealed partial class NoraWpfWindow : Window
         hero.Children.Add(connectHost);
         panel.Children.Add(hero);
 
-        var selectedSubscription = _activeSubscriptionServer is null ? null :
-            NoraSubscriptionStore.LoadAll().FirstOrDefault(sub =>
-                sub.Id.Equals(_activeSubscriptionServer.SubscriptionId, StringComparison.OrdinalIgnoreCase));
-        // Healthy Home keeps its accepted composition. Only a validated status
-        // (including the exact legacy marker) adds a contextual service notice.
-        _homeStatusSubscription = selectedSubscription;
-        _homeServiceNoticeKey = selectedSubscription is null ? "" : NoraSubscriptionNoticeView.Signature(NoraSubscriptionMetadata.EffectiveFor(selectedSubscription));
-        if (selectedSubscription is not null &&
-            NoraSubscriptionNoticeView.Create(NoraSubscriptionMetadata.EffectiveFor(selectedSubscription)) is { } serviceNotice)
-            panel.Children.Add(serviceNotice);
-        if (_activeSubscriptionServer is not null || DiscoverProfiles().Any())
-            panel.Children.Add(ActiveServerCard());
+        panel.Children.Add(ActiveServerCard());
         if (DiscordModeEnabledForView())
         {
             panel.Children.Add(DiscordModeStatusCard());
@@ -4118,8 +4094,7 @@ internal sealed partial class NoraWpfWindow : Window
             ToolTip = NoraProtectedDisplay.Redact(sub.Title)
         }));
 
-        var cachedOnly = NoraSubscriptionMetadata.EffectiveFor(sub).CachedOnly;
-        var meta = cachedOnly ? "Saved settings · refresh required" : $"{sub.Servers.Count} servers";
+        var meta = $"{sub.Servers.Count} servers";
         if (sub.ExpireUnix > 0)
         {
             var left = DateTimeOffset.FromUnixTimeSeconds(sub.ExpireUnix) - DateTimeOffset.UtcNow;
@@ -4243,9 +4218,7 @@ internal sealed partial class NoraWpfWindow : Window
             panel.Children.Add(meter);
         }
 
-        var metadataNotice = NoraSubscriptionNoticeView.Create(NoraSubscriptionMetadata.EffectiveFor(sub));
-        if (metadataNotice is not null) panel.Children.Add(metadataNotice);
-        if (metadataNotice is null && !string.IsNullOrWhiteSpace(sub.Announce))
+        if (!string.IsNullOrWhiteSpace(sub.Announce))
         {
             var announce = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 9, 0, 0) };
             announce.Children.Add(new NoraIcon
@@ -4279,7 +4252,7 @@ internal sealed partial class NoraWpfWindow : Window
         if (wiggleSubscription)
             ApplyArrangementWiggle(card, subscriptionIndex);
 
-        if (expanded && !_isArrangingSubscriptions && !cachedOnly)
+        if (expanded && !_isArrangingSubscriptions)
         {
             var listHost = new StackPanel { Margin = new Thickness(0, 12, 0, 0) };
             listHost.Children.Add(new Border
@@ -4291,16 +4264,18 @@ internal sealed partial class NoraWpfWindow : Window
             var index = 0;
             foreach (var server in sub.Servers)
             {
+                var isTechnical = NoraLegacySubscriptionNotice.IsTechnicalEntry(server);
                 var row = ServerRow(
                     NoraProtectedDisplay.Redact(server.Name),
-                    NoraProtectedDisplay.EndpointText(server),
-                    ShortProtocol(server.Protocol, server.Flow),
-                    server.Country,
-                    _activeSubscriptionServer is not null && string.Equals(_activeSubscriptionServer.LocalPath, server.LocalPath, StringComparison.OrdinalIgnoreCase),
-                    _ping.TryGetValue(server.LocalPath, out var p) ? p : PingStatus.Unknown,
+                    isTechnical ? "" : NoraProtectedDisplay.EndpointText(server),
+                    isTechnical ? "" : ShortProtocol(server.Protocol, server.Flow),
+                    isTechnical ? "" : server.Country,
+                    !isTechnical && _activeSubscriptionServer is not null && string.Equals(_activeSubscriptionServer.LocalPath, server.LocalPath, StringComparison.OrdinalIgnoreCase),
+                    !isTechnical && _ping.TryGetValue(server.LocalPath, out var p) ? p : PingStatus.Unknown,
                     index++,
                     async () => await ActivateSubscriptionServerAsync(server),
-                    async () => await DeleteSubscriptionServerAsync(server));
+                    isTechnical ? null : async () => await DeleteSubscriptionServerAsync(server),
+                    isTechnical: isTechnical);
                 listHost.Children.Add(row);
             }
             panel.Children.Add(listHost);
@@ -4464,25 +4439,31 @@ internal sealed partial class NoraWpfWindow : Window
             !string.Equals(_activeSubscriptionServer.SubscriptionId, original.Id, StringComparison.OrdinalIgnoreCase))
             return;
 
-        var replacement = refreshed.Servers.FirstOrDefault(server =>
+        var preserved = refreshed.Servers.Concat(refreshed.RetainedServers)
+            .Where(server => !NoraLegacySubscriptionNotice.IsTechnicalEntry(server)).ToArray();
+        var current = refreshed.Servers.Where(NoraSubscriptionStore.IsUsableServer).ToArray();
+        var replacement = preserved.FirstOrDefault(server =>
                               string.Equals(server.Id, _activeSubscriptionServer.Id, StringComparison.OrdinalIgnoreCase))
-                          ?? refreshed.Servers.FirstOrDefault(server =>
+                          ?? preserved.FirstOrDefault(server =>
                               NoraSubscriptionStore.SameProviderEntry(server, _activeSubscriptionServer))
-                          ?? refreshed.Servers.FirstOrDefault(server =>
+                          ?? preserved.FirstOrDefault(server =>
                               NoraSubscriptionStore.SameRuntimeConnection(server, _activeSubscriptionServer));
         // A provider may replace its entire node set while one of the old nodes is
         // still carrying the live tunnel. Never make the UI selection disagree
         // with that active core; the user can choose a new node after disconnecting.
         if (replacement is null && _state is TunnelState.Ready or TunnelState.Failed)
-            replacement = refreshed.Servers.FirstOrDefault();
+            replacement = current.FirstOrDefault();
         if (replacement is not null)
         {
             _pendingSubscriptionSelection = null;
-            SetActiveSubscriptionServer(replacement);
+            // A retained node preserves the existing selection and committed
+            // display policy; it never becomes a fresh selection or probe.
+            if (NoraSubscriptionStore.IsUsableServer(replacement))
+                SetActiveSubscriptionServer(replacement);
         }
         else if (_state is TunnelState.Connected or TunnelState.Connecting or TunnelState.Disconnecting)
         {
-            _pendingSubscriptionSelection = refreshed.Servers.FirstOrDefault();
+            _pendingSubscriptionSelection = current.FirstOrDefault();
         }
     }
 
@@ -4597,11 +4578,8 @@ internal sealed partial class NoraWpfWindow : Window
 
     private async Task ActivateSubscriptionServerAsync(NoraSubscriptionServer server)
     {
-        if (NoraSubscriptionMetadata.EffectiveFor(server).CachedOnly)
-        {
-            ShowToast("Refresh required", "This subscription has no currently available servers. Its saved connection settings are retained.", ToastKind.Info);
+        if (!NoraSubscriptionStore.IsUsableServer(server))
             return;
-        }
         if (_discordModeTransitionInProgress)
             return;
         if (_state is TunnelState.Connecting or TunnelState.Disconnecting)
@@ -4685,9 +4663,13 @@ internal sealed partial class NoraWpfWindow : Window
         PingStatus ping,
         int index,
         Func<Task> select,
-        Func<Task>? delete = null)
+        Func<Task>? delete = null,
+        bool isTechnical = false)
     {
-        country = NoraDisplayRegion.Country(name, country);
+        if (isTechnical)
+            selected = false;
+        if (!isTechnical)
+            country = NoraDisplayRegion.Country(name, country);
         var baseBg = selected ? Color.FromArgb(38, 255, 156, 38) : Color.FromArgb(0, 27, 34, 45);
         var hoverBg = selected ? Color.FromArgb(52, 255, 156, 38) : Color.FromArgb(170, 27, 34, 45);
         var bg = new SolidColorBrush(baseBg);
@@ -4699,24 +4681,22 @@ internal sealed partial class NoraWpfWindow : Window
             BorderThickness = new Thickness(1),
             BorderBrush = selected ? NoraWpfTheme.Brush(Color.FromArgb(160, 255, 156, 38)) : Brushes.Transparent,
             Background = bg,
-            Cursor = Cursors.Hand
+            Cursor = isTechnical ? Cursors.Arrow : Cursors.Hand,
+            IsEnabled = !isTechnical
         };
-        row.MouseEnter += (_, _) =>
+        if (!isTechnical)
         {
-            bg.BeginAnimation(SolidColorBrush.ColorProperty, ColorTo(hoverBg, 140));
-        };
-        row.MouseLeave += (_, _) =>
-        {
-            bg.BeginAnimation(SolidColorBrush.ColorProperty, ColorTo(baseBg, 220));
-        };
+            row.MouseEnter += (_, _) => bg.BeginAnimation(SolidColorBrush.ColorProperty, ColorTo(hoverBg, 140));
+            row.MouseLeave += (_, _) => bg.BeginAnimation(SolidColorBrush.ColorProperty, ColorTo(baseBg, 220));
+        }
 
         var grid = new Grid();
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(38) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(isTechnical ? 0 : 38) });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         row.Child = grid;
 
-        grid.Children.Add(new FlagIcon
+        if (!isTechnical) grid.Children.Add(new FlagIcon
         {
             Country = country,
             Width = 28,
@@ -4727,24 +4707,27 @@ internal sealed partial class NoraWpfWindow : Window
 
         var info = new StackPanel { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(2, 0, 10, 0) };
         Grid.SetColumn(info, 1);
-        info.Children.Add(EmojiAwareTextBlock(ServerDisplayName(name, country), new TextBlock
+        info.Children.Add(EmojiAwareTextBlock(isTechnical ? name : ServerDisplayName(name, country), new TextBlock
         {
             FontSize = 14,
             FontWeight = FontWeights.SemiBold,
-            TextTrimming = TextTrimming.CharacterEllipsis,
-            TextWrapping = TextWrapping.NoWrap
+            TextTrimming = isTechnical ? TextTrimming.None : TextTrimming.CharacterEllipsis,
+            TextWrapping = isTechnical ? TextWrapping.Wrap : TextWrapping.NoWrap
         }));
-        var detail = new TextBlock
+        if (!isTechnical)
         {
-            FontSize = 11,
-            Foreground = NoraWpfTheme.MutedBrush,
-            Margin = new Thickness(0, 2.5, 0, 0),
-            TextTrimming = TextTrimming.CharacterEllipsis,
-            TextWrapping = TextWrapping.NoWrap
-        };
-        detail.Inlines.Add(new System.Windows.Documents.Run(endpoint) { FontFamily = NoraWpfTheme.MonoFont });
-        detail.Inlines.Add(new System.Windows.Documents.Run("   " + protocol) { Foreground = NoraWpfTheme.DimBrush });
-        info.Children.Add(detail);
+            var detail = new TextBlock
+            {
+                FontSize = 11,
+                Foreground = NoraWpfTheme.MutedBrush,
+                Margin = new Thickness(0, 2.5, 0, 0),
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                TextWrapping = TextWrapping.NoWrap
+            };
+            detail.Inlines.Add(new System.Windows.Documents.Run(endpoint) { FontFamily = NoraWpfTheme.MonoFont });
+            detail.Inlines.Add(new System.Windows.Documents.Run("   " + protocol) { Foreground = NoraWpfTheme.DimBrush });
+            info.Children.Add(detail);
+        }
         grid.Children.Add(info);
 
         var right = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
@@ -4762,8 +4745,8 @@ internal sealed partial class NoraWpfWindow : Window
                 Child = new TextBlock { Text = "ACTIVE", FontSize = 10, FontWeight = FontWeights.Bold, Foreground = NoraWpfTheme.OrangeBrush }
             });
         }
-        right.Children.Add(PingBadge(ping));
-        if (delete is not null)
+        if (!isTechnical) right.Children.Add(PingBadge(ping));
+        if (!isTechnical && delete is not null)
         {
             var remove = IconActionButton(NoraIconKind.Trash, "Delete server", danger: true);
             remove.Width = 30;
@@ -4779,7 +4762,7 @@ internal sealed partial class NoraWpfWindow : Window
         Grid.SetColumn(right, 2);
         grid.Children.Add(right);
 
-        row.MouseLeftButtonUp += async (_, e) =>
+        if (!isTechnical) row.MouseLeftButtonUp += async (_, e) =>
         {
             e.Handled = true;
             await select();
@@ -6126,11 +6109,8 @@ internal sealed partial class NoraWpfWindow : Window
             ShowToast("Connection details protected", "This subscription does not allow exporting connection diagnostics.", ToastKind.Info);
             return;
         }
-        if (_activeSubscriptionServer is not null && NoraSubscriptionMetadata.EffectiveFor(_activeSubscriptionServer).CachedOnly)
-        {
-            ShowToast("Refresh required", "Saved connection settings are unavailable for connection tests until this subscription recovers.", ToastKind.Info);
+        if (_activeSubscriptionServer is not null && !NoraSubscriptionStore.IsUsableServer(_activeSubscriptionServer))
             return;
-        }
         var target = BuildDiagnosticTarget();
         if (target is null)
         {
@@ -6191,6 +6171,8 @@ internal sealed partial class NoraWpfWindow : Window
         var server = CurrentServerInfo();
         if (_activeSubscriptionServer is not null)
         {
+            if (!NoraSubscriptionStore.IsUsableServer(_activeSubscriptionServer))
+                return null;
             return new NoraDiagnosticTarget(
                 server.Name,
                 server.Protocol,
@@ -6266,6 +6248,8 @@ internal sealed partial class NoraWpfWindow : Window
         }
 
         var selectedProtocol = CurrentServerInfo().Protocol;
+        if (_activeSubscriptionServer is not null && !NoraSubscriptionStore.IsUsableServer(_activeSubscriptionServer))
+            return;
         var hasSelection = _activeSubscriptionServer is not null ||
                            _activeConfig is not null ||
                            !string.IsNullOrWhiteSpace(_activeExternalProtocol);
@@ -6408,11 +6392,8 @@ internal sealed partial class NoraWpfWindow : Window
         if (!fromDiscordModeTransition && _core is null && _state is TunnelState.Ready or TunnelState.Failed)
             ApplyPendingSubscriptionSelection();
         if (_core is null && _activeSubscriptionServer is not null &&
-            NoraSubscriptionMetadata.EffectiveFor(_activeSubscriptionServer).CachedOnly)
-        {
-            ShowToast("Refresh required", "Refresh this subscription before starting a new connection.", ToastKind.Info);
+            !NoraSubscriptionStore.IsUsableServer(_activeSubscriptionServer))
             return;
-        }
         if (_diagnosticRunning)
         {
             ShowToast("Connection test is running", "Cancel the manual test on Logs before connecting.", ToastKind.Info);
@@ -6585,7 +6566,8 @@ internal sealed partial class NoraWpfWindow : Window
 
     private async Task ConnectAutomaticSubscriptionAsync(NoraSubscriptionServer primary, CancellationToken cancellationToken)
     {
-        var candidates = NoraSubscriptionStore.GetAutomaticFailoverCandidates(primary);
+        var candidates = NoraSubscriptionStore.GetAutomaticFailoverCandidates(primary)
+            .Where(NoraSubscriptionStore.IsUsableServer).ToList();
         Exception? lastFailure = null;
         var discordMode = NoraDiscordModeSettings.Enabled;
 
@@ -6593,6 +6575,8 @@ internal sealed partial class NoraWpfWindow : Window
         {
             cancellationToken.ThrowIfCancellationRequested();
             var candidate = candidates[index];
+            if (!NoraSubscriptionStore.IsUsableServer(candidate))
+                continue;
             _activeSubscriptionServer = candidate;
             _trafficInterfaceHint = "NORA-Xray";
             ResetInterfaceTrafficSampler();
@@ -6906,7 +6890,8 @@ internal sealed partial class NoraWpfWindow : Window
             _trafficHistory.Dequeue();
         _trafficHistory.Enqueue((_trafficUpRate, _trafficDownRate));
         foreach (var graph in _graphs)
-            graph.AddSample(_trafficUpRate, _trafficDownRate, (long)_trafficUpBytes, (long)_trafficDownBytes, _connectedFor.Elapsed);
+            if (NoraMotionLifecycle.IsPresented(graph))
+                graph.AddSample(_trafficUpRate, _trafficDownRate, (long)_trafficUpBytes, (long)_trafficDownBytes, _connectedFor.Elapsed);
     }
 
     private async Task ProcessPendingDeepLinksAsync()
@@ -6961,7 +6946,7 @@ internal sealed partial class NoraWpfWindow : Window
                 var subscription = await _subscriptionRefreshCoordinator.RunExclusiveAsync(
                     () => NoraSubscriptionStore.ImportAsync(input.Text, AppendLog, preferredTitle));
                 _expandedSubscriptionId = subscription.Id;
-                if (subscription.Servers.FirstOrDefault() is { } first)
+                if (subscription.Servers.FirstOrDefault(NoraSubscriptionStore.IsUsableServer) is { } first)
                     SetActiveSubscriptionServer(first);
                 AppendLog($"Subscription added: {subscription.Title}");
                 RenderPage(PageKind.Servers);
@@ -7066,8 +7051,8 @@ internal sealed partial class NoraWpfWindow : Window
             }
 
             var serverTasks = NoraSubscriptionStore.LoadAll()
-                .Where(subscription => !NoraSubscriptionMetadata.EffectiveFor(subscription).CachedOnly)
                 .SelectMany(subscription => subscription.Servers)
+                .Where(NoraSubscriptionStore.IsUsableServer)
                 .Select(server => ProbeTargetAsync(
                     server.LocalPath,
                     server.Host,
@@ -7137,8 +7122,8 @@ internal sealed partial class NoraWpfWindow : Window
         var saved = NoraAppState.TryLoadActiveProfilePath();
         var portable = Path.Combine(AppContext.BaseDirectory, "client-profile.json");
         if (!string.IsNullOrWhiteSpace(saved) && NoraSubscriptionStore.TryLoadServer(saved, out var server))
-            SetActiveSubscriptionServer(server);
-        else if (!string.IsNullOrWhiteSpace(saved) && File.Exists(saved))
+            SetActiveSubscriptionServer(server, preserveExistingSelection: true);
+        else if (!string.IsNullOrWhiteSpace(saved) && File.Exists(saved) && !IsSubscriptionMirrorPath(saved))
             SetActiveProfile(saved);
         else if (File.Exists(portable))
             SetActiveProfile(portable);
@@ -7154,6 +7139,8 @@ internal sealed partial class NoraWpfWindow : Window
                 SetActiveSubscriptionServer(server);
                 return;
             }
+            if (IsSubscriptionMirrorPath(path))
+                return;
             if (ProfileListItem.TryFromExternal(path, out var external))
             {
                 _pendingSubscriptionSelection = null;
@@ -7180,8 +7167,19 @@ internal sealed partial class NoraWpfWindow : Window
         }
     }
 
-    private void SetActiveSubscriptionServer(NoraSubscriptionServer server)
+    private static bool IsSubscriptionMirrorPath(string path)
     {
+        var root = Path.GetFullPath(NoraSubscriptionStore.Root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var full = Path.GetFullPath(path);
+        return full.StartsWith(root, StringComparison.OrdinalIgnoreCase) &&
+               Path.GetFileName(full).StartsWith("server-", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void SetActiveSubscriptionServer(NoraSubscriptionServer server, bool preserveExistingSelection = false)
+    {
+        var usable = NoraSubscriptionStore.IsUsableServer(server);
+        if (!usable && (!preserveExistingSelection || NoraLegacySubscriptionNotice.IsTechnicalEntry(server)))
+            return;
         _pendingSubscriptionSelection = null;
         _showActiveEndpoint = false;
         _activeSubscriptionServer = server;
@@ -7189,8 +7187,8 @@ internal sealed partial class NoraWpfWindow : Window
         _activeExternalProtocol = "";
         _activeProfilePath = server.LocalPath;
         NoraAppState.SaveActiveProfilePath(server.LocalPath);
-        if (!NoraSubscriptionMetadata.EffectiveFor(server).CachedOnly) _ = ProbeActiveAsync(server.LocalPath);
-        AppendLog("Selected subscription server " + server.Name + " " + server.Host + ":" + server.Port);
+        if (usable) _ = ProbeActiveAsync(server.LocalPath);
+        AppendLog("Selected subscription server " + NoraProtectedDisplay.Redact(server.Name) + " " + NoraProtectedDisplay.EndpointText(server));
     }
 
     private void ApplyPendingSubscriptionSelection()
@@ -7198,6 +7196,8 @@ internal sealed partial class NoraWpfWindow : Window
         if (_pendingSubscriptionSelection is not { } replacement)
             return;
         _pendingSubscriptionSelection = null;
+        if (!NoraSubscriptionStore.IsUsableServer(replacement))
+            return;
         SetActiveSubscriptionServer(replacement);
         AppendLog("Selected a current subscription server after the provider removed the previous node.");
         if (_page == PageKind.Servers)
@@ -7206,7 +7206,7 @@ internal sealed partial class NoraWpfWindow : Window
 
     private void SelectFirstAvailableProfile()
     {
-        if (NoraSubscriptionStore.LoadAll().Where(sub => !NoraSubscriptionMetadata.EffectiveFor(sub).CachedOnly).SelectMany(x => x.Servers).FirstOrDefault() is { } server)
+        if (NoraSubscriptionStore.LoadAll().SelectMany(x => x.Servers).FirstOrDefault(NoraSubscriptionStore.IsUsableServer) is { } server)
         {
             SetActiveSubscriptionServer(server);
             return;
@@ -7251,7 +7251,7 @@ internal sealed partial class NoraWpfWindow : Window
             return _snapshotServerInfo;
         if (_activeSubscriptionServer is not null)
         {
-            var subOnline = _state is TunnelState.Connected or TunnelState.Connecting || (!NoraSubscriptionMetadata.EffectiveFor(_activeSubscriptionServer).CachedOnly && _ping.TryGetValue(_activeSubscriptionServer.LocalPath, out var sp) && sp.Online);
+            var subOnline = _state is TunnelState.Connected or TunnelState.Connecting || (NoraSubscriptionStore.IsUsableServer(_activeSubscriptionServer) && _ping.TryGetValue(_activeSubscriptionServer.LocalPath, out var sp) && sp.Online);
             return new ServerInfo(NoraProtectedDisplay.Redact(_activeSubscriptionServer.Name), _activeSubscriptionServer.Host, _activeSubscriptionServer.Port, NoraDisplayRegion.Country(_activeSubscriptionServer.Name, _activeSubscriptionServer.Country), subOnline, _activeSubscriptionServer.Protocol);
         }
         if (!string.IsNullOrWhiteSpace(_activeExternalProtocol))
@@ -7607,6 +7607,8 @@ internal sealed partial class NoraWpfWindow : Window
             return;
         if (_activeSubscriptionServer is not null)
         {
+            if (!NoraSubscriptionStore.IsUsableServer(_activeSubscriptionServer))
+                return;
             _ping[path] = await ProbeAsync(_activeSubscriptionServer.Host, _activeSubscriptionServer.Port);
             if (_page is PageKind.Home or PageKind.Servers)
                 Dispatcher.Invoke(() => RenderPage(_page));

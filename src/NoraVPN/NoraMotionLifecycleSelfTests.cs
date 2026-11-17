@@ -29,22 +29,6 @@ namespace Nvp;
 // shown offscreen; their controls use the production lifecycle/render paths.
 internal static class NoraMotionLifecycleSelfTests
 {
-    internal static int RunInputFeedbackProof(TextWriter output, string proofDirectory)
-    {
-        Application? owned = null;
-        try
-        {
-            Directory.CreateDirectory(proofDirectory);
-            if (Application.Current is null) owned = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
-            var results = new List<object>();
-            CheckInputFeedback(proofDirectory, results);
-            File.WriteAllText(Path.Combine(proofDirectory, "input-feedback.json"), JsonSerializer.Serialize(new { processId = Environment.ProcessId, results }, new JsonSerializerOptions { WriteIndented = true }));
-            output.WriteLine("INPUT FEEDBACK PASS: own routed hover/press/focus; pointer capture and keyboard focus unchanged");
-            return 0;
-        }
-        catch (Exception exception) { output.WriteLine("INPUT FEEDBACK FAIL: " + exception.GetType().Name + ": " + exception.Message); return 1; }
-        finally { owned?.Shutdown(); }
-    }
     internal static int Run(TextWriter output, string proofDirectory, string motionMode = "full")
     {
         if (motionMode is not ("full" or "reduced"))

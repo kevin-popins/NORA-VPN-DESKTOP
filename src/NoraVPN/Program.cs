@@ -29,8 +29,8 @@ internal static class Program
         if (args.Length == 1 && args[0].Equals("import-input-selftest", StringComparison.OrdinalIgnoreCase))
             return NoraImportInput.RunSelfTest(Console.Out);
 
-        if (args.Length == 1 && args[0].Equals("subscription-notice-selftest", StringComparison.OrdinalIgnoreCase))
-            return NoraLegacySubscriptionNotice.RunSelfTest(Console.Out);
+        if (args.Length == 1 && args[0].Equals("technical-row-selftest", StringComparison.OrdinalIgnoreCase))
+            return NoraTechnicalRowSelfTests.RunSelfTest(Console.Out);
 
         if (args.Length == 1 && args[0].Equals("subscription-reliability-selftest", StringComparison.OrdinalIgnoreCase))
             return NoraSubscriptionStore.RunTransportSelfTest(Console.Out, validateCoreSyntax: false);
@@ -43,12 +43,6 @@ internal static class Program
 
         if (args.Length == 1 && args[0].Equals("purchase-link-selftest", StringComparison.OrdinalIgnoreCase))
             return NoraPurchaseLink.RunSelfTest(Console.Out);
-
-        if (args.Length == 2 && args[0].Equals("subscription-presentation-selftest", StringComparison.OrdinalIgnoreCase))
-            return NoraSubscriptionPresentationSelfTests.Run(Console.Out, args[1]);
-
-        if (args.Length == 2 && args[0].Equals("ui-input-feedback-selftest", StringComparison.OrdinalIgnoreCase))
-            return NoraMotionLifecycleSelfTests.RunInputFeedbackProof(Console.Out, args[1]);
 
         if (args.Length == 3 && args[0].Equals("subscription-restart-selftest", StringComparison.OrdinalIgnoreCase))
             return NoraSubscriptionRestartSelfTests.Run(Console.Out, args[1], args[2]);
@@ -535,10 +529,12 @@ internal static class Program
                 foreach (var line in importLog) Console.WriteLine(NoraProtectedDisplay.SanitizeLog(line));
                 Console.WriteLine(NoraProtectedDisplay.Redact($"subscription: title={sub.Title}; servers={sub.Servers.Count}; upload={sub.UploadBytes}; download={sub.DownloadBytes}; total={sub.TotalBytes}; update_hours={sub.UpdateIntervalHours}; hwid={sub.Hwid}"));
                 foreach (var server in sub.Servers)
-                    Console.WriteLine(NoraProtectedDisplay.IsProtected(server)
+                    Console.WriteLine(NoraLegacySubscriptionNotice.IsTechnicalEntry(server)
+                        ? $"entry: name={NoraProtectedDisplay.Redact(server.Name)}; connectable=false"
+                        : NoraProtectedDisplay.IsProtected(server)
                         ? $"server: name={NoraProtectedDisplay.Redact(server.Name)}; endpoint={NoraProtectedDisplay.EndpointText(server)}; protocol={server.Protocol}"
                         : $"server: name={server.Name}; host={server.Host}:{server.Port}; protocol={server.Protocol}; inbounds={server.InboundCount}; outbounds={server.OutboundCount}; rules={server.RuleCount}; path={server.LocalPath}");
-                return sub.Servers.Count > 0 || NoraSubscriptionNoticeView.HasNotice(NoraSubscriptionMetadata.EffectiveFor(sub)) ? 0 : 1;
+                return sub.Servers.Count > 0 ? 0 : 1;
 #else
                 Console.Error.WriteLine("subdiag is only available in the Windows client build.");
                 return 2;

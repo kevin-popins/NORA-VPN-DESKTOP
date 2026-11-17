@@ -94,7 +94,7 @@ if ($VerificationMode -eq 'Isolated') {
     $run = Join-Path $proofRoot ('portable-verification-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmss') + '-' + [Guid]::NewGuid().ToString('N'))
     [IO.Directory]::CreateDirectory($run) | Out-Null
     $manifestPath = Join-Path $run 'verification.json'
-    $commands = @('import-input-selftest', 'deep-link-selftest', 'subscription-notice-selftest',
+    $commands = @('import-input-selftest', 'deep-link-selftest', 'technical-row-selftest',
         'subscription-reliability-selftest', 'subscription-refresh-selftest', 'subscription-metadata-selftest',
         'protected-display-selftest', 'purchase-link-selftest', 'display-region-selftest',
         'subscription-order-selftest', 'country-flag-selftest', 'location-artwork-selftest')

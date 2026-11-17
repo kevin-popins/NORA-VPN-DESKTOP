@@ -2,6 +2,7 @@
 using System.IO;
 using System.Collections.Concurrent;
 using System.Net;
+using System.Text.RegularExpressions;
 
 namespace Nvp;
 
@@ -18,8 +19,8 @@ internal static class NoraProtectedDisplay
             return;
         }
         var values = new List<string> { subscription.SourceUrl, subscription.WebPageUrl };
-        foreach (var server in subscription.Servers)
-            values.AddRange([server.Host, server.SourceLink, server.Uuid, server.Sni, server.PublicKey, server.ShortId]);
+        foreach (var server in subscription.Servers.Concat(subscription.RetainedServers))
+            values.AddRange([server.Host, $"{server.Host}:{server.Port}", server.SourceLink, server.Uuid, server.Sni, server.PublicKey, server.ShortId]);
         foreach (var url in new[] { subscription.SourceUrl, subscription.WebPageUrl })
             if (Uri.TryCreate(url, UriKind.Absolute, out var uri))
             {
@@ -42,8 +43,8 @@ internal static class NoraProtectedDisplay
 
     internal static void RequireConnectable(NoraSubscriptionServer server)
     {
-        if (NoraSubscriptionMetadata.EffectiveFor(server).CachedOnly)
-            throw new NoraAppException("NORA-SUB-4003", "Refresh this subscription before starting a new connection or connection diagnostic.");
+        if (!NoraSubscriptionStore.IsUsableServer(server))
+            throw new NoraAppException("NORA-SUB-4003", "This entry cannot be used to start a connection or connection diagnostic.");
     }
     internal static string EndpointText(NoraSubscriptionServer server)
         => IsProtected(server) ? PublicLabel(NoraSubscriptionMetadata.EffectiveFor(server).PublicLabel) : $"{server.Host}:{server.Port}";
@@ -58,12 +59,14 @@ internal static class NoraProtectedDisplay
     // serializer callback. Protected policy never modifies the transport itself.
     internal static bool TryDisclose(NoraSubscriptionServer server, Action disclose)
     {
-        if (IsProtected(server)) return false;
+        if (IsProtected(server) || NoraLegacySubscriptionNotice.IsTechnicalEntry(server)) return false;
         disclose();
         return true;
     }
     internal static void RequireDisclosure(NoraSubscriptionServer server)
     {
+        if (NoraLegacySubscriptionNotice.IsTechnicalEntry(server))
+            throw new NoraAppException("NORA-SUB-4001", "This technical entry does not provide exportable connection details.");
         if (IsProtected(server))
             throw new NoraAppException("NORA-SUB-4001", "This subscription does not allow revealing, copying or exporting connection details.");
     }
@@ -77,10 +80,28 @@ internal static class NoraProtectedDisplay
     }
     internal static string SanitizeLog(string value) => Redact(NoraDiagnosticRedactor.Sanitize(value));
 
+    internal static string SanitizeTargetLog(NoraSubscriptionServer server, string value)
+    {
+        var safe = SanitizeLog(value);
+        if (!IsProtected(server) || server.Host.Length is 0 or >= 4) return safe;
+        // Short local names are replaced only in this target's diagnostic
+        // context, never as a global substring rule for other subscriptions.
+        return Regex.Replace(safe, @"(?<![\p{L}\p{N}_.])" + Regex.Escape(server.Host) + @"(?![\p{L}\p{N}_.])",
+            "[protected]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    }
+
+    internal static string SanitizeSubscriptionLog(NoraSubscriptionInfo subscription, string value)
+    {
+        var safe = SanitizeLog(value);
+        foreach (var server in subscription.Servers.Concat(subscription.RetainedServers))
+            safe = SanitizeTargetLog(server, safe);
+        return safe;
+    }
+
     internal static int RunSelfTest(TextWriter output)
     {
-        var protectedServer = new NoraSubscriptionServer { Id = "protected-node", SubscriptionId = "protected-fixture", Host = "private.example.com", Port = 443 };
-        var plainServer = new NoraSubscriptionServer { Id = "plain-node", SubscriptionId = "plain-fixture", Host = "ordinary.example.com", Port = 443 };
+        var protectedServer = new NoraSubscriptionServer { Id = "protected-node", SubscriptionId = "protected-fixture", Host = "private.example.com", Port = 443, Uuid = "11111111-1111-4111-8111-111111111111" };
+        var plainServer = new NoraSubscriptionServer { Id = "plain-node", SubscriptionId = "plain-fixture", Host = "ordinary.example.com", Port = 443, Uuid = "22222222-2222-4222-8222-222222222222" };
         var subscription = new NoraSubscriptionInfo
         {
             Id = protectedServer.SubscriptionId, SourceUrl = "https://provider.example.com/sub/fixture-token",
@@ -94,6 +115,27 @@ internal static class NoraProtectedDisplay
                      EndpointText(protectedServer) == FallbackLabel && EndpointText(plainServer) == "ordinary.example.com:443" &&
                      !Redact(subscription.SourceUrl + " " + protectedServer.Host).Contains("example.com", StringComparison.Ordinal);
         try { RequireDisclosure(protectedServer); passed = false; } catch (NoraAppException) { }
+        var technical = new NoraSubscriptionServer
+        {
+            Host = "127.0.0.1", Port = 1, Uuid = "00000000-0000-4000-8000-000000000001",
+            Network = "tcp", Security = "none", Encryption = "none", Name = "Проводятся работы 🌐"
+        };
+        passed &= !TryDisclose(technical, () => effects++) && effects == 1;
+        try { RequireDisclosure(technical); passed = false; } catch (NoraAppException) { }
+        var shortServer = new NoraSubscriptionServer
+        {
+            Id = "short-host-node", SubscriptionId = "short-host-fixture", Host = "vpn", Port = 443,
+            Uuid = "33333333-3333-4333-8333-333333333333"
+        };
+        var shortSubscription = new NoraSubscriptionInfo
+        {
+            Id = shortServer.SubscriptionId, SourceUrl = "https://provider.example.com/short-fixture",
+            AppMetadata = new NoraSubscriptionMetadataState { Protected = true }, Servers = [shortServer]
+        };
+        NoraSubscriptionMetadata.RegisterCommitted(shortSubscription);
+        passed &= !SanitizeTargetLog(shortServer, "dial vpn:443; hostname vpn").Contains("vpn", StringComparison.OrdinalIgnoreCase) &&
+                  Redact("unrelated vpn label").Contains("vpn", StringComparison.Ordinal);
+        Sensitive.TryRemove(shortSubscription.Id, out _);
         Sensitive.TryRemove(subscription.Id, out _);
         output.WriteLine(passed ? "PASS: per-subscription disclosure guards precede side effects; source URL/endpoint redacted; safe empty label" : "FAIL: protected disclosure policy");
         return passed ? 0 : 1;

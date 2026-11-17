@@ -39,6 +39,10 @@ internal sealed class NoraSubscriptionInfo
     public DateTimeOffset UpdatedAt { get; set; }
     public NoraSubscriptionMetadataState AppMetadata { get; set; } = new();
     public List<NoraSubscriptionServer> Servers { get; set; } = [];
+    // Recovery material is never promoted into the current display list.
+    public List<NoraSubscriptionServer> RetainedServers { get; set; } = [];
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool BodyHasRejectedEntries { get; set; }
 }
 
 internal sealed class NoraSubscriptionServer
@@ -79,6 +83,8 @@ internal sealed class NoraSubscriptionServer
     public string RawConfigJson { get; set; } = "";
     public string SourceLink { get; set; } = "";
     public string LocalPath { get; set; } = "";
+    public bool IsTechnical { get; set; }
+    public bool IsRetained { get; set; }
     public NoraSubscriptionMetadataState AppMetadata { get; set; } = new();
 }
 
@@ -136,6 +142,35 @@ internal sealed class NoraExternalProfileInfo
 
 internal static class NoraSubscriptionStore
 {
+    private sealed record CurrentRows(long Generation, HashSet<string> UsableIds);
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, CurrentRows> CurrentRowSets = new(StringComparer.Ordinal);
+
+    private static string CurrentRowsKey(string subscriptionId, NoraSubscriptionMetadataState state)
+        => NoraAppState.DataRoot + "\0" + subscriptionId + "\0" + state.ScopeId + "\0" + state.SourceBinding;
+
+    internal static void RegisterCurrentRows(NoraSubscriptionInfo subscription)
+    {
+        var rows = new CurrentRows(subscription.AppMetadata.LocalGeneration,
+            subscription.Servers.Where(server => !server.IsRetained && !NoraLegacySubscriptionNotice.IsTechnicalEntry(server))
+                .Select(server => server.Id).ToHashSet(StringComparer.OrdinalIgnoreCase));
+        CurrentRowSets.AddOrUpdate(CurrentRowsKey(subscription.Id, subscription.AppMetadata), rows,
+            (_, previous) => previous.Generation > rows.Generation ? previous : rows);
+    }
+
+    public static bool IsUsableServer(NoraSubscriptionServer server)
+    {
+        if (server.IsRetained || NoraLegacySubscriptionNotice.IsTechnicalEntry(server)) return false;
+        if (CurrentRowSets.TryGetValue(CurrentRowsKey(server.SubscriptionId, server.AppMetadata), out var current) && !current.UsableIds.Contains(server.Id)) return false;
+        try { ValidateConstrainedServerFields(server); return IsSupportedXrayProtocol(server.Protocol); }
+        catch (Exception exception) when (exception is NoraAppException or InvalidOperationException or JsonException) { return false; }
+    }
+
+    private static void RequireCurrentTransportEntry(NoraSubscriptionServer server)
+    {
+        if (server.IsRetained || NoraLegacySubscriptionNotice.IsTechnicalEntry(server) ||
+            CurrentRowSets.TryGetValue(CurrentRowsKey(server.SubscriptionId, server.AppMetadata), out var current) && !current.UsableIds.Contains(server.Id))
+            throw new NoraAppException("NORA-SUB-4001", "This subscription row cannot be used as a connection profile.");
+    }
     // sing-box 1.13 can misclassify Roblox's RakNet-style UDP handshake as
     // BitTorrent/uTP. Keep this allow-list deliberately narrow: only UDP owned
     // by the actual Roblox game process bypasses the provider's BitTorrent
@@ -228,7 +263,7 @@ internal static class NoraSubscriptionStore
         // Failed operations discard their buffered messages entirely.
         while (messages.TryDequeue(out var message))
         {
-            try { log(NoraProtectedDisplay.SanitizeLog(message)); }
+            try { log(NoraProtectedDisplay.SanitizeSubscriptionLog(result, message)); }
             catch { }
         }
         return result;
@@ -247,11 +282,9 @@ internal static class NoraSubscriptionStore
             catch { }
             if (sub is null)
                 continue;
-            var normalized = NoraLegacySubscriptionNotice.FilterCachedSnapshot(sub);
-            sub.Servers = normalized.Servers;
-            sub.AppMetadata = normalized.Metadata;
+            NoraLegacySubscriptionNotice.NormalizeRows(sub);
             var dir = Path.GetDirectoryName(path) ?? Root;
-            foreach (var server in sub.Servers)
+            foreach (var server in sub.Servers.Concat(sub.RetainedServers))
             {
                 NormalizeServerPresentation(server);
                 server.LocalPath = ServerPath(dir, server.Id);
@@ -282,14 +315,12 @@ internal static class NoraSubscriptionStore
                 var subscription = JsonSerializer.Deserialize<NoraSubscriptionInfo>(File.ReadAllText(manifestPath), JsonOptions);
                 if (subscription is not null)
                 {
-                    var normalized = NoraLegacySubscriptionNotice.FilterCachedSnapshot(subscription);
-                    subscription.Servers = normalized.Servers;
-                    subscription.AppMetadata = normalized.Metadata;
+                    NoraLegacySubscriptionNotice.NormalizeRows(subscription);
                     NoraSubscriptionMetadata.RegisterCommitted(subscription);
                 }
-                var committed = subscription?.Servers.FirstOrDefault(item =>
+                var committed = subscription?.Servers.Concat(subscription.RetainedServers).FirstOrDefault(item =>
                     string.Equals(Path.GetFullPath(ServerPath(directory!, item.Id)), fullPath, StringComparison.OrdinalIgnoreCase));
-                if (committed is null)
+                if (committed is null || NoraLegacySubscriptionNotice.IsTechnicalEntry(committed))
                     return false;
                 NormalizeServerPresentation(committed);
                 committed.LocalPath = fullPath;
@@ -299,7 +330,7 @@ internal static class NoraSubscriptionStore
             if (!File.Exists(path))
                 return false;
             server = JsonSerializer.Deserialize<NoraSubscriptionServer>(File.ReadAllText(path), JsonOptions) ?? new NoraSubscriptionServer();
-            if (NoraLegacySubscriptionNotice.IsNoticeMarker(server))
+            if (NoraLegacySubscriptionNotice.IsTechnicalEntry(server))
             {
                 server = new NoraSubscriptionServer();
                 return false;
@@ -323,6 +354,7 @@ internal static class NoraSubscriptionStore
         if (!Directory.Exists(dir))
             return false;
         Directory.Delete(dir, recursive: true);
+        CurrentRowSets[CurrentRowsKey(subscription.Id, subscription.AppMetadata)] = new CurrentRows(long.MaxValue, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
         NoraSubscriptionMetadata.Forget(subscription);
         return true;
     }
@@ -476,6 +508,7 @@ internal static class NoraSubscriptionStore
         bool nativeTun = false,
         IReadOnlyCollection<IPAddress>? endpointAddresses = null)
     {
+        RequireCurrentTransportEntry(server);
         var proxyOutbound = ExtractSupportedXrayOutbound(server.RawConfigJson, server.Protocol) ?? BuildXrayVlessOutbound(server);
         proxyOutbound["tag"] = "proxy";
         RemoveLocalInterfaceBindings(proxyOutbound);
@@ -607,7 +640,7 @@ internal static class NoraSubscriptionStore
             text.StartsWith("vmess://", StringComparison.OrdinalIgnoreCase) ||
             text.StartsWith("trojan://", StringComparison.OrdinalIgnoreCase))
         {
-            if (!TryParseShareUri(text, "Direct profiles", out var server) || NoraLegacySubscriptionNotice.IsNoticeMarker(server))
+            if (!TryParseShareUri(text, "Direct profiles", out var server) || !IsUsableServer(server))
                 return false;
             info = new NoraExternalProfileInfo
             {
@@ -1153,6 +1186,7 @@ internal static class NoraSubscriptionStore
         NoraSubscriptionServer? server = null,
         string tunInterfaceName = "NORA-Xray")
     {
+        if (server is not null) RequireCurrentTransportEntry(server);
         var policy = server is null ? null : ParseXrayRoutingPolicy(server.RawConfigJson);
 
         var dns = BuildTunDns(server, policy);
@@ -1456,6 +1490,7 @@ internal static class NoraSubscriptionStore
 
     public static string BuildSingBoxConfig(NoraSubscriptionServer server)
     {
+        RequireCurrentTransportEntry(server);
         var policy = ParseXrayRoutingPolicy(server.RawConfigJson);
         var root = new JsonObject
         {
@@ -1601,7 +1636,7 @@ internal static class NoraSubscriptionStore
                 var redirectResult = await SendSubscriptionRequestAsync(http, uri, authorizedSource, metadataTrusted,
                     userAgent, hwid, deviceName, attempt.Token).ConfigureAwait(false);
                 using var response = redirectResult.Response;
-                if (!response.IsSuccessStatusCode)
+                if (response.StatusCode != HttpStatusCode.OK)
                 {
                     lastError = $"HTTP {(int)response.StatusCode}";
                     log($"Subscription fetch as {userAgent} returned {(int)response.StatusCode}; trying next client identity.");
@@ -1627,17 +1662,7 @@ internal static class NoraSubscriptionStore
                     throw new NoraAppException("NORA-SUB-4003", "Subscription server returned an HTML page.");
 
                 NoraSubscriptionInfo candidate;
-                if (response.StatusCode == HttpStatusCode.NoContent)
-                {
-                    if (metadata is null || bodyResult.ByteCount != 0 || response.Content.Headers.ContentLength is > 0 ||
-                        !NoraSubscriptionMetadata.IsNoticeState(metadata))
-                        throw new NoraAppException("NORA-SUB-4003", "Subscription notice has no valid metadata.");
-                    candidate = ParsePayload("", storedSource, headers, log, allowEmpty: true, utcNow: now);
-                    candidate.AppMetadata = metadata with { CachedOnly = true };
-                    candidate.Hwid = hwid;
-                    candidate.UserAgent = userAgent;
-                }
-                else if (HappCrypt5Decoder.IsCrypt5Link(body))
+                if (HappCrypt5Decoder.IsCrypt5Link(body))
                 {
                     body = HappCrypt5Decoder.Decrypt(body);
                     if (body.StartsWith("http:", StringComparison.OrdinalIgnoreCase) || body.StartsWith("https:", StringComparison.OrdinalIgnoreCase))
@@ -1665,28 +1690,22 @@ internal static class NoraSubscriptionStore
                 }
 
                 attempt.Token.ThrowIfCancellationRequested();
-                if (response.StatusCode == HttpStatusCode.OK && metadata is not null &&
-                    (!NoraSubscriptionMetadata.IsLiveState(metadata) || candidate.Servers.Count == 0))
-                    throw new NoraAppException("NORA-SUB-4003", "Subscription metadata contradicts the response body.");
-                if (response.StatusCode != HttpStatusCode.NoContent)
+                if (candidate.BodyHasRejectedEntries && metadata is not null)
+                    throw new NoraAppException("NORA-SUB-4003", "Subscription metadata requires a fully valid response body.");
+                if (candidate.BodyHasRejectedEntries && parsed?.AppMetadata.HasV1Policy == true)
+                    continue;
+                var legacy = candidate.AppMetadata;
+                candidate.AppMetadata = metadata is null ? legacy : metadata with
                 {
-                    var legacy = candidate.AppMetadata;
-                    candidate.AppMetadata = metadata is null ? legacy : metadata with
-                    {
-                        LegacyProtected = legacy.LegacyProtected,
-                        LegacyNotice = legacy.LegacyNotice, LegacyMessage = legacy.LegacyMessage, LegacyNoticeAtUnix = legacy.LegacyNoticeAtUnix,
-                        Protected = metadata.Protected || legacy.LegacyProtected,
-                        CachedOnly = legacy.CachedOnly || metadata.Access is "expired" or "quota_exhausted" or "disabled" or "pending" ||
-                                     metadata.Availability is "node_maintenance" or "outage" or "no_nodes"
-                    };
-                }
+                    LegacyProtected = legacy.LegacyProtected,
+                    Protected = metadata.Protected || legacy.LegacyProtected
+                };
                 candidate.AppMetadata = NoraSubscriptionMetadata.Merge(parsed?.AppMetadata, candidate.AppMetadata,
                     NoraSubscriptionMetadata.BindSource(storedSource), now, out var candidateMetadataAccepted);
                 if (metadata is not null && !candidateMetadataAccepted)
                     throw new NoraAppException("NORA-SUB-4003", "Subscription metadata conflicts with the accepted candidate.");
-                if (candidate.Servers.Count == 0)
-                    return candidate;
-                var withRules = candidate.Servers.Count(s => !string.IsNullOrEmpty(s.RawConfigJson));
+                var usable = candidate.Servers.Count(IsUsableServer);
+                var withRules = candidate.Servers.Count(s => IsUsableServer(s) && !string.IsNullOrEmpty(s.RawConfigJson));
                 if (withRules > 0)
                 {
                     parsed = candidate;
@@ -1695,7 +1714,10 @@ internal static class NoraSubscriptionStore
                 }
                 // A usable node list remains the fallback if the next identity
                 // fails, times out, or returns an unsupported response.
-                parsed ??= candidate;
+                // A technical-only list is a valid display fallback, but it
+                // cannot prevent another client identity returning real nodes.
+                if (parsed is null || !parsed.Servers.Any(IsUsableServer) && usable > 0)
+                    parsed = candidate;
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -1814,6 +1836,8 @@ internal static class NoraSubscriptionStore
         foreach (var server in sub.Servers)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (!IsUsableServer(server))
+                continue;
             if (!NeedsCountryLookup(server.Country))
                 continue;
             var resolved = await ResolveCountryAsync(http, server.Host, cancellationToken);
@@ -1897,11 +1921,8 @@ internal static class NoraSubscriptionStore
         catch { }
 
         if (previous is not null)
-        {
-            var normalized = NoraLegacySubscriptionNotice.FilterCachedSnapshot(previous);
-            previous.Servers = normalized.Servers;
-            previous.AppMetadata = normalized.Metadata;
-        }
+            NoraLegacySubscriptionNotice.NormalizeRows(previous);
+        NoraLegacySubscriptionNotice.NormalizeRows(sub);
 
         if (string.IsNullOrWhiteSpace(sub.DisplayNameOverride) && !string.IsNullOrWhiteSpace(previous?.DisplayNameOverride))
             ApplyPreferredTitle(sub, previous.DisplayNameOverride);
@@ -1910,18 +1931,20 @@ internal static class NoraSubscriptionStore
         var previousMetadata = previous is not null && NoraSubscriptionMetadata.BindSource(previous.SourceUrl) == binding
             ? previous.AppMetadata : null;
         var incomingMetadata = sub.AppMetadata;
+        if (sub.BodyHasRejectedEntries && incomingMetadata.HasV1Policy)
+            throw new NoraAppException("NORA-SUB-4003", "Subscription metadata requires a fully valid response body.");
         var metadataNow = utcNow ?? DateTimeOffset.UtcNow;
         sub.AppMetadata = NoraSubscriptionMetadata.Merge(previousMetadata, incomingMetadata, binding, metadataNow, out var acceptedV1);
         if (incomingMetadata.HasV1Policy && !acceptedV1)
             throw new NoraAppException("NORA-SUB-4003", "Subscription metadata is stale or conflicts with the accepted state.");
         if (sub.Servers.Count == 0)
-        {
-            if ((!acceptedV1 || !NoraSubscriptionMetadata.IsNoticeState(sub.AppMetadata)) && !incomingMetadata.LegacyNotice)
-                throw new NoraAppException("NORA-SUB-4003", "Subscription notice did not contain an authoritative state.");
-            if (previous is not null && previousMetadata is not null)
-                sub.Servers = previous.Servers;
-            sub.AppMetadata = sub.AppMetadata with { CachedOnly = true };
-        }
+            throw new NoraAppException("NORA-SUB-4003", "Subscription contains no supported rows.");
+        var currentIds = sub.Servers.Select(server => server.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        sub.RetainedServers = previous is null || previousMetadata is null ? [] :
+            previous.Servers.Concat(previous.RetainedServers)
+                .Where(server => !NoraLegacySubscriptionNotice.IsTechnicalEntry(server) && !currentIds.Contains(server.Id))
+                .GroupBy(server => server.Id, StringComparer.OrdinalIgnoreCase).Select(group => group.First()).ToList();
+        foreach (var retained in sub.RetainedServers) retained.IsRetained = true;
         sub.AppMetadata = sub.AppMetadata with
         {
             ScopeId = previousMetadata is null ? Guid.NewGuid().ToString("N") :
@@ -1938,7 +1961,7 @@ internal static class NoraSubscriptionStore
         for (var index = 0; index < sub.Servers.Count; index++)
             sub.Servers[index].DisplayOrder = index + 1;
 
-        foreach (var server in sub.Servers)
+        foreach (var server in sub.Servers.Concat(sub.RetainedServers))
         {
             NormalizeServerPresentation(server);
             server.SubscriptionId = sub.Id;
@@ -1958,7 +1981,7 @@ internal static class NoraSubscriptionStore
     {
         // Prepare the whole generation before touching disk. The single atomic
         // manifest replacement is the commit point for both lists and selection.
-        var mirrors = subscription.Servers.Select(server =>
+        var mirrors = subscription.Servers.Concat(subscription.RetainedServers).Select(server =>
         {
             var path = ServerPath(directory, server.Id);
             EnsureUnderRoot(path);
@@ -2079,7 +2102,7 @@ internal static class NoraSubscriptionStore
     // sensible failover candidates: we must never silently switch to a named location.
     public static IReadOnlyList<NoraSubscriptionServer> GetAutomaticFailoverCandidates(NoraSubscriptionServer primary)
     {
-        if (NoraSubscriptionMetadata.EffectiveFor(primary).CachedOnly)
+        if (!IsUsableServer(primary))
             return [];
         if (!IsAutomaticServer(primary) || string.IsNullOrWhiteSpace(primary.SubscriptionId))
             return [primary];
@@ -2093,13 +2116,13 @@ internal static class NoraSubscriptionStore
         NoraSubscriptionServer primary,
         IEnumerable<NoraSubscriptionServer> candidates)
     {
-        if (NoraSubscriptionMetadata.EffectiveFor(primary).CachedOnly)
+        if (!IsUsableServer(primary))
             return [];
         if (!IsAutomaticServer(primary))
             return [primary];
 
         var fallback = candidates
-            .Where(server => !NoraSubscriptionMetadata.EffectiveFor(server).CachedOnly)
+            .Where(IsUsableServer)
             .Where(IsAutomaticServer)
             .Where(server => !string.Equals(server.Id, primary.Id, StringComparison.OrdinalIgnoreCase))
             .Where(server => IsSupportedXrayProtocol(server.Protocol))
@@ -2147,6 +2170,8 @@ internal static class NoraSubscriptionStore
                 Id = "backup",
                 Name = "AUTO backup",
                 Protocol = "VLESS",
+                Host = "198.51.100.10",
+                Uuid = "backup-custom-identity",
                 Network = "xhttp",
                 Security = "reality"
             };
@@ -2746,6 +2771,11 @@ internal static class NoraSubscriptionStore
 
     private static void NormalizeServerPresentation(NoraSubscriptionServer server)
     {
+        if (NoraLegacySubscriptionNotice.IsTechnicalEntry(server))
+        {
+            server.IsTechnical = true;
+            return;
+        }
         if (!IsSupportedXrayProtocol(server.Protocol))
             return;
         server.Protocol = DescribeSubscriptionProtocol(server);
@@ -2754,7 +2784,7 @@ internal static class NoraSubscriptionStore
     private static string ServerPath(string dir, string id) => Path.Combine(dir, "server-" + id + ".json");
 
     internal static NoraSubscriptionInfo ParsePayload(string body, string sourceUrl, IReadOnlyDictionary<string, string> headers, Action<string> log,
-        bool allowEmpty = false, DateTimeOffset? utcNow = null)
+        DateTimeOffset? utcNow = null)
     {
         var now = utcNow ?? DateTimeOffset.UtcNow;
         var title = DecodeHeaderText(Header(headers, "profile-title"));
@@ -2776,9 +2806,10 @@ internal static class NoraSubscriptionStore
         ApplyUserInfo(sub, Header(headers, "subscription-userinfo"));
 
         var compatibilityPayload = body;
+        var rejectedSyntax = 0;
         var trimmed = body.Trim();
         if (trimmed.StartsWith("[", StringComparison.Ordinal) || trimmed.StartsWith("{", StringComparison.Ordinal))
-            sub.Servers = ParseXrayJson(trimmed, title).ToList();
+            sub.Servers = ParseXrayJson(trimmed, title, () => rejectedSyntax++).ToList();
         else
         {
             var decoded = TryBase64Decode(trimmed);
@@ -2787,45 +2818,38 @@ internal static class NoraSubscriptionStore
             if (payload.Contains("proxies:", StringComparison.OrdinalIgnoreCase))
                 sub.Servers = ParseClashYaml(payload, title).ToList();
             else
-                sub.Servers = ParseShareLinks(payload, title).ToList();
+                sub.Servers = ParseShareLinks(payload, title, () => rejectedSyntax++).ToList();
         }
         sub.Title = NormalizeUnicodeText(sub.Title);
         sub.Announce = NormalizeUnicodeText(sub.Announce);
+        var rows = new List<NoraSubscriptionServer>();
+        var invalidRows = rejectedSyntax;
         foreach (var server in sub.Servers)
         {
+            if (NoraLegacySubscriptionNotice.IsTechnicalEntry(server))
+            {
+                NoraLegacySubscriptionNotice.PreserveProviderName(server);
+                rows.Add(server);
+                continue;
+            }
+            try { ValidateConstrainedServerFields(server); }
+            catch (NoraAppException) { invalidRows++; continue; }
             server.Name = NormalizeUnicodeText(server.Name);
             server.Country = NormalizeUnicodeText(server.Country);
+            rows.Add(server);
         }
-        // Extract the exact inert compatibility record before deduplication,
-        // endpoint probes, selection, or any generated core configuration.
-        var markers = sub.Servers.Where(NoraLegacySubscriptionNotice.IsNoticeMarker).ToArray();
-        var expired = markers.FirstOrDefault(NoraLegacySubscriptionNotice.IsExpiredMarker);
-        var hasMaintenance = markers.Any(NoraLegacySubscriptionNotice.IsMaintenanceMarker);
-        var expiredConfirmed = expired is not null && Header(headers, "x-nora-subscription-expired").Trim().Equals("true", StringComparison.OrdinalIgnoreCase);
-        var noticeMarker = expiredConfirmed ? expired : markers.FirstOrDefault(NoraLegacySubscriptionNotice.IsMaintenanceMarker) ?? expired;
-        var legacyMessage = expired is not null && !expiredConfirmed && !hasMaintenance ? NoraLegacySubscriptionNotice.ExpiredFallbackMessage :
-            noticeMarker is null ? "" : NoraLegacySubscriptionNotice.Message(noticeMarker);
-        sub.Servers.RemoveAll(NoraLegacySubscriptionNotice.IsNoticeMarker);
-        foreach (var server in sub.Servers)
-            ValidateConstrainedServerFields(server);
+        sub.Servers = rows;
+        sub.BodyHasRejectedEntries = invalidRows > 0;
+        if (invalidRows > 0) log($"Ignored {invalidRows} non-connectable provider record(s).");
         var legacyProtection = Header(headers, "hide-settings").Trim() == "1" ||
             compatibilityPayload.Split(['\r', '\n']).Any(line => line.Trim().Equals("#hide-settings: 1", StringComparison.OrdinalIgnoreCase));
         sub.AppMetadata = new NoraSubscriptionMetadataState
         {
-            Protected = legacyProtection, LegacyProtected = legacyProtection,
-            LegacyNotice = markers.Length > 0, CachedOnly = expiredConfirmed || markers.Length > 0 && sub.Servers.Count == 0,
-            Access = expiredConfirmed ? "expired" : "unknown",
-            Availability = expiredConfirmed || !hasMaintenance ? "unknown" : sub.Servers.Count == 0 ? "node_maintenance" : "degraded",
-            LegacyAccess = expiredConfirmed ? "expired" : "unknown",
-            LegacyAvailability = expiredConfirmed || !hasMaintenance ? "unknown" : sub.Servers.Count == 0 ? "node_maintenance" : "degraded",
-            Message = legacyMessage,
-            LegacyMessage = legacyMessage, LegacyNoticeAtUnix = now.ToUnixTimeSeconds(),
-            SourceBinding = NoraSubscriptionMetadata.BindSource(sourceUrl),
-            IssuedAtUnix = now.ToUnixTimeSeconds(), TtlSeconds = 300, AcceptedAt = now
+            Protected = legacyProtection, LegacyProtected = legacyProtection, SourceBinding = NoraSubscriptionMetadata.BindSource(sourceUrl)
         };
         var parsedServerCount = sub.Servers.Count;
         sub.Servers = DeduplicateServers(sub.Servers).ToList();
-        if (sub.Servers.Count == 0 && markers.Length == 0 && !allowEmpty)
+        if (sub.Servers.Count == 0)
             throw new NoraAppException("NORA-SUB-4003", "Subscription contains no supported VLESS, VMess or Trojan servers.");
         if (parsedServerCount != sub.Servers.Count)
             log($"Ignored {parsedServerCount - sub.Servers.Count} duplicate subscription server(s).");
@@ -2922,8 +2946,9 @@ internal static class NoraSubscriptionStore
             // backed by the same VLESS connection. Names therefore belong to the
             // entry identity. Only repeated informational rows (quota/instructions)
             // collapse globally, and the first provider occurrence always wins.
-            var identity = ProviderEntryIdentity(server);
-            server.Id = StableId("provider-v2|" + identity);
+            var technical = NoraLegacySubscriptionNotice.IsTechnicalEntry(server);
+            var identity = technical ? "technical-v1|" + server.Host + "|" + server.Uuid : ProviderEntryIdentity(server);
+            server.Id = StableId((technical ? "row-v1|" : "provider-v2|") + identity);
             if (identities.Add(identity))
                 selected.Add(server);
         }
@@ -3017,7 +3042,7 @@ internal static class NoraSubscriptionStore
             policy.BlockBittorrent ? "1" : "0");
     }
 
-    private static IEnumerable<NoraSubscriptionServer> ParseXrayJson(string json, string title)
+    private static IEnumerable<NoraSubscriptionServer> ParseXrayJson(string json, string title, Action rejectedEntry)
     {
         using var doc = JsonDocument.Parse(json);
         var index = 0;
@@ -3028,7 +3053,10 @@ internal static class NoraSubscriptionStore
         {
             index++;
             if (!cfg.TryGetProperty("outbounds", out var outbounds) || outbounds.ValueKind != JsonValueKind.Array)
+            {
+                rejectedEntry();
                 continue;
+            }
             foreach (var outbound in outbounds.EnumerateArray())
             {
                 var outboundProtocol = Str(outbound, "protocol");
@@ -3037,6 +3065,8 @@ internal static class NoraSubscriptionStore
                 {
                     if (ParseXrayNonVlessOutbound(cfg, outbound, outboundProtocol.ToLowerInvariant(), title, index) is { } parsed)
                         yield return parsed;
+                    else
+                        rejectedEntry();
                     continue;
                 }
                 if (!string.Equals(outboundProtocol, "vless", StringComparison.OrdinalIgnoreCase))
@@ -3089,12 +3119,14 @@ internal static class NoraSubscriptionStore
         }
     }
 
-    private static IEnumerable<NoraSubscriptionServer> ParseShareLinks(string payload, string title)
+    private static IEnumerable<NoraSubscriptionServer> ParseShareLinks(string payload, string title, Action rejectedEntry)
     {
         foreach (var line in payload.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             if (TryParseShareUri(line, title, out var server))
                 yield return server;
+            else if (line.Length > 0 && !line.StartsWith('#') && !line.StartsWith("//", StringComparison.Ordinal) && !line.StartsWith(';'))
+                rejectedEntry();
         }
     }
 
@@ -3178,8 +3210,8 @@ internal static class NoraSubscriptionStore
             link.StartsWith("trojan://", StringComparison.OrdinalIgnoreCase) && TryParseTrojanUri(link, title, out server);
         if (parsed)
         {
-            if (!NoraLegacySubscriptionNotice.IsNoticeMarker(server))
-                ValidateConstrainedServerFields(server);
+            // Payload parsing validates/filter rows as a whole. This URI parser
+            // must not abort a valid multi-node list on an official-app marker.
             return true;
         }
         server = new NoraSubscriptionServer();
@@ -4107,8 +4139,10 @@ internal static class NoraDataPlaneProbe
     }
 }
 
-internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<string> log, bool discordMode = false) : IVpnCoreProcess, INoraDiscordModeCore
+internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<string> writeLog, bool discordMode = false) : IVpnCoreProcess, INoraDiscordModeCore
 {
+    // Existing route/core callbacks share the selected target's privacy scope.
+    private void log(string message) => writeLog(NoraProtectedDisplay.SanitizeTargetLog(server, message));
     private Process? _xray;
     private Process? _tunFrontend;
     private string _tunConfigPath = "";
@@ -4137,6 +4171,8 @@ internal sealed class XrayCoreProcess(NoraSubscriptionServer server, Action<stri
     {
         if (_xray is not null)
             return;
+        if (!NoraSubscriptionStore.IsUsableServer(server))
+            throw new NoraAppException("NORA-SUB-4001", "This subscription row cannot be used as a connection profile.");
         cancellationToken.ThrowIfCancellationRequested();
         var xrayExe = NoraSubscriptionStore.XrayPath();
         var missing = NoraSubscriptionStore.MissingVlessCorePaths();
