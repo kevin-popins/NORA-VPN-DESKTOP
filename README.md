@@ -1,199 +1,51 @@
-<p align="center">
-  <img src="assets/logo.svg" width="92" alt="NORA VPN logo">
-</p>
+# NORA VPN
 
-<h1 align="center">NORA VPN</h1>
+<img src="assets/logo.svg" width="64" alt="NORA VPN">
 
-<p align="center">
-  A visual-first Windows VPN client with self-hosted KRot, VLESS and AmneziaWG paths.
-</p>
+## Русский
 
-<p align="center">
-  <img alt="Windows 10 and 11" src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0b1017?style=flat-square&logo=windows&logoColor=white">
-  <img alt=".NET 8" src="https://img.shields.io/badge/.NET-8.0-512bd4?style=flat-square&logo=dotnet&logoColor=white">
-  <img alt="Pre-release" src="https://img.shields.io/badge/status-pre--release-ff9c26?style=flat-square">
-  <img alt="Apache 2.0 License" src="https://img.shields.io/badge/license-Apache--2.0-2563eb?style=flat-square">
-</p>
+NORA VPN — клиент для Windows 10 и 11 с упором на аккуратный визуальный
+интерфейс, понятное управление и надёжную работу с подписками разных провайдеров.
 
-<p align="center">
-  <img alt="WPF desktop UI" src="https://img.shields.io/badge/UI-WPF-7c3aed?style=flat-square">
-  <img alt="KRot protocol" src="https://img.shields.io/badge/protocol-KRot-ff9c26?style=flat-square">
-  <img alt="VLESS protocol" src="https://img.shields.io/badge/protocol-VLESS-0f766e?style=flat-square">
-  <img alt="AmneziaWG 2.0" src="https://img.shields.io/badge/protocol-AmneziaWG%202.0-2563eb?style=flat-square">
-</p>
+- Поддерживает VLESS, VMess, Trojan, AmneziaWG 2.0 и экспериментальный KRot.
+- Импортирует URL-подписки, ссылки подключения, Base64, Xray JSON и Clash YAML.
+- Автоматически обновляет подписки и повторяет попытки при сбоях.
+  Если обновление не удалось, рабочие настройки сохраняются.
 
-<p align="center">
-  <a href="#русская-версия">Русский</a> ·
-  <a href="#english-version">English</a> ·
-  <a href="docs/KROT.md">KRot</a>
-</p>
+### Скачать
 
-<table>
-  <tr>
-    <td width="33.33%"><img src="docs/assets/screenshots/home-idle.png" alt="NORA VPN — главный экран"></td>
-    <td width="33.33%"><img src="docs/assets/screenshots/home-connected.png" alt="NORA VPN — подключено"></td>
-    <td width="33.33%"><img src="docs/assets/screenshots/servers.png" alt="NORA VPN — серверы"></td>
-  </tr>
-</table>
+| Установщик Windows | Без установки |
+|---|---|
+| [Setup](https://github.com/kevin-popins/NORA-VPN-DESKTOP/releases/download/0.1.0-pre.10/NORA-VPN-Setup-v0.1.0-pre.10-win-x64.exe) | [Portable](https://github.com/kevin-popins/NORA-VPN-DESKTOP/releases/download/0.1.0-pre.10/NORA-VPN-Portable-v0.1.0-pre.10-win-x64.zip) |
 
-## Русская версия
+Добавьте подписку или конфигурацию на странице **Add**, выберите сервер
+в **Servers** и нажмите **Connect**.
 
-### Что это
-
-**NORA VPN** — приложение для Windows 10 и 11. Я сделал его, чтобы VPN был
-простым и визуально понятным: добавьте подписку или свой сервер, выберите
-нужную локацию и подключитесь одной кнопкой.
-
-Я хотел, чтобы VPN не выглядел как скучная техническая утилита. Поэтому в
-NORA есть живой главный экран, карта, аккуратная статистика трафика и понятный
-список серверов.
-
-### Что поддерживается
-
-- **VLESS** — ссылки `vless://`, подписки по HTTPS, Base64, Xray JSON и Clash
-  YAML. Работают Reality, TLS и XHTTP.
-- **AmneziaWG 2.0** — конфиги AmneziaWG и WireGuard-совместимого формата.
-- **KRot / Крот** — мой экспериментальный VPN-протокол, вдохновлённый VLESS и
-  AmneziaWG. В приложении можно создавать пользователей и отслеживать, сколько
-  трафика они потребили.
-
-### Что я добавил
-
-- **Фото локаций.** Я добавил на карточку активного сервера фотографию страны
-  или города вместо безликого фона. Сейчас есть изображения для
-  Китая, Эстонии, Финляндии, Франции, Германии, Ирландии, Италии, Литвы,
-  Нидерландов, Польши, Индии, Казахстана, Турции, Украины, Португалии, России,
-  Испании, Великобритании и США. Групповые маршруты RU/EU имеют отдельные фоны;
-  конкретная страна или Москва в имени сервера всегда имеет приоритет.
-- **Работа в трее.** При первом закрытии окна NORA объясняет, что VPN продолжает
-  работать в системном трее. Галочка «больше не показывать» сохраняется между запусками.
-- **Эквалайзер.** Я добавил визуальный эквалайзер, который реагирует на
-  музыку и звук на компьютере.
-- **Плавный Live Traffic.** График трафика движется непрерывно и мягко
-  показывает изменения скорости без резких скачков между точками.
-- **Диагностика подключения.** На странице Logs можно запустить проверку
-  соединения и получить готовый отчёт, если VPN не подключается.
-- **Автообновление подписок.** URL-подписки обновляются при запуске NORA и затем
-  по интервалу, который прислал провайдер. После автообновления NORA показывает одно
-  итоговое уведомление. Порядок провайдера и именованные варианты маршрутов сохраняются,
-  а повторные строки с остатком трафика или инструкцией показываются по одной.
-
-### Пресеты маршрутизации
-
-Я добавил отдельные режимы для случаев, когда VPN нужен не всей системе.
-Первый пресет — **Discord Mode**: через выбранный VPN-сервер идёт только
-Discord, а остальные приложения продолжают использовать обычное подключение.
-
-Открыть режим можно кнопкой с иконкой компьютера слева на главном экране.
-Сейчас Discord Mode работает с VLESS и KRot; AmneziaWG пока не поддерживается.
-Если VPN уже подключён, NORA сама остановит выбранный сервер, переключит режим
-и подключит тот же сервер снова. При ошибке приложение возвращает прежний режим
-и пытается восстановить предыдущее подключение.
-Режим находится в бета-версии, поэтому возможны ошибки. В будущем я планирую
-добавить больше пресетов маршрутизации.
-
-### Что такое KRot
-
-**KRot** — мой экспериментальный VPN-протокол, вдохновлённый VLESS и
-AmneziaWG. Я сделал его для личного VPN-сервера на VPS: из NORA можно
-установить узел, создавать пользователей и смотреть, сколько трафика они
-потребили. Подробности — в [описании KRot](docs/KROT.md).
-
-### Как начать
-
-1. Скачайте Setup из **Releases** и пройдите установку. Portable-архив также
-   остаётся доступен для запуска без установки.
-2. Запустите NORA VPN; установочная версия создаёт ярлык в меню «Пуск» и по
-   желанию на рабочем столе.
-3. На странице **Add** добавьте подписку, конфиг или свой KRot-сервер.
-4. Выберите сервер на странице **Servers** и нажмите Connect.
-
-Я распространяю NORA VPN по [Apache License 2.0](LICENSE). Название и логотип
-NORA VPN описаны отдельно в [правилах использования бренда](TRADEMARKS.md).
-Проекты и библиотеки, которые я использовал, указаны в [NOTICE](NOTICE) и
-[THIRD_PARTY.md](docs/THIRD_PARTY.md).
-Устройство установки, обновления и сохранения пользовательских данных описано
-в [документации установщика](docs/INSTALLER.md).
+[Все релизы](https://github.com/kevin-popins/NORA-VPN-DESKTOP/releases) · [Сайт NORA](https://nora.rest/)
 
 ---
 
-## English version
+## English
 
-### What it is
+NORA VPN is a Windows 10/11 client focused on a polished visual interface,
+clear controls and reliable handling of subscriptions from different providers.
 
-**NORA VPN** is a Windows 10/11 app. I built it to make VPN use simple and
-clear: add a subscription or your own server, choose a location, and connect
-with one button.
+- Supports VLESS, VMess, Trojan, AmneziaWG 2.0 and the experimental KRot protocol.
+- Imports URL subscriptions, connection links, Base64, Xray JSON and Clash YAML.
+- Refreshes subscriptions automatically and retries after failures.
+  Working settings are preserved if an update fails.
 
-I wanted a VPN client that feels less like a dry technical utility. NORA has a
-live home screen, a map, tidy traffic stats, and an easy-to-read server list.
+### Download
 
-### What it supports
+| Windows installer | No installation |
+|---|---|
+| [Setup](https://github.com/kevin-popins/NORA-VPN-DESKTOP/releases/download/0.1.0-pre.10/NORA-VPN-Setup-v0.1.0-pre.10-win-x64.exe) | [Portable](https://github.com/kevin-popins/NORA-VPN-DESKTOP/releases/download/0.1.0-pre.10/NORA-VPN-Portable-v0.1.0-pre.10-win-x64.zip) |
 
-- **VLESS** — `vless://` links, HTTPS subscriptions, Base64, Xray JSON, and
-  Clash YAML. Reality, TLS, and XHTTP are supported.
-- **AmneziaWG 2.0** — AmneziaWG and WireGuard-compatible configuration files.
-- **KRot** — my experimental VPN protocol inspired by VLESS and AmneziaWG.
-  Create users in the app and keep track of how much traffic they use.
+Import a subscription or configuration on **Add**, choose a server on
+**Servers** and press **Connect**.
 
-### What I added
+[All releases](https://github.com/kevin-popins/NORA-VPN-DESKTOP/releases) · [NORA website](https://nora.rest/)
 
-- **Location artwork.** I added a country or city photo to the active-server card
-  instead of a generic background. Artwork is currently available for China,
-  Estonia, Finland, France, Germany, Ireland, Italy, Latvia, Lithuania, the
-  Netherlands, Poland, Sweden, India, Kazakhstan, Turkey, Ukraine, Portugal,
-  Russia, Spain, the United Kingdom, and the United States. Generic RU/EU routes use dedicated group
-  artwork, while a concrete country or Moscow in the server name takes priority.
-- **Tray behavior.** The first window close explains that NORA keeps running in
-  the system tray. The optional "Don't show this again" choice persists between
-  launches, and the notice sizes itself to keep its confirmation button visible
-  with normal Windows title bars and display scaling.
-- **Faster server selection.** Choosing a subscription or direct server opens
-  Home immediately. Arrange mode keeps the moved row under the pointer instead
-  of jumping a long server list back to the top.
-- **Equalizer.** I added a visual equalizer that reacts to music and other
-  sound playing on your computer.
-- **Smooth Live Traffic.** The traffic graph moves continuously and shows
-  speed changes without abrupt jumps between samples.
-- **Connection diagnostics.** The Logs page can run a connection test and
-  produce a ready-to-share report when the VPN cannot connect.
-- **Automatic subscription refresh.** URL subscriptions refresh when NORA
-  starts and then at the interval supplied by the provider. NORA shows one
-  summary notification after an automatic refresh. Provider order and named
-  routing variants are retained, while repeated quota or instruction rows
-  appear only once.
+---
 
-### Routing presets
-
-I added separate modes for cases where the whole system does not need to use
-the VPN. The first preset is **Discord Mode**: only Discord goes through the
-selected VPN server, while other apps continue using the normal connection.
-
-Open it with the computer icon on the left side of the Home screen. Discord
-Mode currently works with VLESS and KRot; AmneziaWG is not supported yet.
-When a VPN is already connected, NORA stops the selected server, changes the
-routing mode, and reconnects that same server. If the transition fails, NORA
-restores the previous mode and attempts to restore the previous connection. The
-mode is in beta, so bugs are possible. I plan to add more routing presets in
-future releases.
-
-### What is KRot?
-
-**KRot** is my experimental VPN protocol inspired by VLESS and AmneziaWG. I
-built it for a personal VPN server on a VPS: install a node, create users, and
-see how much traffic they use from NORA. Read the [KRot overview](docs/KROT.md)
-for more.
-
-### Getting started
-
-1. Download Setup from **Releases** and complete installation. The portable ZIP
-   remains available when an installation is not desired.
-2. Launch NORA VPN from Start or the optional desktop shortcut.
-3. On **Add**, import a subscription or configuration, or add your KRot server.
-4. Choose a server on **Servers** and press Connect.
-
-I publish NORA VPN under the [Apache License 2.0](LICENSE). The NORA VPN name
-and logo are covered separately by the [brand-use policy](TRADEMARKS.md). The
-projects and libraries I used are listed in [NOTICE](NOTICE) and
-[THIRD_PARTY.md](docs/THIRD_PARTY.md).
-See [installer documentation](docs/INSTALLER.md) for upgrade and data-preservation behavior.
+[Apache License 2.0](LICENSE) · [Brand use](TRADEMARKS.md) · [Third-party notices](NOTICE)
