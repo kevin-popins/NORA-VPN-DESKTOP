@@ -1,9 +1,20 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$PortableDirectory
+    [string]$PortableDirectory,
+    [ValidateSet('Full', 'Isolated')]
+    [string]$VerificationMode = 'Full',
+    [string]$ManagedTestDll = '',
+    [string]$ProofDirectory = '',
+    [string]$ExpectedAppVersion = '',
+    [string]$ExpectedFileVersion = '',
+    [string]$ExpectedCommit = '',
+    [string]$ApprovedCoreBundle = '',
+    [string]$ApprovedCoreBundleSha256 = '758fc43fbf02efb43706ca1e0f0beee3026e1c3c97a8869a6e5a141f826c7c96'
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'portable-verification.ps1')
+$projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $root = (Resolve-Path -LiteralPath $PortableDirectory).Path
 $required = @(
     "NoraVPN.exe",
@@ -68,6 +79,93 @@ $required = @(
 $missing = $required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $root $_)) }
 if ($missing.Count -gt 0) {
     throw "Portable layout is incomplete: $($missing -join ', ')"
+}
+
+# Static checks apply to both modes. No payload executable has run here.
+$expected = Get-NoraBuildIdentity $projectRoot $ExpectedAppVersion $ExpectedFileVersion $ExpectedCommit
+$stagedExecutable = Get-NoraFileIdentity (Join-Path $root 'NoraVPN.exe')
+Assert-NoraFileVersion $stagedExecutable $expected
+$assetEvidence = Get-NoraStaticAssetEvidence $root $projectRoot
+
+if ($VerificationMode -eq 'Isolated') {
+    # Deliberately return before the legacy full checks below (core version,
+    # elevated EXE and full-shell ui-icon commands are forbidden in this mode).
+    $proofRoot = Assert-NoraPrivateProofDirectory $ProofDirectory $projectRoot $root
+    $run = Join-Path $proofRoot ('portable-verification-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmss') + '-' + [Guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($run) | Out-Null
+    $manifestPath = Join-Path $run 'verification.json'
+    $commands = @('import-input-selftest', 'deep-link-selftest', 'subscription-notice-selftest',
+        'subscription-reliability-selftest', 'subscription-refresh-selftest', 'subscription-metadata-selftest',
+        'protected-display-selftest', 'purchase-link-selftest', 'display-region-selftest',
+        'subscription-order-selftest', 'country-flag-selftest', 'location-artwork-selftest')
+    $results = [Collections.Generic.List[object]]::new()
+    $manifest = [ordered]@{
+        Schema = 'nora-isolated-portable-verification-v1'; Status = 'Running'; StartedUtc = [DateTime]::UtcNow.ToString('O')
+        ProofDirectory = $run; PortableDirectory = $root; Expected = $expected; StagedExecutable = $stagedExecutable
+        Assets = $assetEvidence; Commands = $results; Failure = $null
+        Settings = [ordered]@{ VerificationMode = 'Isolated'; ExecutableLaunched = $false; CoreLaunched = $false; UacUsed = $false; InstalledAppAccessed = $false; ProductionShellCreated = $false; NetworkTestsEnabled = $false; ValidateCoreSyntax = $false; RuntimeMotionExecuted = $false; TestsSerialized = $true }
+        VerificationScripts = @('test-portable.ps1', 'portable-verification.ps1') | ForEach-Object { Get-NoraFileIdentity (Join-Path $PSScriptRoot $_) }
+    }
+    $previousEnvironment = @{}
+    try {
+        if (-not $ManagedTestDll -or -not (Test-Path -LiteralPath $ManagedTestDll -PathType Leaf)) { throw 'Isolated verification requires an explicitly supplied matching ManagedTestDll; no fallback is allowed.' }
+        $managed = Get-NoraFileIdentity $ManagedTestDll
+        if ([IO.Path]::GetFileName($managed.Path) -cne 'NoraVPN.dll') { throw 'The managed test entrypoint must be NoraVPN.dll.' }
+        Assert-NoraFileVersion $managed $expected
+        $managedDirectory = Split-Path -Parent $managed.Path
+        foreach ($name in @('NoraVPN.runtimeconfig.json', 'NoraVPN.deps.json')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $managedDirectory $name) -PathType Leaf)) { throw "Missing managed runtime companion: $name" }
+        }
+        $manifest.ManagedTestAssembly = $managed
+        $manifest.ManagedRuntimeFiles = @('NoraVPN.runtimeconfig.json', 'NoraVPN.deps.json') | ForEach-Object { Get-NoraFileIdentity (Join-Path $managedDirectory $_) }
+        $manifest.ManagedAssets = Get-NoraStaticAssetEvidence $managedDirectory $projectRoot
+        $manifest.Bundle = Get-NoraBundledAssemblyEvidence $stagedExecutable.Path
+        if ($manifest.Bundle.Sha256 -ne $managed.Sha256 -or $manifest.Bundle.Bytes -ne $managed.Bytes) { throw 'The staged single-file embedded DLL is not byte-identical to the managed DLL selected for tests.' }
+        $manifest.ApprovedCores = Get-NoraApprovedCoreEvidence $root $ApprovedCoreBundle $ApprovedCoreBundleSha256
+        $manifest.WorkingTreeDirty = [bool](& git -C $projectRoot status --porcelain)
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot record source working-tree status.' }
+        $dotnet = (Get-Command dotnet -CommandType Application -ErrorAction Stop).Source
+        $manifest.DotnetHost = Get-NoraFileIdentity $dotnet
+        $environment = @{
+            NORA_DATA_ROOT = (Join-Path $run 'synthetic-state'); NORA_SELFTEST_ROOT = (Join-Path $run 'temporary-fixtures')
+            TEMP = (Join-Path $run 'temporary-fixtures'); TMP = (Join-Path $run 'temporary-fixtures')
+            DOTNET_CLI_HOME = (Join-Path $run 'dotnet-home'); DOTNET_CLI_TELEMETRY_OPTOUT = '1'
+            DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'; DOTNET_NOLOGO = '1'; DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE = 'true'
+            DOTNET_STARTUP_HOOKS = $null; DOTNET_ADDITIONAL_DEPS = $null; CORECLR_ENABLE_PROFILING = '0'; COR_ENABLE_PROFILING = '0'
+        }
+        foreach ($directory in @($environment.NORA_DATA_ROOT, $environment.NORA_SELFTEST_ROOT, $environment.DOTNET_CLI_HOME)) { [IO.Directory]::CreateDirectory($directory) | Out-Null }
+        foreach ($name in $environment.Keys) {
+            $previousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+            [Environment]::SetEnvironmentVariable($name, $environment[$name], 'Process')
+        }
+        $manifest.Environment = $environment
+        Push-Location -LiteralPath $root
+        try {
+            foreach ($command in $commands) {
+                $log = Join-Path $run ($command + '.log')
+                $started = [DateTime]::UtcNow
+                & $dotnet $managed.Path $command *> $log
+                $exitCode = $LASTEXITCODE
+                $results.Add([PSCustomObject]@{ Command = $command; ExitCode = $exitCode; StartedUtc = $started.ToString('O'); DurationMs = [Math]::Round(([DateTime]::UtcNow - $started).TotalMilliseconds); Log = $log; LogSha256 = (Get-FileHash -LiteralPath $log -Algorithm SHA256).Hash.ToLowerInvariant() })
+                if ($exitCode -ne 0) { throw "Isolated $command failed with exit code $exitCode. See private proof log." }
+                Write-Host "ISOLATED PASS: $command"
+            }
+        }
+        finally { Pop-Location }
+        if ((Get-FileHash -LiteralPath $managed.Path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $managed.Sha256 -or
+            (Get-FileHash -LiteralPath $stagedExecutable.Path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $stagedExecutable.Sha256) { throw 'An application artifact changed while verification was running.' }
+        $manifest.Status = 'Passed'
+    }
+    catch { $manifest.Status = 'Failed'; $manifest.Failure = $_.Exception.Message; throw }
+    finally {
+        foreach ($name in $previousEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $previousEnvironment[$name], 'Process') }
+        $manifest.CompletedUtc = [DateTime]::UtcNow.ToString('O')
+        $manifest | ConvertTo-Json -Depth 15 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+        Write-Host "Private portable verification manifest: $manifestPath"
+    }
+    Write-Host 'ISOLATED PORTABLE PASS: static shipping identity, embedded/tested DLL equality, approved core hashes, and safe managed commands.'
+    [PSCustomObject]@{ VerificationMode = 'Isolated'; Status = $manifest.Status; ManifestPath = $manifestPath }
+    return
 }
 
 function Get-IcoFrameSizes([string]$path) {

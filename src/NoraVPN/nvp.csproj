@@ -7,10 +7,10 @@
     <AssemblyName>nvp</AssemblyName>
     <RootNamespace>Nvp</RootNamespace>
     <PublishSingleFile>true</PublishSingleFile>
-    <Version>0.1.0-pre.9</Version>
+    <Version>0.1.0-pre.10</Version>
     <AssemblyVersion>0.1.0.0</AssemblyVersion>
-    <FileVersion>0.1.0.0</FileVersion>
-    <InformationalVersion>0.1.0-pre.9</InformationalVersion>
+    <FileVersion>0.1.0.10</FileVersion>
+    <InformationalVersion>0.1.0-pre.10</InformationalVersion>
   </PropertyGroup>
   <PropertyGroup Condition="'$(TargetFramework)' != 'net8.0-windows'">
     <InvariantGlobalization>true</InvariantGlobalization>
@@ -108,7 +108,87 @@
       <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
       <TargetPath>wintun.dll</TargetPath>
     </Content>
-    <Content Include="..\..\assets\locations\*.png;..\..\assets\locations\*.jpg;..\..\assets\locations\*.jpeg">
+    <!-- Explicit shipping set: keep raw masters and future artwork out of releases. -->
+    <Content Include="..\..\assets\locations\AQ1.jpg;
+                     ..\..\assets\locations\AQ2.jpg;
+                     ..\..\assets\locations\AQ3.jpg;
+                     ..\..\assets\locations\AQ4.jpg;
+                     ..\..\assets\locations\AQ5.jpg;
+                     ..\..\assets\locations\BM1.jpg;
+                     ..\..\assets\locations\BM2.jpg;
+                     ..\..\assets\locations\BM3.jpg;
+                     ..\..\assets\locations\Bulgaria1.jpg;
+                     ..\..\assets\locations\Bulgaria2.jpg;
+                     ..\..\assets\locations\Bulgaria3.jpg;
+                     ..\..\assets\locations\China.jpg;
+                     ..\..\assets\locations\Discord1.jpg;
+                     ..\..\assets\locations\Discord2.jpg;
+                     ..\..\assets\locations\Discord3.jpg;
+                     ..\..\assets\locations\Discord4.jpg;
+                     ..\..\assets\locations\earth.png;
+                     ..\..\assets\locations\Estonia.jpg;
+                     ..\..\assets\locations\EUALL.jpg;
+                     ..\..\assets\locations\Finland1.jpg;
+                     ..\..\assets\locations\finland2.jpg;
+                     ..\..\assets\locations\Finland3.jpg;
+                     ..\..\assets\locations\France1.jpg;
+                     ..\..\assets\locations\France2.jpg;
+                     ..\..\assets\locations\France3.jpg;
+                     ..\..\assets\locations\Germany1.jpg;
+                     ..\..\assets\locations\Germany2.jpg;
+                     ..\..\assets\locations\Germany3.jpg;
+                     ..\..\assets\locations\Germany4.jpg;
+                     ..\..\assets\locations\Germany5.jpg;
+                     ..\..\assets\locations\India1.jpg;
+                     ..\..\assets\locations\India2.jpg;
+                     ..\..\assets\locations\India3.jpg;
+                     ..\..\assets\locations\Ireland.jpg;
+                     ..\..\assets\locations\ireland1.jpg;
+                     ..\..\assets\locations\ireland3.jpg;
+                     ..\..\assets\locations\Italy.jpg;
+                     ..\..\assets\locations\KZ1.jpg;
+                     ..\..\assets\locations\KZ2.jpg;
+                     ..\..\assets\locations\KZ3.jpg;
+                     ..\..\assets\locations\Latvia1.jpg;
+                     ..\..\assets\locations\Latvia2.jpg;
+                     ..\..\assets\locations\Latvia3.jpg;
+                     ..\..\assets\locations\Lithuania1.jpg;
+                     ..\..\assets\locations\Lithuania2.jpg;
+                     ..\..\assets\locations\Lithuania3.jpg;
+                     ..\..\assets\locations\moon.png;
+                     ..\..\assets\locations\netherlands1.jpg;
+                     ..\..\assets\locations\Netherlands2.jpg;
+                     ..\..\assets\locations\netherlands3.jpg;
+                     ..\..\assets\locations\Netherlands4.jpg;
+                     ..\..\assets\locations\Netherlands5.jpg;
+                     ..\..\assets\locations\Poland1.jpg;
+                     ..\..\assets\locations\Poland2.jpg;
+                     ..\..\assets\locations\Poland3.jpg;
+                     ..\..\assets\locations\Portugal.jpg;
+                     ..\..\assets\locations\RUALL.jpg;
+                     ..\..\assets\locations\Russia1.jpg;
+                     ..\..\assets\locations\RUSSIA2.jpg;
+                     ..\..\assets\locations\Russia3.jpg;
+                     ..\..\assets\locations\Spain.jpg;
+                     ..\..\assets\locations\Sweden1.jpg;
+                     ..\..\assets\locations\Sweden2.jpg;
+                     ..\..\assets\locations\Sweden3.jpg;
+                     ..\..\assets\locations\TR1.jpg;
+                     ..\..\assets\locations\TR2.jpg;
+                     ..\..\assets\locations\TR3.jpg;
+                     ..\..\assets\locations\UK1.jpg;
+                     ..\..\assets\locations\UK2.jpg;
+                     ..\..\assets\locations\UK3.jpg;
+                     ..\..\assets\locations\Ukraine1.jpg;
+                     ..\..\assets\locations\Universal.jpg;
+                     ..\..\assets\locations\universe.jpg;
+                     ..\..\assets\locations\USA1.jpg;
+                     ..\..\assets\locations\USA2.jpg;
+                     ..\..\assets\locations\USA3.jpg;
+                     ..\..\assets\locations\VA1.jpg;
+                     ..\..\assets\locations\VA2.jpg;
+                     ..\..\assets\locations\VA3.jpg;
+                     ..\..\assets\locations\welocmescreengirl.jpg">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <ExcludeFromSingleFile>true</ExcludeFromSingleFile>

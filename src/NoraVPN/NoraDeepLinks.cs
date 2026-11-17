@@ -23,10 +23,21 @@ internal static partial class NoraDeepLinkParser
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
     public static bool LooksLikeDeepLink(string? value)
-        => value?.StartsWith("noravpn:", StringComparison.OrdinalIgnoreCase) == true;
+    {
+#if WINDOWS
+        try { return value is not null && NoraImportInput.Normalize(value).StartsWith("noravpn:", StringComparison.OrdinalIgnoreCase); }
+        catch (NoraAppException) { return false; }
+#else
+        return value?.Trim().StartsWith("noravpn:", StringComparison.OrdinalIgnoreCase) == true;
+#endif
+    }
 
     public static NoraDeepLinkRequest Parse(string value)
     {
+#if WINDOWS
+        value = NoraImportInput.Normalize(value);
+        NoraImportInput.ValidateUriText(value);
+#endif
         if (string.IsNullOrWhiteSpace(value))
             throw Invalid("The link is empty.");
         EnsureUtf8Limit(value, MaximumLinkBytes, "The link is too large.");
@@ -92,6 +103,15 @@ internal static partial class NoraDeepLinkParser
 
         if (kind == NoraDeepLinkKind.Subscription)
             ValidateSubscriptionUrl(payload);
+#if WINDOWS
+        else
+        {
+            var profilePayload = NoraImportInput.Normalize(payload);
+            if (LooksLikeDeepLink(profilePayload) || HappCrypt5Decoder.IsCrypt5Link(profilePayload) ||
+                Uri.TryCreate(profilePayload, UriKind.Absolute, out var profileUri) && profileUri.Scheme is "http" or "https")
+                throw Invalid("A profile link must contain profile data. Use a subscription import link for a provider URL.");
+        }
+#endif
         return new NoraDeepLinkRequest(kind, payload, name);
     }
 
@@ -171,7 +191,8 @@ internal static partial class NoraDeepLinkParser
 
     private static void ValidateSubscriptionUrl(string value)
     {
-        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https") ||
+        if (value.Any(c => char.IsWhiteSpace(c) || char.IsControl(c) || char.GetUnicodeCategory(c) == System.Globalization.UnicodeCategory.Format) ||
+            !Uri.TryCreate(value, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https") ||
             string.IsNullOrWhiteSpace(uri.Host) || !string.IsNullOrEmpty(uri.UserInfo) || !string.IsNullOrEmpty(uri.Fragment))
         {
             throw Invalid("The subscription address must be an HTTP or HTTPS URL without credentials or a fragment.");
@@ -218,7 +239,7 @@ internal static partial class NoraDeepLinkParser
     internal static int RunSelfTest(TextWriter output)
     {
         var originalRoot = Environment.GetEnvironmentVariable("NORA_DATA_ROOT");
-        var root = Path.Combine(Path.GetTempPath(), "nora-deep-link-selftest-" + Guid.NewGuid().ToString("N"));
+        var root = Path.Combine(NoraSelfTestPaths.BaseDirectory, "nora-deep-link-selftest-" + Guid.NewGuid().ToString("N"));
         try
         {
             Environment.SetEnvironmentVariable("NORA_DATA_ROOT", root);

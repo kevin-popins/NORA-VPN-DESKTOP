@@ -2135,7 +2135,7 @@ internal static class NoraProfileImporter
 {
     public static async Task<NoraImportResult> ImportAsync(string text, Action<string> log)
     {
-        text = text.Trim();
+        text = NoraImportInput.Classify(text).Text;
         if (string.IsNullOrWhiteSpace(text))
             throw new InvalidOperationException("Paste a connection key first.");
         if (text.StartsWith("nora1.", StringComparison.OrdinalIgnoreCase))

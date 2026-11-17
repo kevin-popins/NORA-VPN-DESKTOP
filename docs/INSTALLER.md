@@ -59,6 +59,32 @@ The script publishes a self-contained win-x64 application, runs the portable
 regression suite, generates the branded wizard artwork, compiles Setup and
 compares the Setup icon pixels with the canonical `assets/logo.ico`.
 
+## Isolated verification
+
+For a host that already runs NORA, use the explicit `Isolated` verification mode
+on both packaging scripts. Supply a matching `ManagedTestDll`, a private
+`ProofDirectory` outside source/payload folders, and the existing approved
+`ApprovedCoreBundle` ZIP. Isolated mode uses restored dependencies, never fetches
+cores, and compares every staged core against that ZIP without executing it.
+
+Wait for the build to finish successfully before copying its DLL, runtime
+companions and assets to an immutable QA stage. Keep one build/test runner per
+checkout. `Isolated` verifies the staged executable version and commit, hashes
+its embedded managed assembly against the tested DLL, checks branding and all
+shipping assets, then runs a fixed serialized set of early managed self-tests
+with separate fixture roots. It does not invoke the normal shell, installer,
+installed app, single-instance activation or core executables. Private evidence
+records actual hashes, versions and test exits. Full verification retains the
+historical executable/core tests and belongs on a separate test machine.
+
+Application and installer version defaults come from the project. Overrides are
+passed to compilation and checked before Setup is built; changing a Setup label
+alone cannot relabel an older application payload. Install/update execution is
+a separate lifecycle check, not implied by successful package verification.
+
+See [subscription behavior](SUBSCRIPTIONS.md) for metadata, recovery and display
+restrictions.
+
 ## Visual states
 
 | Welcome | License | Data/network notices |

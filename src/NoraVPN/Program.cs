@@ -26,6 +26,36 @@ internal static class Program
     public static int Main(string[] args)
     {
 #if WINDOWS
+        if (args.Length == 1 && args[0].Equals("import-input-selftest", StringComparison.OrdinalIgnoreCase))
+            return NoraImportInput.RunSelfTest(Console.Out);
+
+        if (args.Length == 1 && args[0].Equals("subscription-notice-selftest", StringComparison.OrdinalIgnoreCase))
+            return NoraLegacySubscriptionNotice.RunSelfTest(Console.Out);
+
+        if (args.Length == 1 && args[0].Equals("subscription-reliability-selftest", StringComparison.OrdinalIgnoreCase))
+            return NoraSubscriptionStore.RunTransportSelfTest(Console.Out, validateCoreSyntax: false);
+
+        if (args.Length == 1 && args[0].Equals("subscription-metadata-selftest", StringComparison.OrdinalIgnoreCase))
+            return NoraSubscriptionMetadata.RunSelfTest(Console.Out);
+
+        if (args.Length == 1 && args[0].Equals("protected-display-selftest", StringComparison.OrdinalIgnoreCase))
+            return NoraProtectedDisplay.RunSelfTest(Console.Out);
+
+        if (args.Length == 1 && args[0].Equals("purchase-link-selftest", StringComparison.OrdinalIgnoreCase))
+            return NoraPurchaseLink.RunSelfTest(Console.Out);
+
+        if (args.Length == 2 && args[0].Equals("subscription-presentation-selftest", StringComparison.OrdinalIgnoreCase))
+            return NoraSubscriptionPresentationSelfTests.Run(Console.Out, args[1]);
+
+        if (args.Length == 2 && args[0].Equals("ui-input-feedback-selftest", StringComparison.OrdinalIgnoreCase))
+            return NoraMotionLifecycleSelfTests.RunInputFeedbackProof(Console.Out, args[1]);
+
+        if (args.Length == 3 && args[0].Equals("subscription-restart-selftest", StringComparison.OrdinalIgnoreCase))
+            return NoraSubscriptionRestartSelfTests.Run(Console.Out, args[1], args[2]);
+
+        if (args.Length is >= 2 and <= 3 && args[0].Equals("ui-motion-lifecycle-selftest", StringComparison.OrdinalIgnoreCase))
+            return NoraMotionLifecycleSelfTests.Run(Console.Out, args[1], args.Length == 3 ? args[2] : "full");
+
 #if NORA_QA_PREVIEW
         if (args.Length == 0)
         {
@@ -500,11 +530,15 @@ internal static class Program
             if (args[0] == "subdiag")
             {
 #if WINDOWS
-                var sub = NoraSubscriptionStore.ImportAsync(args[1], Console.WriteLine).GetAwaiter().GetResult();
-                Console.WriteLine($"subscription: title={sub.Title}; servers={sub.Servers.Count}; upload={sub.UploadBytes}; download={sub.DownloadBytes}; total={sub.TotalBytes}; update_hours={sub.UpdateIntervalHours}; hwid={sub.Hwid}");
+                var importLog = new List<string>();
+                var sub = NoraSubscriptionStore.ImportAsync(args[1], importLog.Add).GetAwaiter().GetResult();
+                foreach (var line in importLog) Console.WriteLine(NoraProtectedDisplay.SanitizeLog(line));
+                Console.WriteLine(NoraProtectedDisplay.Redact($"subscription: title={sub.Title}; servers={sub.Servers.Count}; upload={sub.UploadBytes}; download={sub.DownloadBytes}; total={sub.TotalBytes}; update_hours={sub.UpdateIntervalHours}; hwid={sub.Hwid}"));
                 foreach (var server in sub.Servers)
-                    Console.WriteLine($"server: name={server.Name}; host={server.Host}:{server.Port}; protocol={server.Protocol}; inbounds={server.InboundCount}; outbounds={server.OutboundCount}; rules={server.RuleCount}; path={server.LocalPath}");
-                return sub.Servers.Count > 0 ? 0 : 1;
+                    Console.WriteLine(NoraProtectedDisplay.IsProtected(server)
+                        ? $"server: name={NoraProtectedDisplay.Redact(server.Name)}; endpoint={NoraProtectedDisplay.EndpointText(server)}; protocol={server.Protocol}"
+                        : $"server: name={server.Name}; host={server.Host}:{server.Port}; protocol={server.Protocol}; inbounds={server.InboundCount}; outbounds={server.OutboundCount}; rules={server.RuleCount}; path={server.LocalPath}");
+                return sub.Servers.Count > 0 || NoraSubscriptionNoticeView.HasNotice(NoraSubscriptionMetadata.EffectiveFor(sub)) ? 0 : 1;
 #else
                 Console.Error.WriteLine("subdiag is only available in the Windows client build.");
                 return 2;
@@ -515,6 +549,7 @@ internal static class Program
 #if WINDOWS
                 if (!NoraSubscriptionStore.TryLoadServer(args[1], out var server))
                     throw new InvalidOperationException("Cannot load subscription server json.");
+                NoraProtectedDisplay.RequireDisclosure(server);
                 Console.WriteLine(NoraSubscriptionStore.BuildSingBoxConfig(server));
                 return 0;
 #else
@@ -527,6 +562,7 @@ internal static class Program
 #if WINDOWS
                 if (!NoraSubscriptionStore.TryLoadServer(args[1], out var server))
                     throw new InvalidOperationException("Cannot load subscription server json.");
+                NoraProtectedDisplay.RequireDisclosure(server);
                 Console.WriteLine(NoraSubscriptionStore.BuildXrayConfig(server));
                 return 0;
 #else
@@ -546,6 +582,7 @@ internal static class Program
                 }
                 if (NoraSubscriptionStore.TryLoadServer(args[1], out var tunServer))
                 {
+                    NoraProtectedDisplay.RequireDisclosure(tunServer);
                     Console.WriteLine(NoraSubscriptionStore.BuildXrayTunFrontendConfig(20808, tunServer));
                     return 0;
                 }
@@ -560,6 +597,8 @@ internal static class Program
 #if WINDOWS
                 if (!NoraSubscriptionStore.TryLoadServer(args[1], out var server))
                     throw new InvalidOperationException("Cannot load subscription server json.");
+                NoraProtectedDisplay.RequireDisclosure(server);
+                NoraProtectedDisplay.RequireConnectable(server);
                 var resultPath = args.Length > 2 ? args[2] : Path.Combine(NoraAppState.DataRoot, "logs", "xray-diag.log");
                 Directory.CreateDirectory(Path.GetDirectoryName(resultPath) ?? NoraAppState.DataRoot);
                 void Log(string line)
