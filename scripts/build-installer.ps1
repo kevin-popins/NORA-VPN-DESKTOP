@@ -4,6 +4,7 @@ param(
     [string]$BuildId = "",
     [string]$OutputDirectory = "",
     [switch]$NoRestore,
+    [string]$CompilerPath = '',
     [ValidateSet('Full', 'Isolated')]
     [string]$VerificationMode = 'Full',
     [string]$ManagedTestDll = '',
@@ -81,7 +82,11 @@ $isccCandidates = @(
     (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
     (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe")
 )
-$iscc = $isccCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+$iscc = if ($CompilerPath) {
+    (Resolve-Path -LiteralPath $CompilerPath -ErrorAction Stop).Path
+} else {
+    $isccCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+}
 if (-not $iscc) {
     throw "Inno Setup 6.7+ was not found. Install JRSoftware.InnoSetup and retry."
 }
@@ -95,7 +100,11 @@ if (-not (Test-Path -LiteralPath $expectedSetup)) {
     throw "Inno Setup completed but the expected artifact is missing: $expectedSetup"
 }
 $setupIdentity = Get-NoraFileIdentity $expectedSetup
-if ($setupIdentity.FileVersion -ne $InstallerVersion) { throw 'The compiled installer file version does not match the verified application payload.' }
+$setupVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($expectedSetup)
+$setupNumericVersion = '{0}.{1}.{2}.{3}' -f $setupVersion.FileMajorPart, $setupVersion.FileMinorPart, $setupVersion.FileBuildPart, $setupVersion.FilePrivatePart
+if ($setupNumericVersion -ne $InstallerVersion -or $setupVersion.ProductVersion.Trim() -ne $AppVersion) {
+    throw 'The compiled installer numeric/text version does not match the verified application payload.'
+}
 
 # Guard the canonical NORA identity on every public artifact. The setup
 # compiler may re-encode ICO resources, so compare rendered 32x32 pixels rather
@@ -138,7 +147,7 @@ if ($VerificationMode -eq 'Isolated') {
         Schema = 'nora-installer-package-evidence-v1'; CreatedUtc = [DateTime]::UtcNow.ToString('O')
         Build = $identity; BuildId = $BuildId; VerificationMode = $VerificationMode; RestoreInvoked = $false
         Publish = [ordered]@{ Configuration = 'Release'; Framework = 'net8.0-windows'; Runtime = 'win-x64'; SelfContained = $true; NoRestore = $true; InformationalVersionIncludesCommit = $true; WorkloadAdvertisingDisabled = $true }
-        Payload = $compiledExecutable; Installer = $setupIdentity; VerificationManifest = $verification.ManifestPath
+        Payload = $compiledExecutable; Installer = $setupIdentity; InstallerNumericVersion = $setupNumericVersion; VerificationManifest = $verification.ManifestPath
         InnoCompiler = Get-NoraFileIdentity $iscc; InstallerScriptSha256 = (Get-FileHash -LiteralPath $script -Algorithm SHA256).Hash.ToLowerInvariant()
         CanonicalIconPixelsMatched = $true; SetupExecuted = $false; InstalledAppAccessed = $false
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $evidence -Encoding UTF8
