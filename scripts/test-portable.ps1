@@ -124,7 +124,7 @@ if ($VerificationMode -eq 'Isolated') {
         $manifest.ApprovedCores = Get-NoraApprovedCoreEvidence $root $ApprovedCoreBundle $ApprovedCoreBundleSha256
         $manifest.WorkingTreeDirty = [bool](& git -C $projectRoot status --porcelain)
         if ($LASTEXITCODE -ne 0) { throw 'Cannot record source working-tree status.' }
-        $dotnet = (Get-Command dotnet -CommandType Application -ErrorAction Stop).Source
+        $dotnet = (Get-Command dotnet -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
         $manifest.DotnetHost = Get-NoraFileIdentity $dotnet
         $environment = @{
             NORA_DATA_ROOT = (Join-Path $run 'synthetic-state'); NORA_SELFTEST_ROOT = (Join-Path $run 'temporary-fixtures')
